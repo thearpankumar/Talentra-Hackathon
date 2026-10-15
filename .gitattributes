@@ -1,0 +1,61 @@
+# Automatically detect text files and normalize line endings in Git
+* text=auto
+
+# Enforce LF for source code, configuration, and documentation
+*.py             text eol=lf
+*.toml           text eol=lf
+*.md             text eol=lf
+*.txt            text eol=lf
+*.json           text eol=lf
+*.yaml           text eol=lf
+*.yml            text eol=lf
+*.sh             text eol=lf
+*.bash           text eol=lf
+*.zsh            text eol=lf
+*.js             text eol=lf
+*.jsx            text eol=lf
+*.ts             text eol=lf
+*.tsx            text eol=lf
+*.css            text eol=lf
+*.html           text eol=lf
+*.xml            text eol=lf
+*.sql            text eol=lf
+*.rs             text eol=lf
+*.go             text eol=lf
+*.java           text eol=lf
+*.c              text eol=lf
+*.h              text eol=lf
+*.cpp            text eol=lf
+*.hpp            text eol=lf
+*.env            text eol=lf
+*.example        text eol=lf
+*.gitignore      text eol=lf
+*.gitattributes  text eol=lf
+*.dockerfile     text eol=lf
+Dockerfile       text eol=lf
+Makefile         text eol=lf
+LICENSE          text eol=lf
+NOTICE           text eol=lf
+.python-version  text eol=lf
+
+# Windows scripts retain CRLF
+*.bat            text eol=crlf
+*.cmd            text eol=crlf
+
+# PowerShell scripts use LF; PowerShell supports LF cross-platform
+*.ps1            text eol=lf
+*.psm1           text eol=lf
+
+# Binary files must not undergo line-ending conversion
+*.png            binary
+*.jpg            binary
+*.jpeg           binary
+*.gif            binary
+*.ico            binary
+*.pdf            binary
+*.zip            binary
+*.gz             binary
+*.woff           binary
+*.woff2          binary
+*.ttf            binary
+*.pyc            binary
