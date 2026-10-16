@@ -624,3 +624,7 @@ http-client.private.env.json
 # Built Visual Studio Code Extensions
 *.vsix
 
+
+# schema parts are hand-authored source (override generic "parts/" ignore)
+!infra/schema/parts/
+!infra/schema/parts/**
