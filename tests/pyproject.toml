@@ -1,0 +1,14 @@
+[project]
+name = "talentra-schema-tests"
+version = "0.1.0"
+description = "pytest suite for the Talentra CockroachDB schema (live catalog, security, rules, backup/restore)"
+requires-python = ">=3.10"
+dependencies = ["psycopg[binary]>=3.2", "pytest>=8", "pytest-xdist>=3.5", "openpyxl>=3.1", "pyyaml>=6"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-ra -q"
+markers = [
+  "slow: long-running (TTL job wait, backup/restore)",
+  "destructive: modifies cluster-level objects",
+]
