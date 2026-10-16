@@ -1,0 +1,2948 @@
+module: licences_devices
+notes: |2
+
+  **Scope.** Licence ownership, seat allocation, device registration, device slots, sessions, login attempts, revocation and limit-violation evidence (docket Rule group 9, D-13).
+  The licence is the *parent* of commercial objects: `subscription` / `subscription_period` (subscriptions_payments) reference `licence`, never the reverse.
+
+  **Two-level slot model (declarative twin of the transactional lock).**
+  * `licence_seat_slot` pre-creates slot_no 1..max_users per licence; a seat claims exactly one slot (`uq_licence_seat_licence_seat_slot_id` partial unique over live seats). A licence therefore cannot hold more live seats than slots even if the application forgets the lock.
+  * `device_slot` pre-creates slot_no 1..max_devices_per_user per `licence_seat`; each active `device_session` claims one slot (`uq_device_session_device_slot_id WHERE ended_at IS NULL`). Slot count == `licence.max_devices_per_user` is maintained by the seat-assignment txn and by the 'licence limit change' job (extra slots are marked `is_retired`, never deleted while a session holds them).
+  * TXN_LOCK (D-12 P4): seat assignment locks the `licence` row, login locks the `licence_seat` row `FOR UPDATE`. Slots give the constraint that cannot be bypassed; the lock gives ordered, low-retry execution and a clean place to record the violation.
+
+  **Counting an active session.** A session counts iff `ended_at IS NULL` (slot held). Expired sessions are physically released lazily inside the login txn (step 3 of BR-LIC-06) and eagerly by a 1-minute JOB; revoked sessions are released in the revoke txn; TTL (13 months on `ended_at`) only purges *finished* rows (NULL ended_at never expires). `expires_at` (absolute) and `last_activity_at + idle timeout` drive expiry.
+
+  **Decisions.** login history = view `vw_login_history` over `login_attempt` (successful rows) joined to `device_session`; the append-only `login_attempt` (very high, hash-sharded, 24-month TTL) is the single write path, so no duplicate store. Revocations are two append-only event tables (`device_revocation`, `session_revocation`) *and* an `audit_event` row (FK) for the audit trail. A limit breach writes `device_limit_violation` + `audit_event` + `login_attempt(device_limit_denied)` in a txn that COMMITs the evidence and returns the denial (it is not rolled back).
+  `device_limit_policy` lookup: `deny_new` (docket default) or `replace_oldest` (Netflix/Okta-style 'sign out oldest session'); per licence.
+
+  **Real-world models checked.** Microsoft 365 / Slack / LinkedIn Recruiter: seat = named user assignment on a licence with reassignment history (-> `licence_seat`, `licence_user_invitation`, `licence_transfer`); Netflix/Okta: device or session cap with 'sign out other device' (-> `device_limit_policy`, `device_session.end_reason`). CockroachDB docs verified: `SELECT ... FOR UPDATE` is supported under SERIALIZABLE and mainly serves to queue contended txns (correctness comes from SERIALIZABLE; the unique indexes are the declarative guard); row-level TTL deletes in background ranges by `ttl_expire_after`/expression. NULL TTL expression = row not expired (relied on for active sessions; verify on target version before go-live).
+
+  **Contention.** Locks are per `licence_seat` (one user) so logins for different users never conflict; only the same user's concurrent logins queue. Seat assignment contends per licence (rare admin operation). Expected 40001 rate is near zero in normal use; the client retries the whole txn up to 5 times with jittered backoff (BR-LIC-06). `login_attempt` and `session_activity_sample` use hash-sharded time indexes to avoid a hot range.
+
+  **Deviations / extension.** Fingerprints are stored as HMAC-SHA256 hashes only (never raw device ids). `licence_usage_snapshot` is a low-volume daily snapshot owned here; KPI marts live in analytics. Sub-roles within a licence (e.g. seat admin vs member) can be added via `licence_seat.seat_role_id` later (out of scope per docket section 3).
+  Ownership: `licence.account_id` (the paying account) and `organisation_id` (the tenant using it, NULL for individual/consultant licences).
+
+  ## TTL versus foreign keys (decision F-01)
+  CockroachDB row-level TTL deletes fail while a RESTRICT/NO ACTION child references the expiring row, so every foreign key that points at a TTL table now states
+  what happens when the parent expires:
+  * `device_session.identity_session_id` -> `identity_session`: ON DELETE SET NULL (column now nullable)
+  * `device_revocation.audit_event_id` -> `audit_event`: ON DELETE SET NULL (column now nullable)
+  * `session_revocation.audit_event_id` -> `audit_event`: ON DELETE SET NULL (column now nullable)
+  * `device_limit_violation.audit_event_id` -> `audit_event`: ON DELETE SET NULL (column now nullable)
+  * `session_activity_sample.device_session_id` -> `device_session`: ON DELETE CASCADE
+  * `session_revocation.device_session_id` -> `device_session`: ON DELETE SET NULL (column now nullable)
+  * `device_limit_violation.replaced_device_session_id` -> `device_session`: ON DELETE SET NULL (column now nullable)
+  * `device_limit_violation.login_attempt_id` -> `login_attempt`: ON DELETE SET NULL (column now nullable)
+  * Foreign-key actions are executed by the engine, not by an application role, so the INSERT/SELECT-only grants of append-only children stay intact; the nulled column is
+    excluded from any row_hash/prev_hash computation (hash only immutable business columns).
+  * Rule applied everywhere: evidence rows outlive the row they point at (SET NULL); high-volume samples that are only meaningful with the parent follow it (CASCADE).
+    A TTL table must never be the target of a RESTRICT/NO ACTION foreign key (checked by rule check A09 in 08_rule_compliance).
+lookups:
+- name: licence_status
+  description: Lifecycle status of a licence.
+  values:
+  - code: draft
+    en: Draft
+    sort: 10
+  - code: active
+    en: Active
+    sort: 20
+    hi: सक्रिय
+  - code: suspended
+    en: Suspended
+    sort: 30
+    hi: निलंबित
+  - code: expired
+    en: Expired
+    sort: 40
+    hi: समाप्त
+  - code: cancelled
+    en: Cancelled
+    sort: 50
+    hi: रद्द
+  milestones:
+  - B36
+- name: seat_status
+  description: Status of a licence seat.
+  values:
+  - code: active
+    en: Active
+    sort: 10
+  - code: suspended
+    en: Suspended
+    sort: 20
+  - code: revoked
+    en: Revoked
+    sort: 30
+  - code: transferred
+    en: Transferred
+    sort: 40
+  milestones:
+  - B36
+- name: device_platform
+  description: Client platform of a registered device.
+  values:
+  - code: android
+    en: Android
+    sort: 10
+  - code: ios
+    en: iOS
+    sort: 20
+  - code: web
+    en: Web browser
+    sort: 30
+  - code: windows
+    en: Windows desktop
+    sort: 40
+  - code: macos
+    en: macOS desktop
+    sort: 50
+  - code: linux
+    en: Linux desktop
+    sort: 60
+  milestones:
+  - B39
+- name: device_limit_policy
+  description: What happens when a login would exceed max_devices_per_user.
+  values:
+  - code: deny_new
+    en: Deny the new login
+    sort: 10
+  - code: replace_oldest
+    en: Sign out the oldest session
+    sort: 20
+  milestones:
+  - B39
+- name: session_end_reason
+  description: Why a device session ended (released its slot).
+  values:
+  - code: logout
+    en: User logout
+    sort: 10
+  - code: idle_timeout
+    en: Idle timeout
+    sort: 20
+  - code: absolute_expiry
+    en: Absolute expiry
+    sort: 30
+  - code: revoked_by_user
+    en: Revoked by user
+    sort: 40
+  - code: revoked_by_admin
+    en: Revoked by admin
+    sort: 50
+  - code: revoked_by_system
+    en: Revoked by system (risk)
+    sort: 60
+  - code: replaced
+    en: Replaced by newer login
+    sort: 70
+  - code: licence_inactive
+    en: Licence suspended or expired
+    sort: 80
+  - code: seat_removed
+    en: Seat removed
+    sort: 90
+  - code: limit_denied
+    en: Login denied at device limit
+    sort: 100
+  milestones:
+  - B39
+- name: login_outcome
+  description: Result of a login attempt (success or failure reason).
+  values:
+  - code: success
+    en: Success
+    sort: 10
+  - code: bad_credentials
+    en: Wrong credentials
+    sort: 20
+  - code: unknown_user
+    en: Unknown user
+    sort: 30
+  - code: mfa_failed
+    en: Second factor failed
+    sort: 40
+  - code: account_locked
+    en: Account locked
+    sort: 50
+  - code: no_seat
+    en: No licence seat
+    sort: 60
+  - code: licence_inactive
+    en: Licence not active
+    sort: 70
+  - code: device_limit_denied
+    en: Device limit reached
+    sort: 80
+  - code: device_revoked
+    en: Device revoked
+    sort: 90
+  - code: ip_blocked
+    en: IP not allowed
+    sort: 100
+  - code: rate_limited
+    en: Rate limited
+    sort: 110
+  milestones:
+  - B36
+  - B39
+- name: authentication_method
+  description: How the user authenticated.
+  values:
+  - code: password
+    en: Password
+    sort: 10
+  - code: otp
+    en: One-time code
+    sort: 20
+  - code: totp
+    en: Authenticator app
+    sort: 30
+  - code: sso
+    en: Single sign-on
+    sort: 40
+  - code: refresh_token
+    en: Refresh token
+    sort: 50
+  milestones:
+  - B39
+- name: revocation_reason
+  description: Reason a device or session was revoked.
+  values:
+  - code: lost_device
+    en: Lost or stolen
+    sort: 10
+  - code: user_request
+    en: User request
+    sort: 20
+  - code: admin_action
+    en: Admin action
+    sort: 30
+  - code: suspicious_activity
+    en: Suspicious activity
+    sort: 40
+  - code: licence_change
+    en: Licence change
+    sort: 50
+  - code: user_offboarded
+    en: User offboarded
+    sort: 60
+  milestones:
+  - B42
+- name: revocation_source
+  description: Who initiated a revocation.
+  values:
+  - code: self_service
+    en: User self-service
+    sort: 10
+  - code: licence_admin
+    en: Licence admin
+    sort: 20
+  - code: platform_admin
+    en: Platform admin
+    sort: 30
+  - code: system
+    en: System rule
+    sort: 40
+  milestones:
+  - B42
+- name: licence_invitation_status
+  description: Status of a licence user invitation.
+  values:
+  - code: pending
+    en: Pending
+    sort: 10
+  - code: accepted
+    en: Accepted
+    sort: 20
+  - code: declined
+    en: Declined
+    sort: 30
+  - code: expired
+    en: Expired
+    sort: 40
+  - code: cancelled
+    en: Cancelled
+    sort: 50
+  milestones:
+  - B36
+- name: transfer_status
+  description: Status of a licence ownership transfer.
+  values:
+  - code: requested
+    en: Requested
+    sort: 10
+  - code: approved
+    en: Approved
+    sort: 20
+  - code: completed
+    en: Completed
+    sort: 30
+  - code: rejected
+    en: Rejected
+    sort: 40
+  milestones:
+  - B36
+- name: trust_challenge_type
+  description: Type of device trust challenge.
+  values:
+  - code: email_otp
+    en: Email OTP
+    sort: 10
+  - code: sms_otp
+    en: SMS OTP
+    sort: 20
+  - code: totp
+    en: Authenticator code
+    sort: 30
+  - code: push_approval
+    en: Push approval
+    sort: 40
+  milestones:
+  - B45
+- name: trust_challenge_status
+  description: State of a device trust challenge.
+  values:
+  - code: issued
+    en: Issued
+    sort: 10
+  - code: solved
+    en: Solved
+    sort: 20
+  - code: failed
+    en: Failed
+    sort: 30
+  - code: expired
+    en: Expired
+    sort: 40
+  milestones:
+  - B45
+- name: push_provider
+  description: Push notification provider.
+  values:
+  - code: fcm
+    en: Firebase Cloud Messaging
+    sort: 10
+  - code: apns
+    en: Apple Push Notification service
+    sort: 20
+  - code: webpush
+    en: Web Push
+    sort: 30
+  milestones:
+  - B45
+- name: licence_feature
+  description: Feature or limit that can be overridden per licence.
+  values:
+  - code: concurrent_search
+    en: Concurrent searches
+    sort: 10
+  - code: bulk_export
+    en: Bulk export
+    sort: 20
+  - code: api_access
+    en: API access
+    sort: 30
+  - code: sso
+    en: Single sign-on
+    sort: 40
+  - code: session_idle_timeout
+    en: Session idle timeout minutes
+    sort: 50
+  - code: inmail_quota
+    en: InMail quota
+    sort: 60
+  milestones:
+  - B45
+tables:
+- name: licence
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B36
+  - B76
+  retention: Soft-deleted when cancelled and past legal retention; licence rows retained 8 years for invoicing history; no PII.
+  description: 'A commercial licence owned by an account/organisation: how many users (seats) and devices per user it allows. Parent of subscriptions; seats hang off it.'
+  columns:
+  - name: licence_code
+    desc: Human-readable licence number (unique among live licences).
+    sens: Internal
+    type: STRING(32)
+    domain: code
+  - name: account_id
+    desc: Paying account that owns the licence.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Tenant organisation using the licence.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = individual/consultant licence not tied to an organisation.
+  - name: licence_status_id
+    desc: Current lifecycle status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: max_users
+    desc: Maximum number of concurrently assigned seats (users).
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: max_devices_per_user
+    desc: Maximum number of active sessions/devices a single user may hold under this licence.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: device_limit_policy_id
+    desc: Policy applied when a login would exceed max_devices_per_user.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: seats_in_use
+    desc: Denormalised count of live seats; maintained under the licence row lock; must equal count of live licence_seat.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '0'
+  - name: session_idle_timeout_minutes
+    desc: Idle minutes after which a session expires.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '30'
+  - name: session_max_lifetime_hours
+    desc: Absolute session lifetime in hours.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '24'
+  - name: valid_from
+    desc: Start of validity (UTC).
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+  - name: valid_to
+    desc: End of validity (UTC).
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = open-ended/ongoing until cancelled.
+  - name: require_ip_allowlist
+    desc: True = logins must match licence_ip_allowlist.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'false'
+  constraints:
+  - name: ck_licence_max_users_positive
+    type: check
+    expr: max_users > 0
+    desc: 'Docket Rule 9: positive max users.'
+  - name: ck_licence_max_devices_positive
+    type: check
+    expr: max_devices_per_user > 0 AND max_devices_per_user <= 100
+    desc: 'Docket Rule 9: positive max devices (sanity ceiling 100).'
+  - name: ck_licence_seats_in_use_range
+    type: check
+    expr: seats_in_use >= 0 AND seats_in_use <= max_users
+    desc: Counter never exceeds max_users (declarative backstop).
+  - name: ck_licence_valid_range
+    type: check
+    expr: valid_to IS NULL OR valid_to >= valid_from
+    desc: Validity window order.
+  - name: ck_licence_session_timeouts
+    type: check
+    expr: session_idle_timeout_minutes > 0 AND session_max_lifetime_hours > 0
+    desc: Positive timeouts.
+  indexes:
+  - name: uq_licence_licence_code
+    columns:
+    - licence_code
+    unique: true
+    where: deleted_at IS NULL
+    desc: Licence number unique among live licences.
+  - name: idx_licence_account_id_licence_status_id
+    columns:
+    - account_id
+    - licence_status_id
+    desc: Account licence listing by status.
+  - name: idx_licence_organisation_id
+    columns:
+    - organisation_id
+    desc: Licences of an organisation.
+    where: organisation_id IS NOT NULL
+  - name: idx_licence_licence_status_id_valid_to
+    columns:
+    - licence_status_id
+    - valid_to
+    desc: Expiry sweep job.
+    where: deleted_at IS NULL
+  - name: idx_licence_device_limit_policy_id
+    columns:
+    - device_limit_policy_id
+    desc: Leading index for FK fk_licence_device_limit_policy_id (child lookup / FK check).
+  fks:
+  - name: fk_licence_account_id
+    columns:
+    - account_id
+    ref: account
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: account_id -> account; delete rule RESTRICT (see table description)
+  - name: fk_licence_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_licence_licence_status_id
+    columns:
+    - licence_status_id
+    ref: licence_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_status_id -> licence_status; delete rule RESTRICT (see table description)
+  - name: fk_licence_device_limit_policy_id
+    columns:
+    - device_limit_policy_id
+    ref: device_limit_policy
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: device_limit_policy_id -> device_limit_policy; delete rule RESTRICT (see table description)
+- name: licence_seat_slot
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B36
+  - B76
+  retention: Deleted with its licence; created/retired by the licence limit change txn.
+  description: Pre-allocated seat slots 1..max_users per licence; a seat claims one slot (declarative seat-limit twin).
+  columns:
+  - name: licence_id
+    desc: Owning licence.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: slot_no
+    desc: Slot number, 1..max_users at creation time.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: is_retired
+    desc: True when max_users was reduced; retired slots are never reused but kept while a seat holds them.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'false'
+  constraints:
+  - name: uq_licence_seat_slot_licence_id_slot_no
+    type: unique
+    columns:
+    - licence_id
+    - slot_no
+    desc: One row per slot number per licence.
+  - name: uq_licence_seat_slot_licence_id_id
+    type: unique
+    columns:
+    - licence_id
+    - id
+    desc: Target of composite FK from licence_seat.
+  - name: ck_licence_seat_slot_slot_no_positive
+    type: check
+    expr: slot_no > 0
+    desc: Slot numbers start at 1.
+  indexes: []
+  fks:
+  - name: fk_licence_seat_slot_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule CASCADE (see table description)
+- name: licence_seat
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B36
+  - B76
+  retention: Soft-deleted on user erasure; seat history kept for licence audit 7 years then purged.
+  description: Allocation of one licence seat to one user (one live seat per user per licence).
+  columns:
+  - name: licence_id
+    desc: Licence the seat belongs to.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: licence_seat_slot_id
+    desc: Claimed seat slot (same licence, composite FK).
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: app_user_id
+    desc: User holding the seat.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: seat_status_id
+    desc: Seat status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: assigned_at
+    desc: When the seat was assigned.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: assigned_by_app_user_id
+    desc: Admin who assigned the seat.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = system/self-provisioned.
+  - name: revoked_at
+    desc: When the seat was released.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = seat still live.
+  - name: last_login_at
+    desc: Most recent successful login on this seat.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = never logged in.
+  constraints:
+  - name: uq_licence_seat_id_app_user_id
+    type: unique
+    columns:
+    - id
+    - app_user_id
+    desc: Target of composite FK from device_session (session user == seat user).
+  - name: ck_licence_seat_revoked_range
+    type: check
+    expr: revoked_at IS NULL OR revoked_at >= assigned_at
+    desc: Release after assignment.
+  indexes:
+  - name: uq_licence_seat_licence_id_app_user_id
+    columns:
+    - licence_id
+    - app_user_id
+    unique: true
+    where: revoked_at IS NULL AND deleted_at IS NULL
+    desc: One live seat per user per licence.
+  - name: uq_licence_seat_licence_seat_slot_id
+    columns:
+    - licence_seat_slot_id
+    unique: true
+    where: revoked_at IS NULL AND deleted_at IS NULL
+    desc: 'One live seat per slot: seat count <= max_users.'
+  - name: idx_licence_seat_app_user_id_seat_status_id
+    columns:
+    - app_user_id
+    - seat_status_id
+    desc: My licences lookup at login.
+    where: revoked_at IS NULL
+  - name: idx_licence_seat_seat_status_id
+    columns:
+    - seat_status_id
+    desc: Leading index for FK fk_licence_seat_seat_status_id (child lookup / FK check).
+  - name: idx_licence_seat_assigned_by_app_user_id
+    columns:
+    - assigned_by_app_user_id
+    desc: Leading index for FK fk_licence_seat_assigned_by_app_user_id (child lookup / FK check).
+  fks:
+  - name: fk_licence_seat_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule RESTRICT (see table description)
+  - name: fk_licence_seat_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_licence_seat_seat_status_id
+    columns:
+    - seat_status_id
+    ref: seat_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: seat_status_id -> seat_status; delete rule RESTRICT (see table description)
+  - name: fk_licence_seat_assigned_by_app_user_id
+    columns:
+    - assigned_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: assigned_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_licence_seat_licence_seat_slot_id_licence_id
+    columns:
+    - licence_id
+    - licence_seat_slot_id
+    ref: licence_seat_slot
+    ref_columns:
+    - licence_id
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Slot must belong to the same licence.
+- name: licence_user_invitation
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B36
+  retention: Purged 90 days after closed_at (job).
+  description: Invitation for a person to take a seat on a licence.
+  columns:
+  - name: licence_id
+    desc: Licence offering the seat.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: invited_email
+    desc: Invitee email (lowercase).
+    sens: Personal
+    type: STRING(254)
+    domain: email
+    pii: masked outside licence admins; purged 90 days after close
+  - name: invited_app_user_id
+    desc: Existing user matched to the email.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = no account yet.
+  - name: licence_invitation_status_id
+    desc: Status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: token_hash
+    desc: SHA-256 of the invitation token.
+    sens: Sensitive
+    type: BYTES
+    domain: secret_hash
+    pii: hash only; raw token emailed once
+  - name: invited_by_app_user_id
+    desc: Admin who sent it.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: expires_at
+    desc: Invitation expiry.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+  - name: closed_at
+    desc: When accepted/declined/expired/cancelled.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = still pending.
+  - name: licence_seat_id
+    desc: Seat created on acceptance.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = not accepted.
+  constraints:
+  - name: uq_licence_user_invitation_token_hash
+    type: unique
+    columns:
+    - token_hash
+    desc: Token lookup.
+  - name: ck_licence_user_invitation_invited_email_lower
+    type: check
+    expr: invited_email = lower(invited_email)
+    desc: Lowercase email.
+  indexes:
+  - name: uq_licence_user_invitation_licence_id_invited_email
+    columns:
+    - licence_id
+    - invited_email
+    unique: true
+    where: closed_at IS NULL
+    desc: One pending invitation per email per licence.
+  - name: idx_licence_user_invitation_invited_app_user_id
+    columns:
+    - invited_app_user_id
+    desc: Invitations for a user.
+    where: invited_app_user_id IS NOT NULL
+  - name: idx_licence_user_invitation_invited_by_app_user_id
+    columns:
+    - invited_by_app_user_id
+    desc: Invitations by an admin.
+  - name: idx_licence_user_invitation_expires_at
+    columns:
+    - expires_at
+    desc: Expiry job.
+    where: closed_at IS NULL
+  - name: idx_licence_user_invitation_licence_invitation_status_id
+    columns:
+    - licence_invitation_status_id
+    desc: Leading index for FK fk_licence_user_invitation_licence_invitation_status_id (child lookup / FK check).
+  - name: idx_licence_user_invitation_licence_seat_id
+    columns:
+    - licence_seat_id
+    desc: Leading index for FK fk_licence_user_invitation_licence_seat_id (child lookup / FK check).
+  fks:
+  - name: fk_licence_user_invitation_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule CASCADE (see table description)
+  - name: fk_licence_user_invitation_invited_app_user_id
+    columns:
+    - invited_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: invited_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_licence_user_invitation_licence_invitation_status_id
+    columns:
+    - licence_invitation_status_id
+    ref: licence_invitation_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_invitation_status_id -> licence_invitation_status; delete rule RESTRICT (see table description)
+  - name: fk_licence_user_invitation_invited_by_app_user_id
+    columns:
+    - invited_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: invited_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_licence_user_invitation_licence_seat_id
+    columns:
+    - licence_seat_id
+    ref: licence_seat
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_seat_id -> licence_seat; delete rule RESTRICT (see table description)
+- name: licence_status_history
+  kind: audit
+  delete_policy: append_only
+  volume: low
+  tier: '1'
+  milestones:
+  - B36
+  retention: Retained with the licence (8 years); never updated.
+  description: Append-only history of licence status changes.
+  columns:
+  - name: licence_id
+    desc: Licence.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: from_licence_status_id
+    desc: Previous status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+    'null': true
+    null_why: NULL = initial creation.
+  - name: to_licence_status_id
+    desc: New status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: changed_at
+    desc: When changed.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: changed_by_app_user_id
+    desc: Actor.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = system job.
+  - name: reason_note
+    desc: Free-text reason.
+    sens: Internal
+    type: STRING(500)
+    domain: free_text
+    'null': true
+    null_why: NULL = no reason given.
+  constraints: []
+  indexes:
+  - name: idx_licence_status_history_licence_id_changed_at
+    columns:
+    - licence_id
+    - changed_at DESC
+    desc: History per licence.
+  - name: idx_licence_status_history_from_licence_status_id
+    columns:
+    - from_licence_status_id
+    desc: Leading index for FK fk_licence_status_history_from_licence_status_id (child lookup / FK check).
+  - name: idx_licence_status_history_to_licence_status_id
+    columns:
+    - to_licence_status_id
+    desc: Leading index for FK fk_licence_status_history_to_licence_status_id (child lookup / FK check).
+  - name: idx_licence_status_history_changed_by_app_user_id
+    columns:
+    - changed_by_app_user_id
+    desc: Leading index for FK fk_licence_status_history_changed_by_app_user_id (child lookup / FK check).
+  fks:
+  - name: fk_licence_status_history_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule RESTRICT (see table description)
+  - name: fk_licence_status_history_from_licence_status_id
+    columns:
+    - from_licence_status_id
+    ref: licence_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: from_licence_status_id -> licence_status; delete rule RESTRICT (see table description)
+  - name: fk_licence_status_history_to_licence_status_id
+    columns:
+    - to_licence_status_id
+    ref: licence_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: to_licence_status_id -> licence_status; delete rule RESTRICT (see table description)
+  - name: fk_licence_status_history_changed_by_app_user_id
+    columns:
+    - changed_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: changed_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+- name: licence_transfer
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B36
+  - B45
+  retention: Retained 8 years with the licence.
+  description: Transfer of licence ownership between accounts.
+  columns:
+  - name: licence_id
+    desc: Licence being transferred.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: from_account_id
+    desc: Current owner.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: to_account_id
+    desc: New owner.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: transfer_status_id
+    desc: Workflow state.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: requested_by_app_user_id
+    desc: Requester.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: approved_by_app_user_id
+    desc: Approver.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = not yet approved.
+  - name: requested_at
+    desc: Request time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: completed_at
+    desc: Completion time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = not completed.
+  constraints:
+  - name: ck_licence_transfer_accounts_differ
+    type: check
+    expr: from_account_id <> to_account_id
+    desc: Transfer must change owner.
+  - name: ck_licence_transfer_completed_range
+    type: check
+    expr: completed_at IS NULL OR completed_at >= requested_at
+    desc: Order.
+  indexes:
+  - name: idx_licence_transfer_licence_id_requested_at
+    columns:
+    - licence_id
+    - requested_at DESC
+    desc: Transfers of a licence.
+  - name: idx_licence_transfer_from_account_id
+    columns:
+    - from_account_id
+    desc: Outgoing transfers.
+  - name: idx_licence_transfer_to_account_id
+    columns:
+    - to_account_id
+    desc: Incoming transfers.
+  - name: idx_licence_transfer_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    desc: By requester.
+  - name: idx_licence_transfer_approved_by_app_user_id
+    columns:
+    - approved_by_app_user_id
+    desc: By approver.
+    where: approved_by_app_user_id IS NOT NULL
+  - name: idx_licence_transfer_transfer_status_id
+    columns:
+    - transfer_status_id
+    desc: Leading index for FK fk_licence_transfer_transfer_status_id (child lookup / FK check).
+  fks:
+  - name: fk_licence_transfer_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule RESTRICT (see table description)
+  - name: fk_licence_transfer_from_account_id
+    columns:
+    - from_account_id
+    ref: account
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: from_account_id -> account; delete rule RESTRICT (see table description)
+  - name: fk_licence_transfer_to_account_id
+    columns:
+    - to_account_id
+    ref: account
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: to_account_id -> account; delete rule RESTRICT (see table description)
+  - name: fk_licence_transfer_transfer_status_id
+    columns:
+    - transfer_status_id
+    ref: transfer_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: transfer_status_id -> transfer_status; delete rule RESTRICT (see table description)
+  - name: fk_licence_transfer_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: requested_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_licence_transfer_approved_by_app_user_id
+    columns:
+    - approved_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: approved_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+- name: licence_usage_snapshot
+  kind: snapshot
+  delete_policy: append_only
+  volume: medium
+  tier: '1'
+  milestones:
+  - B45
+  - B76
+  retention: Retained 3 years then dropped.
+  description: Daily snapshot of seat/device/session usage per licence.
+  columns:
+  - name: licence_id
+    desc: Licence.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: snapshot_date
+    desc: UTC day.
+    sens: Internal
+    type: DATE
+    domain: date
+  - name: seats_in_use
+    desc: Live seats at end of day.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: active_devices
+    desc: Distinct non-revoked devices seen in the day.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: peak_active_sessions
+    desc: Peak concurrent active sessions.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: login_count
+    desc: Successful logins.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: denied_login_count
+    desc: Logins denied (any reason).
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: device_limit_denied_count
+    desc: Logins denied because of device limit.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  constraints:
+  - name: uq_licence_usage_snapshot_licence_id_snapshot_date
+    type: unique
+    columns:
+    - licence_id
+    - snapshot_date
+    desc: One snapshot per licence per day (idempotent job).
+  indexes: []
+  fks:
+  - name: fk_licence_usage_snapshot_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule RESTRICT (see table description)
+- name: licence_ip_allowlist
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B45
+  retention: Soft-deleted; purged 1 year after licence end.
+  description: Allowed network ranges for logins under a licence.
+  columns:
+  - name: licence_id
+    desc: Licence.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: ip_network
+    desc: CIDR network (INET with prefix).
+    sens: Internal
+    type: INET
+    domain: ip_address
+  - name: label
+    desc: Admin label, e.g. head office.
+    sens: Internal
+    type: STRING(100)
+    domain: free_text
+    'null': true
+    null_why: NULL = unlabeled.
+  - name: is_active
+    desc: False = temporarily disabled.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'true'
+  constraints: []
+  indexes:
+  - name: uq_licence_ip_allowlist_licence_id_ip_network
+    columns:
+    - licence_id
+    - ip_network
+    unique: true
+    where: deleted_at IS NULL
+    desc: No duplicate ranges per licence.
+  fks:
+  - name: fk_licence_ip_allowlist_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule CASCADE (see table description)
+- name: licence_feature_override
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B45
+  retention: Soft-deleted; kept with licence history 8 years.
+  description: Per-licence override of a feature flag or numeric limit (outside the plan entitlements).
+  columns:
+  - name: licence_id
+    desc: Licence.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: licence_feature_id
+    desc: Feature overridden.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: is_enabled
+    desc: Enable or disable the feature.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'true'
+  - name: limit_value
+    desc: Numeric limit when the feature is quantitative.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    'null': true
+    null_why: NULL = not a numeric override.
+  - name: valid_from
+    desc: Override start.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: valid_to
+    desc: Override end.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = open-ended/ongoing.
+  - name: reason_note
+    desc: Why granted (sales/support note).
+    sens: Internal
+    type: STRING(500)
+    domain: free_text
+    'null': true
+    null_why: NULL = none recorded.
+  constraints:
+  - name: ck_licence_feature_override_valid_range
+    type: check
+    expr: valid_to IS NULL OR valid_to >= valid_from
+    desc: Window order.
+  - name: ck_licence_feature_override_limit_value_positive
+    type: check
+    expr: limit_value IS NULL OR limit_value >= 0
+    desc: Non-negative limit.
+  indexes:
+  - name: uq_licence_feature_override_licence_id_licence_feature_id
+    columns:
+    - licence_id
+    - licence_feature_id
+    unique: true
+    where: deleted_at IS NULL AND valid_to IS NULL
+    desc: One open-ended override per feature per licence.
+  - name: idx_licence_feature_override_licence_feature_id
+    columns:
+    - licence_feature_id
+    desc: Find licences with a feature override.
+  fks:
+  - name: fk_licence_feature_override_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule CASCADE (see table description)
+  - name: fk_licence_feature_override_licence_feature_id
+    columns:
+    - licence_feature_id
+    ref: licence_feature
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_feature_id -> licence_feature; delete rule RESTRICT (see table description)
+- name: device
+  kind: entity
+  delete_policy: soft
+  volume: high
+  tier: '1'
+  milestones:
+  - B39
+  - B42
+  - B76
+  retention: Soft-deleted when user removes it; purged 13 months after last_seen_at (job) or on erasure.
+  description: A registered client device of a user (fingerprint hash, platform, trust).
+  columns:
+  - name: app_user_id
+    desc: Device owner.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: device_fingerprint_hash
+    desc: HMAC-SHA256 of the client device fingerprint (never the raw identifier).
+    sens: Personal
+    type: BYTES
+    domain: secret_hash
+    pii: keyed hash only; raw fingerprint never stored
+  - name: device_platform_id
+    desc: Platform.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: device_model
+    desc: Reported model.
+    sens: Internal
+    type: STRING(100)
+    domain: free_text
+    'null': true
+    null_why: NULL = not reported (web).
+  - name: os_version
+    desc: OS/browser version.
+    sens: Internal
+    type: STRING(50)
+    domain: free_text
+    'null': true
+    null_why: NULL = not reported.
+  - name: app_version
+    desc: App build version.
+    sens: Internal
+    type: STRING(30)
+    domain: free_text
+    'null': true
+    null_why: NULL = web client.
+  - name: device_label
+    desc: User-given name.
+    sens: Internal
+    type: STRING(100)
+    domain: free_text
+    'null': true
+    null_why: NULL = user has not named it.
+  - name: is_trusted
+    desc: Passed a trust challenge.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'false'
+  - name: trusted_at
+    desc: When trust was granted.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = not trusted.
+  - name: first_seen_at
+    desc: First registration.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: last_seen_at
+    desc: Last successful login/activity.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: last_ip_address
+    desc: Last IP seen.
+    sens: Personal
+    type: INET
+    domain: ip_address
+    'null': true
+    null_why: NULL = unknown.
+    pii: retained while device is registered; purged on erasure
+  - name: revoked_at
+    desc: When revoked (cannot log in).
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = not revoked.
+  constraints:
+  - name: uq_device_id_app_user_id
+    type: unique
+    columns:
+    - id
+    - app_user_id
+    desc: Target of composite FK from device_session.
+  - name: ck_device_trusted_consistent
+    type: check
+    expr: (is_trusted AND trusted_at IS NOT NULL) OR (NOT is_trusted)
+    desc: Trusted devices carry a timestamp.
+  - name: ck_device_seen_range
+    type: check
+    expr: last_seen_at >= first_seen_at
+    desc: Time order.
+  indexes:
+  - name: uq_device_app_user_id_device_fingerprint_hash
+    columns:
+    - app_user_id
+    - device_fingerprint_hash
+    unique: true
+    where: deleted_at IS NULL
+    desc: One live registration per user and fingerprint.
+  - name: idx_device_app_user_id_last_seen_at
+    columns:
+    - app_user_id
+    - last_seen_at DESC
+    desc: My devices screen.
+    where: deleted_at IS NULL
+  - name: idx_device_last_seen_at
+    columns:
+    - last_seen_at
+    desc: Stale device purge, sharded.
+    hash: true
+    bucket_count: 8
+  - name: idx_device_device_platform_id
+    columns:
+    - device_platform_id
+    desc: Leading index for FK fk_device_device_platform_id (child lookup / FK check).
+  fks:
+  - name: fk_device_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_device_device_platform_id
+    columns:
+    - device_platform_id
+    ref: device_platform
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: device_platform_id -> device_platform; delete rule RESTRICT (see table description)
+- name: device_slot
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B39
+  - B76
+  retention: Deleted with its seat (CASCADE); recreated on seat reactivation.
+  description: Pre-created device slots 1..max_devices_per_user for a seat; an active session claims one (D-13).
+  columns:
+  - name: licence_seat_id
+    desc: Seat the slot belongs to.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: slot_no
+    desc: Slot number.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: is_retired
+    desc: True when the licence limit was lowered; slot kept while in use.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'false'
+  constraints:
+  - name: uq_device_slot_licence_seat_id_slot_no
+    type: unique
+    columns:
+    - licence_seat_id
+    - slot_no
+    desc: One row per slot per seat.
+  - name: uq_device_slot_licence_seat_id_id
+    type: unique
+    columns:
+    - licence_seat_id
+    - id
+    desc: Target of composite FK from device_session.
+  - name: ck_device_slot_slot_no_positive
+    type: check
+    expr: slot_no > 0
+    desc: Slots start at 1.
+  indexes: []
+  fks:
+  - name: fk_device_slot_licence_seat_id
+    columns:
+    - licence_seat_id
+    ref: licence_seat
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: licence_seat_id -> licence_seat; delete rule CASCADE (see table description)
+- name: device_session
+  kind: entity
+  delete_policy: hard
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B39
+  - B42
+  - B76
+  retention: Active rows kept; ended rows TTL-purged 13 months after ended_at; erasure anonymises ip_address.
+  description: An authenticated session on a device, holding one device slot while ended_at IS NULL (the licence limit counter).
+  ttl:
+    expire_after: 13 months
+    column: ended_at
+  columns:
+  - name: identity_session_id
+    desc: Identity-module session this extends (1:1).
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = the identity_session row was expired by its 7-day row-level TTL; the device_session keeps its own history.
+  - name: app_user_id
+    desc: Session user (equal to seat user and device user by composite FKs).
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: device_id
+    desc: Device used.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: licence_seat_id
+    desc: Seat the session runs under.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: device_slot_id
+    desc: Claimed device slot.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: started_at
+    desc: Session start.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: last_activity_at
+    desc: Last activity (heartbeat, sampled).
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: expires_at
+    desc: Absolute expiry; at or after this the session no longer counts.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+  - name: ended_at
+    desc: End time; slot is free once set.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = session active.
+  - name: session_end_reason_id
+    desc: Why it ended.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+    'null': true
+    null_why: NULL = session active.
+  - name: ip_address
+    desc: IP at login.
+    sens: Personal
+    type: INET
+    domain: ip_address
+    pii: retained for security audit 13 months then TTL
+  - name: authentication_method_id
+    desc: How the user authenticated.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  constraints:
+  - name: uq_device_session_identity_session_id
+    type: unique
+    columns:
+    - identity_session_id
+    desc: One device session per identity session.
+  - name: ck_device_session_ended_range
+    type: check
+    expr: ended_at IS NULL OR ended_at >= started_at
+    desc: End after start.
+  - name: ck_device_session_end_reason_consistent
+    type: check
+    expr: (ended_at IS NULL) = (session_end_reason_id IS NULL)
+    desc: Reason present iff ended.
+  - name: ck_device_session_expiry_range
+    type: check
+    expr: expires_at >= started_at
+    desc: Expiry after start.
+  - name: ck_device_session_activity_range
+    type: check
+    expr: last_activity_at >= started_at
+    desc: Activity after start.
+  indexes:
+  - name: uq_device_session_device_slot_id
+    columns:
+    - device_slot_id
+    unique: true
+    where: ended_at IS NULL
+    desc: 'Each slot held by at most one active session: enforces max_devices_per_user (D-13).'
+  - name: uq_device_session_device_id
+    columns:
+    - device_id
+    unique: true
+    where: ended_at IS NULL
+    desc: A device has at most one active session.
+  - name: idx_device_session_app_user_id_started_at
+    columns:
+    - app_user_id
+    - started_at DESC
+    desc: User session history.
+  - name: idx_device_session_licence_seat_id
+    columns:
+    - licence_seat_id
+    desc: Active session count per seat.
+    where: ended_at IS NULL
+    storing:
+    - device_slot_id
+    - expires_at
+    - last_activity_at
+  - name: idx_device_session_expires_at
+    columns:
+    - expires_at
+    desc: 'Expiry job: find active sessions past expiry.'
+    where: ended_at IS NULL
+    hash: true
+    bucket_count: 16
+  - name: idx_device_session_started_at
+    columns:
+    - started_at
+    desc: Time-ordered scans, sharded.
+    hash: true
+    bucket_count: 16
+  - name: idx_device_session_session_end_reason_id
+    columns:
+    - session_end_reason_id
+    desc: Leading index for FK fk_device_session_session_end_reason_id (child lookup / FK check).
+  - name: idx_device_session_authentication_method_id
+    columns:
+    - authentication_method_id
+    desc: Leading index for FK fk_device_session_authentication_method_id (child lookup / FK check).
+  fks:
+  - name: fk_device_session_identity_session_id
+    columns:
+    - identity_session_id
+    ref: identity_session
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+  - name: fk_device_session_session_end_reason_id
+    columns:
+    - session_end_reason_id
+    ref: session_end_reason
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: session_end_reason_id -> session_end_reason; delete rule RESTRICT (see table description)
+  - name: fk_device_session_authentication_method_id
+    columns:
+    - authentication_method_id
+    ref: authentication_method
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: authentication_method_id -> authentication_method; delete rule RESTRICT (see table description)
+  - name: fk_device_session_device_slot_id_licence_seat_id
+    columns:
+    - licence_seat_id
+    - device_slot_id
+    ref: device_slot
+    ref_columns:
+    - licence_seat_id
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Slot belongs to the same seat.
+  - name: fk_device_session_licence_seat_id_app_user_id
+    columns:
+    - licence_seat_id
+    - app_user_id
+    ref: licence_seat
+    ref_columns:
+    - id
+    - app_user_id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Session user equals the seat user.
+  - name: fk_device_session_device_id_app_user_id
+    columns:
+    - device_id
+    - app_user_id
+    ref: device
+    ref_columns:
+    - id
+    - app_user_id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Device belongs to the session user.
+- name: session_activity_sample
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B45
+  retention: TTL 30 days.
+  description: Sampled activity heartbeats of a session (security forensics, idle detection).
+  ttl:
+    expire_after: 30 days
+    column: sampled_at
+  columns:
+  - name: device_session_id
+    desc: Session.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: sampled_at
+    desc: Sample time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: ip_address
+    desc: IP at sample.
+    sens: Personal
+    type: INET
+    domain: ip_address
+    pii: TTL 30 days
+  - name: endpoint_group
+    desc: Coarse feature group touched (search, profile, billing...).
+    sens: Internal
+    type: STRING(40)
+    domain: code
+  - name: request_count
+    desc: Requests in the sampling interval.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  constraints: []
+  indexes:
+  - name: idx_session_activity_sample_sampled_at
+    columns:
+    - sampled_at
+    desc: Time scan, sharded.
+    hash: true
+    bucket_count: 16
+  - name: idx_session_activity_sample_device_session_id_sampled_at
+    columns:
+    - device_session_id
+    - sampled_at DESC
+    desc: Samples of a session.
+  fks:
+  - name: fk_session_activity_sample_device_session_id
+    columns:
+    - device_session_id
+    ref: device_session
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: 'CASCADE: the sample is a subset of the session and has its own shorter TTL; it follows the parent when the parent expires first (decision F-01).'
+- name: login_attempt
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B36
+  - B39
+  - B76
+  retention: TTL 24 months on attempted_at; erasure nulls app_user_id/ip via anonymise job exception-logged.
+  description: Append-only record of every login attempt, success or failure (very high volume).
+  ttl:
+    expire_after: 24 months
+    column: attempted_at
+  columns:
+  - name: app_user_id
+    desc: User matched, if any.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = submitted identifier matched no user (outcome unknown_user).
+  - name: identifier_hmac
+    desc: Keyed hash of the submitted login identifier (email/phone), to correlate attacks on unknown users.
+    sens: Personal
+    type: BYTES
+    domain: secret_hash
+    pii: HMAC-SHA256 keyed hash only
+  - name: login_outcome_id
+    desc: Success or failure reason.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: authentication_method_id
+    desc: Method tried.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: licence_id
+    desc: Licence context if resolved.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = not resolved (unknown user, no seat).
+  - name: device_id
+    desc: Registered device if known.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = unregistered device or failure before registration.
+  - name: device_fingerprint_hash
+    desc: Fingerprint hash presented.
+    sens: Personal
+    type: BYTES
+    domain: secret_hash
+    'null': true
+    null_why: NULL = client sent none.
+    pii: keyed hash only
+  - name: ip_address
+    desc: Client IP.
+    sens: Personal
+    type: INET
+    domain: ip_address
+    pii: TTL 24 months; masked in exports
+  - name: country_id
+    desc: Geo-IP country.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = geo lookup unavailable.
+  - name: user_agent
+    desc: Truncated user agent string.
+    sens: Internal
+    type: STRING(300)
+    domain: free_text
+    'null': true
+    null_why: NULL = absent.
+  - name: risk_score
+    desc: Risk score 0..100.
+    sens: Internal
+    type: DECIMAL(5,2)
+    domain: percentage
+    'null': true
+    null_why: NULL = not scored.
+  - name: request_ref
+    desc: Request/trace id; idempotency of retried login txns.
+    sens: Internal
+    type: STRING(64)
+    domain: code
+  - name: attempted_at
+    desc: Attempt time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: uq_login_attempt_request_ref_login_outcome_id
+    type: unique
+    columns:
+    - request_ref
+    - login_outcome_id
+    desc: A retried login txn cannot double-log the same outcome.
+  - name: ck_login_attempt_risk_score_range
+    type: check
+    expr: risk_score IS NULL OR (risk_score >= 0 AND risk_score <= 100)
+    desc: Percentage range.
+  indexes:
+  - name: idx_login_attempt_attempted_at
+    columns:
+    - attempted_at
+    desc: Time-ordered scans, sharded.
+    hash: true
+    bucket_count: 16
+  - name: idx_login_attempt_app_user_id_attempted_at
+    columns:
+    - app_user_id
+    - attempted_at DESC
+    desc: User login history.
+    where: app_user_id IS NOT NULL
+  - name: idx_login_attempt_ip_address_attempted_at
+    columns:
+    - ip_address
+    - attempted_at DESC
+    desc: Brute-force/rate-limit by IP.
+  - name: idx_login_attempt_licence_id_attempted_at
+    columns:
+    - licence_id
+    - attempted_at DESC
+    desc: Licence login history.
+    where: licence_id IS NOT NULL
+  - name: idx_login_attempt_device_id
+    columns:
+    - device_id
+    desc: Attempts per device.
+    where: device_id IS NOT NULL
+  - name: idx_login_attempt_country_id
+    columns:
+    - country_id
+    desc: Geo analysis.
+    where: country_id IS NOT NULL
+  - name: idx_login_attempt_login_outcome_id
+    columns:
+    - login_outcome_id
+    desc: Leading index for FK fk_login_attempt_login_outcome_id (child lookup / FK check).
+  - name: idx_login_attempt_authentication_method_id
+    columns:
+    - authentication_method_id
+    desc: Leading index for FK fk_login_attempt_authentication_method_id (child lookup / FK check).
+  fks:
+  - name: fk_login_attempt_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_login_attempt_login_outcome_id
+    columns:
+    - login_outcome_id
+    ref: login_outcome
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: login_outcome_id -> login_outcome; delete rule RESTRICT (see table description)
+  - name: fk_login_attempt_authentication_method_id
+    columns:
+    - authentication_method_id
+    ref: authentication_method
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: authentication_method_id -> authentication_method; delete rule RESTRICT (see table description)
+  - name: fk_login_attempt_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_id -> licence; delete rule RESTRICT (see table description)
+  - name: fk_login_attempt_device_id
+    columns:
+    - device_id
+    ref: device
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: device_id -> device; delete rule RESTRICT (see table description)
+  - name: fk_login_attempt_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: country_id -> country; delete rule RESTRICT (see table description)
+- name: device_revocation
+  kind: event
+  delete_policy: append_only
+  volume: medium
+  tier: '1'
+  milestones:
+  - B42
+  - B76
+  retention: Retained 7 years (audit class).
+  description: 'Auditable event: a device was revoked (all its sessions end).'
+  columns:
+  - name: device_id
+    desc: Revoked device.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: app_user_id
+    desc: Owner of the device (subject).
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: revoked_by_app_user_id
+    desc: Actor.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = system rule (revocation_source = system).
+  - name: revocation_source_id
+    desc: Initiator class.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: revocation_reason_id
+    desc: Reason.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: sessions_ended
+    desc: Number of sessions ended by this revocation.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '0'
+  - name: audit_event_id
+    desc: Audit trail row written in the same txn.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = the audit_event row aged out of its 400-day TTL; this evidence row carries who/when/why itself.
+  - name: note
+    desc: Free-text note.
+    sens: Internal
+    type: STRING(500)
+    domain: free_text
+    'null': true
+    null_why: NULL = none.
+  - name: revoked_at
+    desc: Revocation time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: ck_device_revocation_sessions_ended_nonneg
+    type: check
+    expr: sessions_ended >= 0
+    desc: Non-negative.
+  indexes:
+  - name: idx_device_revocation_device_id_revoked_at
+    columns:
+    - device_id
+    - revoked_at DESC
+    desc: Revocations of a device.
+  - name: idx_device_revocation_app_user_id_revoked_at
+    columns:
+    - app_user_id
+    - revoked_at DESC
+    desc: Revocations affecting a user.
+  - name: idx_device_revocation_revoked_by_app_user_id
+    columns:
+    - revoked_by_app_user_id
+    desc: Revocations by an actor.
+    where: revoked_by_app_user_id IS NOT NULL
+  - name: idx_device_revocation_audit_event_id
+    columns:
+    - audit_event_id
+    desc: Join to audit trail.
+  - name: idx_device_revocation_revocation_source_id
+    columns:
+    - revocation_source_id
+    desc: Leading index for FK fk_device_revocation_revocation_source_id (child lookup / FK check).
+  - name: idx_device_revocation_revocation_reason_id
+    columns:
+    - revocation_reason_id
+    desc: Leading index for FK fk_device_revocation_revocation_reason_id (child lookup / FK check).
+  fks:
+  - name: fk_device_revocation_device_id
+    columns:
+    - device_id
+    ref: device
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: device_id -> device; delete rule RESTRICT (see table description)
+  - name: fk_device_revocation_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_device_revocation_revoked_by_app_user_id
+    columns:
+    - revoked_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: revoked_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_device_revocation_revocation_source_id
+    columns:
+    - revocation_source_id
+    ref: revocation_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: revocation_source_id -> revocation_source; delete rule RESTRICT (see table description)
+  - name: fk_device_revocation_revocation_reason_id
+    columns:
+    - revocation_reason_id
+    ref: revocation_reason
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: revocation_reason_id -> revocation_reason; delete rule RESTRICT (see table description)
+  - name: fk_device_revocation_audit_event_id
+    columns:
+    - audit_event_id
+    ref: audit_event
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+- name: session_revocation
+  kind: event
+  delete_policy: append_only
+  volume: medium
+  tier: '1'
+  milestones:
+  - B42
+  - B76
+  retention: Retained 7 years (audit class).
+  description: 'Auditable event: a single session was revoked.'
+  columns:
+  - name: device_session_id
+    desc: Revoked session.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = the device_session row was expired by its 13-month TTL; the revocation keeps its own columns.
+  - name: device_revocation_id
+    desc: Parent device revocation if cascaded.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = session revoked on its own.
+  - name: app_user_id
+    desc: Session owner.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: revoked_by_app_user_id
+    desc: Actor.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = system rule.
+  - name: revocation_source_id
+    desc: Initiator class.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: revocation_reason_id
+    desc: Reason.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: audit_event_id
+    desc: Audit trail row written in the same txn.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = the audit_event row aged out of its 400-day TTL; this evidence row carries who/when/why itself.
+  - name: revoked_at
+    desc: Revocation time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: uq_session_revocation_device_session_id
+    type: unique
+    columns:
+    - device_session_id
+    desc: A session is revoked at most once.
+  indexes:
+  - name: idx_session_revocation_device_revocation_id
+    columns:
+    - device_revocation_id
+    desc: Children of a device revocation.
+    where: device_revocation_id IS NOT NULL
+  - name: idx_session_revocation_app_user_id_revoked_at
+    columns:
+    - app_user_id
+    - revoked_at DESC
+    desc: By user.
+  - name: idx_session_revocation_revoked_by_app_user_id
+    columns:
+    - revoked_by_app_user_id
+    desc: By actor.
+    where: revoked_by_app_user_id IS NOT NULL
+  - name: idx_session_revocation_audit_event_id
+    columns:
+    - audit_event_id
+    desc: Join to audit trail.
+  - name: idx_session_revocation_revocation_source_id
+    columns:
+    - revocation_source_id
+    desc: Leading index for FK fk_session_revocation_revocation_source_id (child lookup / FK check).
+  - name: idx_session_revocation_revocation_reason_id
+    columns:
+    - revocation_reason_id
+    desc: Leading index for FK fk_session_revocation_revocation_reason_id (child lookup / FK check).
+  fks:
+  - name: fk_session_revocation_device_session_id
+    columns:
+    - device_session_id
+    ref: device_session
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+  - name: fk_session_revocation_device_revocation_id
+    columns:
+    - device_revocation_id
+    ref: device_revocation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: device_revocation_id -> device_revocation; delete rule RESTRICT (see table description)
+  - name: fk_session_revocation_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_session_revocation_revoked_by_app_user_id
+    columns:
+    - revoked_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: revoked_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_session_revocation_revocation_source_id
+    columns:
+    - revocation_source_id
+    ref: revocation_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: revocation_source_id -> revocation_source; delete rule RESTRICT (see table description)
+  - name: fk_session_revocation_revocation_reason_id
+    columns:
+    - revocation_reason_id
+    ref: revocation_reason
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: revocation_reason_id -> revocation_reason; delete rule RESTRICT (see table description)
+  - name: fk_session_revocation_audit_event_id
+    columns:
+    - audit_event_id
+    ref: audit_event
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+- name: device_limit_violation
+  kind: event
+  delete_policy: append_only
+  volume: medium
+  tier: '1'
+  milestones:
+  - B39
+  - B42
+  - B76
+  retention: Retained 7 years (audit class).
+  description: Evidence that a login tried to exceed max_devices_per_user (docket Rule 9); paired with an audit_event.
+  columns:
+  - name: licence_seat_id
+    desc: Seat that was full.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: app_user_id
+    desc: User attempting login.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: device_id
+    desc: Device if registered.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = new unregistered device.
+  - name: attempted_fingerprint_hash
+    desc: Fingerprint hash presented.
+    sens: Personal
+    type: BYTES
+    domain: secret_hash
+    pii: keyed hash only
+  - name: active_session_count
+    desc: Active sessions counted at the time.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: max_devices_allowed
+    desc: Limit in force (snapshot of licence.max_devices_per_user).
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: device_limit_policy_id
+    desc: Policy applied (deny_new or replace_oldest).
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: replaced_device_session_id
+    desc: Session signed out under replace_oldest.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = login denied (deny_new).
+  - name: login_attempt_id
+    desc: The attempt row recorded with device_limit_denied/success.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = the login_attempt row was expired by its 24-month TTL; the violation row is self-describing.
+  - name: audit_event_id
+    desc: Audit trail row (docket Rule 9).
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = the audit_event row aged out of its 400-day TTL; the violation row is self-describing.
+  - name: occurred_at
+    desc: Time of the attempt.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: ck_device_limit_violation_count_at_limit
+    type: check
+    expr: active_session_count >= max_devices_allowed
+    desc: Only recorded when the limit was reached.
+  indexes:
+  - name: idx_device_limit_violation_licence_seat_id_occurred_at
+    columns:
+    - licence_seat_id
+    - occurred_at DESC
+    desc: Violations per seat.
+  - name: idx_device_limit_violation_app_user_id_occurred_at
+    columns:
+    - app_user_id
+    - occurred_at DESC
+    desc: Violations per user.
+  - name: idx_device_limit_violation_device_id
+    columns:
+    - device_id
+    desc: Violations per device.
+    where: device_id IS NOT NULL
+  - name: idx_device_limit_violation_replaced_device_session_id
+    columns:
+    - replaced_device_session_id
+    desc: Reverse lookup.
+    where: replaced_device_session_id IS NOT NULL
+  - name: idx_device_limit_violation_login_attempt_id
+    columns:
+    - login_attempt_id
+    desc: Join to attempt.
+  - name: idx_device_limit_violation_audit_event_id
+    columns:
+    - audit_event_id
+    desc: Join to audit.
+  - name: idx_device_limit_violation_device_limit_policy_id
+    columns:
+    - device_limit_policy_id
+    desc: Leading index for FK fk_device_limit_violation_device_limit_policy_id (child lookup / FK check).
+  fks:
+  - name: fk_device_limit_violation_licence_seat_id
+    columns:
+    - licence_seat_id
+    ref: licence_seat
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: licence_seat_id -> licence_seat; delete rule RESTRICT (see table description)
+  - name: fk_device_limit_violation_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_device_limit_violation_device_id
+    columns:
+    - device_id
+    ref: device
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: device_id -> device; delete rule RESTRICT (see table description)
+  - name: fk_device_limit_violation_device_limit_policy_id
+    columns:
+    - device_limit_policy_id
+    ref: device_limit_policy
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: device_limit_policy_id -> device_limit_policy; delete rule RESTRICT (see table description)
+  - name: fk_device_limit_violation_replaced_device_session_id
+    columns:
+    - replaced_device_session_id
+    ref: device_session
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+  - name: fk_device_limit_violation_login_attempt_id
+    columns:
+    - login_attempt_id
+    ref: login_attempt
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+  - name: fk_device_limit_violation_audit_event_id
+    columns:
+    - audit_event_id
+    ref: audit_event
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+- name: device_trust_challenge
+  kind: entity
+  delete_policy: hard
+  volume: high
+  tier: '1'
+  milestones:
+  - B45
+  retention: TTL 30 days after expires_at.
+  description: Challenge issued to prove possession of a new/untrusted device.
+  ttl:
+    expire_after: 30 days
+    column: expires_at
+  columns:
+  - name: device_id
+    desc: Device being verified.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: app_user_id
+    desc: User.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: trust_challenge_type_id
+    desc: Challenge type.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: trust_challenge_status_id
+    desc: State.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: code_hash
+    desc: Hash of the one-time code.
+    sens: Sensitive
+    type: BYTES
+    domain: secret_hash
+    pii: argon2id hash; never stored in clear
+  - name: attempt_count
+    desc: Wrong attempts so far.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '0'
+  - name: ip_address
+    desc: IP when issued.
+    sens: Personal
+    type: INET
+    domain: ip_address
+    pii: TTL 30 days after expiry
+  - name: issued_at
+    desc: Issue time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: expires_at
+    desc: Expiry time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+  - name: solved_at
+    desc: When solved.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = unsolved.
+  constraints:
+  - name: ck_device_trust_challenge_expiry_range
+    type: check
+    expr: expires_at >= issued_at
+    desc: Expiry after issue.
+  - name: ck_device_trust_challenge_attempt_nonneg
+    type: check
+    expr: attempt_count >= 0
+    desc: Non-negative.
+  indexes:
+  - name: idx_device_trust_challenge_device_id_issued_at
+    columns:
+    - device_id
+    - issued_at DESC
+    desc: Challenges of a device.
+  - name: idx_device_trust_challenge_app_user_id
+    columns:
+    - app_user_id
+    desc: By user.
+  - name: idx_device_trust_challenge_issued_at
+    columns:
+    - issued_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 8
+  - name: idx_device_trust_challenge_trust_challenge_type_id
+    columns:
+    - trust_challenge_type_id
+    desc: Leading index for FK fk_device_trust_challenge_trust_challenge_type_id (child lookup / FK check).
+  - name: idx_device_trust_challenge_trust_challenge_status_id
+    columns:
+    - trust_challenge_status_id
+    desc: Leading index for FK fk_device_trust_challenge_trust_challenge_status_id (child lookup / FK check).
+  fks:
+  - name: fk_device_trust_challenge_device_id
+    columns:
+    - device_id
+    ref: device
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: device_id -> device; delete rule RESTRICT (see table description)
+  - name: fk_device_trust_challenge_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_device_trust_challenge_trust_challenge_type_id
+    columns:
+    - trust_challenge_type_id
+    ref: trust_challenge_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: trust_challenge_type_id -> trust_challenge_type; delete rule RESTRICT (see table description)
+  - name: fk_device_trust_challenge_trust_challenge_status_id
+    columns:
+    - trust_challenge_status_id
+    ref: trust_challenge_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: trust_challenge_status_id -> trust_challenge_status; delete rule RESTRICT (see table description)
+- name: push_registration
+  kind: entity
+  delete_policy: hard
+  volume: high
+  tier: '1'
+  milestones:
+  - B45
+  retention: Deleted with its device; invalidated tokens purged after 30 days.
+  description: Push notification token bound to a device.
+  columns:
+  - name: device_id
+    desc: Device.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: push_provider_id
+    desc: Provider.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: push_token
+    desc: Provider token, envelope-encrypted.
+    sens: Sensitive
+    type: BYTES
+    domain: encrypted
+    pii: AES-GCM envelope encryption
+  - name: push_token_hash
+    desc: SHA-256 of the token for dedupe.
+    sens: Sensitive
+    type: BYTES
+    domain: secret_hash
+    pii: hash only
+  - name: registered_at
+    desc: Registration time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: last_refreshed_at
+    desc: Last token refresh.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = never refreshed.
+  - name: invalidated_at
+    desc: When provider reported invalid.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = still valid.
+  constraints: []
+  indexes:
+  - name: uq_push_registration_push_provider_id_push_token_hash
+    columns:
+    - push_provider_id
+    - push_token_hash
+    unique: true
+    where: invalidated_at IS NULL
+    desc: One live registration per token.
+  - name: idx_push_registration_device_id
+    columns:
+    - device_id
+    desc: Tokens of a device.
+    where: invalidated_at IS NULL
+  - name: idx_push_registration_registered_at
+    columns:
+    - registered_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 8
+  fks:
+  - name: fk_push_registration_device_id
+    columns:
+    - device_id
+    ref: device
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: device_id -> device; delete rule CASCADE (see table description)
+  - name: fk_push_registration_push_provider_id
+    columns:
+    - push_provider_id
+    ref: push_provider
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: push_provider_id -> push_provider; delete rule RESTRICT (see table description)
+views:
+- name: vw_login_history
+  kind: view
+  tables:
+  - login_attempt
+  - device
+  - device_session
+  purpose: 'Per-user login history: attempts with device platform and session end for the account owner and licence admin.'
+  security: security_invoker semantics via app role grants; users see only own rows (app_user_id = session user); licence admins see rows of their licence; IP masked for non-owners.
+  sql_sketch: SELECT la.app_user_id, la.attempted_at, la.login_outcome_id, la.ip_address, d.device_platform_id, ds.ended_at, ds.session_end_reason_id FROM login_attempt la LEFT JOIN device d ON d.id = la.device_id
+    LEFT JOIN device_session ds ON ds.device_id = la.device_id AND ds.started_at >= la.attempted_at AND ds.started_at < la.attempted_at + interval '1 minute' WHERE la.app_user_id IS NOT NULL
+- name: vw_active_device_session
+  kind: view
+  tables:
+  - device_session
+  - licence_seat
+  purpose: 'Active (counted) sessions: ended_at IS NULL AND expires_at > now().'
+  security: Read-only to app role; used by "my devices" and admin console.
+  sql_sketch: SELECT * FROM device_session WHERE ended_at IS NULL AND expires_at > now()
+- name: vw_licence_seat_availability
+  kind: view
+  tables:
+  - licence
+  - licence_seat_slot
+  - licence_seat
+  purpose: Free seats and used devices per licence.
+  security: Licence admins of the licence only.
+  sql_sketch: SELECT l.id, l.max_users, count(s.id) AS used FROM licence l LEFT JOIN licence_seat s ON s.licence_id = l.id AND s.revoked_at IS NULL AND s.deleted_at IS NULL GROUP BY l.id
+business_rules:
+- id: BR-LIC-01
+  rule: Every licence has a positive max_users and max_devices_per_user.
+  mechanism_type: CHECK
+  mechanism: 'ck_licence_max_users_positive: max_users > 0; ck_licence_max_devices_positive: max_devices_per_user BETWEEN 1 AND 100; both INT4 NOT NULL explicit columns.'
+  tables:
+  - licence
+  milestone: B36
+- id: BR-LIC-02
+  rule: A licence cannot have more live seats than max_users.
+  mechanism_type: SLOT_TABLE
+  mechanism: licence_seat_slot rows 1..max_users per licence, UNIQUE(licence_id, slot_no). licence_seat claims one slot; partial unique uq_licence_seat_licence_seat_slot_id WHERE revoked_at IS NULL AND
+    deleted_at IS NULL; composite FK (licence_id, licence_seat_slot_id) -> licence_seat_slot(licence_id, id) keeps the slot in the same licence. Declarative twin of BR-LIC-03.
+  tables:
+  - licence
+  - licence_seat_slot
+  - licence_seat
+  milestone: B36
+- id: BR-LIC-03
+  rule: Seat assignment serialises per licence.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Txn: (1) SELECT id,max_users,seats_in_use,licence_status_id FROM licence WHERE id=$1 FOR UPDATE; (2) require status active and now() within validity; (3) SELECT id FROM licence_seat_slot WHERE
+    licence_id=$1 AND NOT is_retired AND id NOT IN (SELECT licence_seat_slot_id FROM licence_seat WHERE licence_id=$1 AND revoked_at IS NULL AND deleted_at IS NULL) ORDER BY slot_no LIMIT 1; (4) none ->
+    reject (seat_limit_reached, audit_event); (5) INSERT licence_seat (conflict on live user seat = already seated); INSERT device_slot rows 1..max_devices_per_user; UPDATE licence SET seats_in_use=seats_in_use+1;
+    (6) COMMIT; retry the whole txn on SQLSTATE 40001.'
+  tables:
+  - licence
+  - licence_seat_slot
+  - licence_seat
+  - device_slot
+  milestone: B36
+- id: BR-LIC-04
+  rule: One live seat per user per licence.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq_licence_seat_licence_id_app_user_id UNIQUE (licence_id, app_user_id) WHERE revoked_at IS NULL AND deleted_at IS NULL.
+  tables:
+  - licence_seat
+  milestone: B36
+- id: BR-LIC-05
+  rule: A user cannot hold more active sessions than max_devices_per_user.
+  mechanism_type: SLOT_TABLE
+  mechanism: 'device_slot rows 1..max_devices_per_user per seat; device_session claims one; uq_device_session_device_slot_id UNIQUE (device_slot_id) WHERE ended_at IS NULL (D-13). Composite FKs force slot/seat/user/device
+    consistency: (licence_seat_id, device_slot_id)->device_slot(licence_seat_id,id); (licence_seat_id, app_user_id)->licence_seat(id,app_user_id); (device_id, app_user_id)->device(id,app_user_id). A device
+    holds at most one active session (uq_device_session_device_id).'
+  tables:
+  - device_slot
+  - device_session
+  - licence_seat
+  - device
+  milestone: B39
+- id: BR-LIC-06
+  rule: Login enforces the limit at the point of login with exact SQL steps.
+  mechanism_type: TXN_LOCK
+  mechanism: 'BEGIN (SERIALIZABLE). 1) SELECT l.id, l.licence_status_id, l.valid_from, l.valid_to, l.max_devices_per_user, l.device_limit_policy_id, l.session_idle_timeout_minutes, l.session_max_lifetime_hours,
+    s.id AS seat_id FROM licence l JOIN licence_seat s ON s.licence_id=l.id WHERE s.app_user_id=$user AND s.revoked_at IS NULL AND s.deleted_at IS NULL AND l.id=$lic FOR UPDATE OF s (locks only this user''s
+    seat row; no seat/active licence -> INSERT login_attempt(no_seat|licence_inactive), COMMIT, deny). 2) IP allowlist: if licence.require_ip_allowlist, check licence_ip_allowlist (ip_network >>= $ip) else
+    deny(ip_blocked). 3) Release stale: UPDATE device_session SET ended_at=now(), session_end_reason_id=<absolute_expiry|idle_timeout> WHERE licence_seat_id=$seat AND ended_at IS NULL AND (expires_at<=now()
+    OR last_activity_at < now()-make_interval(mins=>idle)). 4) Device: INSERT INTO device(...) ON CONFLICT (app_user_id, device_fingerprint_hash) WHERE deleted_at IS NULL DO UPDATE SET last_seen_at=now()
+    RETURNING id, revoked_at; revoked -> login_attempt(device_revoked), COMMIT, deny. 5) Same-device re-login: UPDATE device_session SET ended_at=now(), session_end_reason_id=<replaced> WHERE device_id=$dev
+    AND ended_at IS NULL. 6) Claim: SELECT ds.id FROM device_slot ds WHERE ds.licence_seat_id=$seat AND NOT ds.is_retired AND NOT EXISTS (SELECT 1 FROM device_session x WHERE x.device_slot_id=ds.id AND
+    x.ended_at IS NULL) ORDER BY ds.slot_no LIMIT 1. 7) No free slot: deny_new -> INSERT login_attempt(device_limit_denied) RETURNING id; INSERT audit_event(action=device_limit_exceeded); INSERT device_limit_violation(...);
+    COMMIT the evidence; return 403. replace_oldest -> pick session with min(last_activity_at) of the seat, UPDATE it ended (end_reason=replaced), INSERT violation + audit_event, reuse its slot. 8) INSERT
+    identity_session(...) RETURNING id; INSERT device_session(identity_session_id, app_user_id, device_id, licence_seat_id, device_slot_id, expires_at=now()+max_lifetime ...); UPDATE licence_seat SET last_login_at=now();
+    INSERT login_attempt(success); COMMIT. Contention: lock is per seat (one user), so only that user''s concurrent logins queue; slot unique index is the guard if a bug skipped the lock. On 40001 or unique
+    violation on uq_device_session_device_slot_id the client retries the whole txn (max 5, 20-200 ms jittered backoff); request_ref + uq_login_attempt_request_ref_login_outcome_id make retries idempotent.'
+  tables:
+  - licence
+  - licence_seat
+  - device
+  - device_slot
+  - device_session
+  - login_attempt
+  - device_limit_violation
+  - licence_ip_allowlist
+  milestone: B39
+- id: BR-LIC-07
+  rule: An attempt to exceed the device limit is recorded in the audit trail.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Step 7 of BR-LIC-06 inserts audit_event + device_limit_violation(audit_event_id FK) + login_attempt in a txn that commits (the denial is not rolled back). ck_device_limit_violation_count_at_limit:
+    active_session_count >= max_devices_allowed.'
+  tables:
+  - device_limit_violation
+  - login_attempt
+  milestone: B39
+- id: BR-LIC-08
+  rule: How an active session is counted and released.
+  mechanism_type: JOB
+  mechanism: 'Counted iff ended_at IS NULL (it holds a device_slot). Released by (a) logout/revoke: UPDATE ended_at,end_reason; (b) login txn step 3 lazy release; (c) JOB every 1 minute: UPDATE device_session
+    SET ended_at=expires_at, session_end_reason_id=absolute_expiry WHERE ended_at IS NULL AND expires_at<=now() (index idx_device_session_expires_at, hash-sharded) and idle sessions via last_activity_at;
+    (d) TTL purge of ended rows 13 months. ck_device_session_end_reason_consistent keeps reason and ended_at together. Heartbeats update last_activity_at at most once per 60 s.'
+  tables:
+  - device_session
+  milestone: B39
+- id: BR-LIC-09
+  rule: Revoking a device or session is an auditable action.
+  mechanism_type: APP_LAYER
+  mechanism: 'Revoke txn: UPDATE device SET revoked_at=now(); UPDATE device_session SET ended_at=now(), session_end_reason_id=<revoked_by_*> WHERE device_id=$d AND ended_at IS NULL; INSERT device_revocation
+    (+ session_revocation per ended session, uq_session_revocation_device_session_id); INSERT audit_event; all in one txn; FK audit_event_id NOT NULL guarantees an audit row.'
+  tables:
+  - device
+  - device_session
+  - device_revocation
+  - session_revocation
+  milestone: B42
+- id: BR-LIC-10
+  rule: Revocation, violation and login history are append-only.
+  mechanism_type: PRIVILEGE
+  mechanism: App roles have INSERT/SELECT only on login_attempt, device_revocation, session_revocation, device_limit_violation, licence_status_history, licence_usage_snapshot; no UPDATE/DELETE grants; TTL
+    job runs as the TTL system role (P5/P6).
+  tables:
+  - login_attempt
+  - device_revocation
+  - session_revocation
+  - device_limit_violation
+  - licence_status_history
+  milestone: B42
+- id: BR-LIC-11
+  rule: Session user must equal seat user and device owner.
+  mechanism_type: CHAIN_FK
+  mechanism: Composite FKs on device_session (see BR-LIC-05) referencing UNIQUE(id, app_user_id) on licence_seat and device.
+  tables:
+  - device_session
+  - licence_seat
+  - device
+  milestone: B39
+- id: BR-LIC-12
+  rule: Login attempts for unknown users are logged without a user.
+  mechanism_type: CHECK
+  mechanism: login_attempt.app_user_id NULL (null_why) with identifier_hmac stored; attempts are rate-limited by idx on (ip_address, attempted_at).
+  tables:
+  - login_attempt
+  milestone: B36
+- id: BR-LIC-13
+  rule: High-volume log tables expire automatically.
+  mechanism_type: TTL
+  mechanism: login_attempt 24 months (attempted_at); session_activity_sample 30 days; device_session 13 months after ended_at (NULL never expires); device_trust_challenge 30 days after expires_at. CRDB
+    ttl_expire_after / ttl_expiration_expression; ttl_job_cron staggered nightly.
+  tables:
+  - login_attempt
+  - session_activity_sample
+  - device_session
+  - device_trust_challenge
+  milestone: B45
+- id: BR-LIC-14
+  rule: Reducing max_users or max_devices_per_user never kills held slots.
+  mechanism_type: JOB
+  mechanism: Limit-change txn locks licence FOR UPDATE, marks surplus slots is_retired; free retired slots are not claimable (step 6 filters NOT is_retired); seats/sessions in retired slots drain naturally
+    or are revoked by an admin action (BR-LIC-09).
+  tables:
+  - licence
+  - licence_seat_slot
+  - device_slot
+  milestone: B45
+- id: BR-LIC-15
+  rule: Licence validity and status gate logins.
+  mechanism_type: APP_LAYER
+  mechanism: Step 1 of BR-LIC-06 requires licence_status = active AND valid_from <= now() AND (valid_to IS NULL OR valid_to > now()); expiry JOB moves status to expired and ends sessions (end_reason licence_inactive)
+    and writes licence_status_history.
+  tables:
+  - licence
+  - licence_status_history
+  milestone: B45
+- id: BR-LIC-16
+  rule: A push token is registered once.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq_push_registration_push_provider_id_push_token_hash WHERE invalidated_at IS NULL.
+  tables:
+  - push_registration
+  milestone: B45

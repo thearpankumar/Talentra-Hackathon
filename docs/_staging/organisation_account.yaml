@@ -1,0 +1,5787 @@
+module: organisation_account
+notes: |
+  **Scope and entity rationale.** Module owns the tenant (`organisation`), its sites, the commercial `account` that bills one or more organisations,
+  account administrators, and the effective-dated recruiter mapping (the single owner of "which recruiter may act for which company"). Depth tables
+  beyond the five registry tables: corporate tree (`organisation_hierarchy` + `_closure` + `_change`), identity/compliance (`organisation_identifier`,
+  `organisation_verification`, `organisation_document`, `organisation_domain`), page content (`organisation_media/benefit/social_link/brand/career_page/
+  industry/department`), engagement (`organisation_follow`, reviews), data-quality (`organisation_alias`, `organisation_merge`, `organisation_tag*`), history
+  (`organisation_size_history`, `organisation_status_history`, `account_status_history`), commercial (`client_relationship`, `account_setting`, `account_organisation`)
+  and onboarding (`organisation_invitation`, `organisation_contact`, `organisation_note`).
+
+  **Recruiter mapping (BR-ORG-01..05).** Mechanism = P1 CHAIN_FK + P3. Per (recruiter, organisation) rows form a chain: `sequence_no`, `prior_recruiter_organisation_mapping_id`
+  (UNIQUE -> at most one successor), `prior_ended_at`, composite FK `(prior_id, recruiter_app_user_id, organisation_id, prior_ended_at) -> (id, recruiter_app_user_id,
+  organisation_id, effective_to)` with ON UPDATE RESTRICT (also pins recruiter/organisation to be identical along the chain), CHECK `effective_from >= prior_ended_at`,
+  partial unique chain head `WHERE prior_... IS NULL`, and partial unique open row `WHERE effective_to IS NULL` (P3). A predecessor must already be closed (non-NULL effective_to)
+  before a successor can reference it, so overlap is impossible declaratively. P4 is used only for the workflow: close + insert in one SERIALIZABLE txn after
+  `SELECT ... FROM organisation WHERE id=$1 FOR UPDATE`. Access predicate = `vw_recruiter_job_requirement`: job_requirement JOIN open, in-force mapping on (recruiter = current user,
+  organisation = requirement.organisation OR descendant when scope = with_descendants via organisation_hierarchy_closure) AND organisation active AND not in organisation_block for the candidate path.
+  Application roles have no direct SELECT on job_requirement for recruiter personas; they read only through the view (PRIVILEGE). Consultants use a different path (consultant openness, sourcing module).
+
+  **Hierarchy and cycles on CockroachDB (no triggers, no exclusion constraints).** `organisation_hierarchy` keeps ONE row per organisation (adjacency) with `hierarchy_level`
+  (0..7), `parent_level`, `root_organisation_id` and a materialised `ancestor_path`. A self composite FK `(parent_organisation_id, parent_level) -> (child_organisation_id,
+  hierarchy_level)` plus CHECK `hierarchy_level = parent_level + 1` means every edge goes strictly down one level, so a cycle would need a level to equal itself plus k -
+  unrepresentable. Re-parenting a subtree changes levels of descendants; do it in one multi-row UPDATE statement (FK is checked at statement end, ON UPDATE NO ACTION) inside a SERIALIZABLE txn;
+  the 8-level cap bounds the statement. `organisation_hierarchy_closure` (ancestor, descendant, depth) is derived in the same txn and gives O(1) subtree queries; a nightly job re-derives
+  and diffs it (JOB). Alternatives rejected: recursive-CTE-only checks (race under concurrency), triggers (D-01). Same trick is reused for `organisation_department`.
+
+  **Tax/registration identifiers (B75).** `organisation_identifier.value_encrypted` (AES-GCM envelope, key per tenant, `key_version`), `value_lookup_hash` (HMAC-SHA256 blind index, pepper in KMS),
+  `masked_value` (last 4). Unique `(country_id, tax_id_type_id, value_lookup_hash)` partial on live rows stops one GSTIN/EIN/VAT being claimed by two companies. Validation: the app normalises
+  (upper-case, strip spaces/dashes) and validates with the regex+checksum stored on master data `tax_id_type` (e.g. India GSTIN 15 chars with mod-36 check digit, PAN 10 chars `AAAAA9999A`, CIN 21 chars,
+  US EIN 9 digits) BEFORE hashing; the DB guards digest length. Contacts, notes, reviewer ids are Personal (access-controlled, audited, anonymised in place on erasure); vendor tokens and document refs are Sensitive.
+
+  **Verification boundary (Section 6).** Source of truth = the registry/tax vendor; we store status, identifiers used, vendor reference, `idempotency_key` (UNIQUE), checked_at, expires_at. Vendor down: row stays
+  `pending/unavailable` with `retry_after_at`; the organisation keeps its last verified `verification_status_id` until `expires_at`, never silently flips to verified. Every attempt is a row (audit).
+
+  **Reviews.** Mechanics only (reviewer relation, 1-5 dimensions, pros/cons, moderation, employer response, helpful votes, one live review per reviewer+company+relation, anonymity, employment-verified flag).
+  `organisation_rating_summary` is the live aggregate of OUR reviews; tier3_reference `company_rating_snapshot` holds dated, attributed external ratings - no overlap. Review text is Personal (D-17), encrypted at rest.
+
+  **Deviations / decisions.** (1) `account_admin` "at least one active admin" is enforced by counter + CHECK on `account.active_admin_count` maintained under FOR UPDATE (declarative twin), plus app check. (2) Follower counts are not stored
+  (hot-row contention); `organisation_follow` is the fact, counts come from analytics. (3) `helpful_count` is a denormalised counter updated by batch job, not per vote. (4) Hierarchy has one current row; history in `_change`.
+  (5) FKs to master_data tables used as lookups (verification_status, tax_id_type, document_type, address_type, visibility_level, employment_type, geo_source) are declared enum_ref; country/city/state_region/currency/language/industry/job_role/skill-like are identifier.
+
+  **Out of scope - sub-roles inside an employer organisation.** Docket excludes separate posting/interviewing/pipeline roles. Today an organisation has: account admins (account scope), mapped recruiters (all jobs of mapped
+  companies) and platform roles from administration. Extension path: add `organisation_member_role(id, organisation_id, app_user_id, role_code FK org_role lookup {poster, interviewer, pipeline_manager, viewer}, department id nullable FK
+  organisation_department, effective_from/to)` with P1/P3 non-overlap as in recruiter mapping, and extend `vw_recruiter_job_requirement` with `EXISTS member_role WHERE permission covers action`; `organisation_department` already exists to scope roles. No existing table changes.
+
+  **Competitor coverage.** LinkedIn Company Page: name, tagline, about, website, industry, size band, type, HQ + locations, founded, specialties, verified badge, page admins, followers, logo/cover, social - all covered (specialties via `organisation_industry`/tags; admin roles collapsed to account_admin by scope). Naukri/Monster employer profile: company type,
+  GST/CIN, recruiter list, branding/career page, perks, gallery, verified employer - covered (`organisation_career_page`, `organisation_benefit`, `organisation_media`). Glassdoor/AmbitionBox: multi-dimension reviews, pros/cons, would-recommend, employment-verified, employer replies, helpful votes, moderation - covered.
+  Beyond them: D&B-style parent/ultimate-parent hierarchy with ownership %, staffing client contracts with fee/margin/guarantee, identifier blind-index dedupe, merge workflow with rollback map, effective-dated mapping with chain proof. Falls short (deliberately): LinkedIn employee graph / 'people also viewed', salary data (tier3).
+  Research note: LinkedIn/Naukri field lists compiled from public company-page UIs and third-party extraction schemas (no official LinkedIn data-model doc is published); CockroachDB partial unique, hash-sharded and FK semantics per CockroachDB docs (hash-sharded + partial combos are tested at seed time).
+
+  ## Viewer parameter for recruiter views (decision F-02)
+  `vw_recruiter_job_requirement` has exactly one definition (here). It exposes `viewer_app_user_id` and is read through `fn_recruiter_job_requirement(viewer UUID)` (or a prepared
+  statement with `viewer_app_user_id = $1`). The earlier variants used two different session variables (`talentra.app_user_id`, `app.user_id`); both were dropped because custom
+  session variables are not verified on the pinned CockroachDB image. The same explicit-argument mechanism is used by `vw_candidate_visible_to_user` (administration).
+
+  Language of user-entered text (finding F-06): free-text tables of this module carry a nullable `language_id` (FK `language`), NULL = unknown.
+lookups:
+- name: organisation_type
+  description: 'Kind of organisation on the platform (docket: employer, client, consultancy, TPO/college).'
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: employer
+    en: Employer
+    sort: 10
+    hi: नियोक्ता
+  - code: consultancy
+    en: Consultancy / staffing agency
+    sort: 20
+    hi: परामर्श / स्टाफिंग एजेंसी
+  - code: client
+    en: Client company
+    sort: 30
+    hi: क्लाइंट कंपनी
+  - code: tpo_college
+    en: College / training and placement office
+    sort: 40
+    hi: कॉलेज / प्लेसमेंट कार्यालय
+  - code: startup
+    en: Startup
+    sort: 50
+    hi: स्टार्टअप
+  - code: government
+    en: Government / public sector
+    sort: 60
+    hi: सरकारी / सार्वजनिक क्षेत्र
+  - code: ngo
+    en: Non-profit
+    sort: 70
+    hi: गैर-लाभकारी
+  - code: self_employed
+    en: Self-employed / sole proprietor
+    sort: 80
+    hi: स्वरोजगार
+- name: organisation_size_band
+  description: Employee-count band shown on the company page (LinkedIn-style bands).
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: emp_1
+    en: Self-employed (1)
+    sort: 10
+    hi: स्वरोजगार (1)
+  - code: emp_2_10
+    en: 2-10 employees
+    sort: 20
+    hi: 2-10 कर्मचारी
+  - code: emp_11_50
+    en: 11-50 employees
+    sort: 30
+    hi: 11-50 कर्मचारी
+  - code: emp_51_200
+    en: 51-200 employees
+    sort: 40
+    hi: 51-200 कर्मचारी
+  - code: emp_201_500
+    en: 201-500 employees
+    sort: 50
+    hi: 201-500 कर्मचारी
+  - code: emp_501_1000
+    en: 501-1,000 employees
+    sort: 60
+    hi: 501-1,000 कर्मचारी
+  - code: emp_1001_5000
+    en: 1,001-5,000 employees
+    sort: 70
+    hi: 1,001-5,000 कर्मचारी
+  - code: emp_5001_10000
+    en: 5,001-10,000 employees
+    sort: 80
+    hi: 5,001-10,000 कर्मचारी
+  - code: emp_10001_plus
+    en: 10,001+ employees
+    sort: 90
+    hi: 10,001+ कर्मचारी
+- name: organisation_status
+  description: Lifecycle status of an organisation record.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: draft
+    en: Draft
+    sort: 10
+    hi: प्रारूप
+  - code: pending_review
+    en: Pending review
+    sort: 20
+    hi: समीक्षा लंबित
+  - code: active
+    en: Active
+    sort: 30
+    hi: सक्रिय
+  - code: suspended
+    en: Suspended
+    sort: 40
+    hi: निलंबित
+  - code: closed
+    en: Closed
+    sort: 50
+    hi: बंद
+  - code: merged
+    en: Merged into another organisation
+    sort: 60
+    hi: विलय
+- name: account_status
+  description: Commercial status of an account.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: prospect
+    en: Prospect
+    sort: 10
+    hi: संभावित
+  - code: active
+    en: Active
+    sort: 20
+    hi: सक्रिय
+  - code: on_hold
+    en: On hold (dunning / review)
+    sort: 30
+    hi: रोका गया
+  - code: suspended
+    en: Suspended
+    sort: 40
+    hi: निलंबित
+  - code: closed
+    en: Closed
+    sort: 50
+    hi: बंद
+- name: account_admin_level
+  description: Responsibility level of an account administrator (account-level only; not an employer sub-role).
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: owner
+    en: Owner
+    sort: 10
+    hi: स्वामी
+  - code: billing
+    en: Billing administrator
+    sort: 20
+    hi: बिलिंग प्रशासक
+  - code: technical
+    en: Technical administrator
+    sort: 30
+    hi: तकनीकी प्रशासक
+  - code: general
+    en: General administrator
+    sort: 40
+    hi: सामान्य प्रशासक
+- name: payment_term
+  description: Credit / payment terms offered on an account or client contract.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: prepaid
+    en: Prepaid
+    sort: 10
+    hi: अग्रिम भुगतान
+  - code: due_on_receipt
+    en: Due on receipt
+    sort: 20
+    hi: प्राप्ति पर देय
+  - code: net_15
+    en: Net 15 days
+    sort: 30
+  - code: net_30
+    en: Net 30 days
+    sort: 40
+  - code: net_45
+    en: Net 45 days
+    sort: 50
+  - code: net_60
+    en: Net 60 days
+    sort: 60
+  - code: net_90
+    en: Net 90 days
+    sort: 70
+- name: hierarchy_relationship_type
+  description: How a child organisation relates to its parent (D&B-style linkage).
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: subsidiary
+    en: Subsidiary
+    sort: 10
+  - code: division
+    en: Division
+    sort: 20
+  - code: branch_entity
+    en: Branch / registered branch
+    sort: 30
+  - code: franchise
+    en: Franchise
+    sort: 40
+  - code: joint_venture
+    en: Joint venture
+    sort: 50
+  - code: campus
+    en: Campus / affiliated institution
+    sort: 60
+- name: mapping_scope
+  description: Reach of a recruiter mapping on the organisation tree.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: organisation_only
+    en: This organisation only
+    sort: 10
+  - code: with_descendants
+    en: This organisation and all its descendants
+    sort: 20
+- name: mapping_end_reason
+  description: Why a recruiter mapping was ended.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: recruiter_left
+    en: Recruiter left
+    sort: 10
+  - code: reassigned
+    en: Reassigned
+    sort: 20
+  - code: contract_ended
+    en: Client contract ended
+    sort: 30
+  - code: revoked_by_admin
+    en: Revoked by administrator
+    sort: 40
+  - code: organisation_suspended
+    en: Organisation suspended
+    sort: 50
+  - code: superseded
+    en: Superseded by new mapping
+    sort: 60
+- name: verification_kind
+  description: What an organisation verification checks.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: registration
+    en: Company registration
+    sort: 10
+  - code: tax
+    en: Tax registration
+    sort: 20
+  - code: domain
+    en: Email domain ownership
+    sort: 30
+  - code: address
+    en: Address
+    sort: 40
+  - code: kyc_document
+    en: KYC document review
+    sort: 50
+- name: domain_verification_method
+  description: How domain ownership is proven.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: dns_txt
+    en: DNS TXT record
+    sort: 10
+  - code: email_link
+    en: Link sent to admin mailbox at the domain
+    sort: 20
+  - code: meta_tag
+    en: HTML meta tag
+    sort: 30
+  - code: file_upload
+    en: Well-known file upload
+    sort: 40
+- name: contact_role
+  description: Role of an organisation contact person.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: hr_head
+    en: HR head
+    sort: 10
+  - code: recruiter_lead
+    en: Recruitment lead
+    sort: 20
+  - code: billing
+    en: Billing contact
+    sort: 30
+  - code: legal
+    en: Legal contact
+    sort: 40
+  - code: support
+    en: Support contact
+    sort: 50
+  - code: press
+    en: Press / media
+    sort: 60
+- name: social_platform
+  description: Social platforms for company links.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: linkedin
+    en: LinkedIn
+    sort: 10
+  - code: x
+    en: X
+    sort: 20
+  - code: facebook
+    en: Facebook
+    sort: 30
+  - code: instagram
+    en: Instagram
+    sort: 40
+  - code: youtube
+    en: YouTube
+    sort: 50
+  - code: glassdoor
+    en: Glassdoor
+    sort: 60
+  - code: ambitionbox
+    en: AmbitionBox
+    sort: 70
+  - code: github
+    en: GitHub
+    sort: 80
+- name: media_type
+  description: Type of company media asset.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: logo
+    en: Logo
+    sort: 10
+  - code: cover
+    en: Cover image
+    sort: 20
+  - code: gallery_image
+    en: Gallery image
+    sort: 30
+  - code: video
+    en: Video
+    sort: 40
+  - code: brochure
+    en: Brochure (PDF)
+    sort: 50
+  - code: image
+    en: Image
+    sort: 10
+    hi: चित्र
+  - code: audio
+    en: Audio
+    sort: 30
+    hi: ऑडियो
+  - code: document
+    en: Document
+    sort: 40
+    hi: दस्तावेज़
+  - code: link_preview
+    en: Link preview
+    sort: 50
+    hi: लिंक पूर्वावलोकन
+- name: benefit_category
+  description: Category of a benefit, perk or culture highlight.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: health
+    en: Health and wellness
+    sort: 10
+  - code: insurance
+    en: Insurance
+    sort: 20
+  - code: leave
+    en: Leave and time off
+    sort: 30
+  - code: learning
+    en: Learning and development
+    sort: 40
+  - code: flexibility
+    en: Flexible work
+    sort: 50
+  - code: equity
+    en: Equity and bonus
+    sort: 60
+  - code: culture
+    en: Culture and values
+    sort: 70
+  - code: other
+    en: Other
+    sort: 80
+- name: moderation_status
+  description: Moderation state of user-generated content (reviews, responses, media).
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: pending
+    en: Pending moderation
+    sort: 10
+  - code: approved
+    en: Approved
+    sort: 20
+  - code: rejected
+    en: Rejected
+    sort: 30
+  - code: flagged
+    en: Flagged by users
+    sort: 40
+  - code: removed
+    en: Removed after publication
+    sort: 50
+- name: reviewer_relation
+  description: Relationship of a reviewer to the company.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: current_employee
+    en: Current employee
+    sort: 10
+  - code: former_employee
+    en: Former employee
+    sort: 20
+  - code: interviewee
+    en: Interviewed candidate
+    sort: 30
+  - code: contractor
+    en: Contractor
+    sort: 40
+  - code: intern
+    en: Intern
+    sort: 50
+- name: recommendation_answer
+  description: Would-recommend answer on a review (three-valued, never a sentinel).
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: 'yes'
+    en: 'Yes'
+    sort: 10
+  - code: 'no'
+    en: 'No'
+    sort: 20
+  - code: not_stated
+    en: Not stated
+    sort: 30
+- name: attribution_source
+  description: Provenance of a factual data point about an organisation.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: self_declared
+    en: Declared by the organisation
+    sort: 10
+  - code: registry
+    en: Company registry
+    sort: 20
+  - code: licensed_provider
+    en: Licensed data provider
+    sort: 30
+  - code: platform_estimate
+    en: Platform estimate
+    sort: 40
+  - code: legacy_import
+    en: Legacy system import
+    sort: 50
+- name: note_category
+  description: Category of an internal staff note.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: sales
+    en: Sales
+    sort: 10
+  - code: compliance
+    en: Compliance
+    sort: 20
+  - code: support
+    en: Support
+    sort: 30
+  - code: risk
+    en: Risk
+    sort: 40
+  - code: general
+    en: General
+    sort: 50
+- name: alias_type
+  description: Type of alternate organisation name.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: former_name
+    en: Former name
+    sort: 10
+  - code: abbreviation
+    en: Abbreviation
+    sort: 20
+  - code: trade_name
+    en: Trade name
+    sort: 30
+  - code: transliteration
+    en: Transliteration
+    sort: 40
+  - code: misspelling
+    en: Common misspelling
+    sort: 50
+  - code: merged_name
+    en: Name of a merged duplicate
+    sort: 60
+- name: merge_status
+  description: Workflow state of an organisation merge.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: proposed
+    en: Proposed
+    sort: 10
+  - code: approved
+    en: Approved
+    sort: 20
+  - code: executed
+    en: Executed
+    sort: 30
+  - code: rejected
+    en: Rejected
+    sort: 40
+  - code: rolled_back
+    en: Rolled back
+    sort: 50
+- name: client_relationship_status
+  description: State of an agency-client relationship.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: prospect
+    en: Prospect
+    sort: 10
+  - code: active
+    en: Active
+    sort: 20
+  - code: on_hold
+    en: On hold
+    sort: 30
+  - code: terminated
+    en: Terminated
+    sort: 40
+- name: fee_model
+  description: Commercial model between an agency and its client.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: placement_percent
+    en: Percentage of annual CTC per placement
+    sort: 10
+  - code: hourly_markup
+    en: Hourly markup
+    sort: 20
+  - code: retainer
+    en: Retainer
+    sort: 30
+  - code: fixed_fee
+    en: Fixed fee per hire
+    sort: 40
+- name: department_kind
+  description: Kind of internal organisation unit.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: business_unit
+    en: Business unit
+    sort: 10
+  - code: department
+    en: Department
+    sort: 20
+  - code: team
+    en: Team
+    sort: 30
+  - code: function
+    en: Function
+    sort: 40
+- name: invitation_status
+  description: State of a recruiter invitation.
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: pending
+    en: Pending
+    sort: 10
+  - code: accepted
+    en: Accepted
+    sort: 20
+  - code: expired
+    en: Expired
+    sort: 30
+  - code: revoked
+    en: Revoked
+    sort: 40
+- name: account_setting_key
+  description: Registry of permitted account settings (keys are never free text).
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  values:
+  - code: require_job_approval
+    en: Require approval before a job publishes
+    sort: 10
+  - code: default_job_visibility
+    en: Default job visibility
+    sort: 20
+  - code: allow_consultant_openness
+    en: Allow jobs to be opened to consultants
+    sort: 30
+  - code: data_retention_days
+    en: Applicant data retention (days)
+    sort: 40
+  - code: invoice_language
+    en: Invoice language
+    sort: 50
+  - code: sso_required
+    en: Single sign-on required
+    sort: 60
+tables:
+- name: organisation
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones: &id001
+  - B25
+  - B28
+  - B31
+  - B34
+  - B75
+  retention: Company identity is public business data kept while the platform operates; soft-deleted organisations are retained 7 years for invoice, audit and review integrity, then fully anonymised (legal
+    name replaced, identifiers erased).
+  description: 'Employer / client / consultancy / college organisation (the tenant, D-11). Company-page core: names, type, industry, size band, website, description, verification, HQ.'
+  columns:
+  - name: legal_name
+    type: STRING(300)
+    domain: free_text
+    desc: Registered legal name.
+    sens: Public
+  - name: display_name
+    type: STRING(200)
+    domain: free_text
+    desc: Brand / trading name shown on the company page.
+    sens: Public
+  - name: legal_name_normalised
+    type: STRING(300)
+    domain: free_text
+    desc: Lower-cased legal_name for case-insensitive and trigram search/dedupe.
+    sens: Public
+    computed: lower(legal_name)
+  - name: slug
+    type: STRING(120)
+    domain: free_text
+    desc: URL slug of the public company page (unique among live rows).
+    sens: Public
+  - name: tagline
+    type: STRING(200)
+    domain: free_text
+    desc: One-line company tagline.
+    sens: Public
+    'null': true
+    null_why: NULL = not provided
+  - name: organisation_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Kind of organisation (employer, consultancy, TPO/college, client...).
+    sens: Internal
+  - name: organisation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Lifecycle status.
+    sens: Internal
+  - name: primary_industry_id
+    type: UUID
+    domain: identifier
+    desc: Primary industry (master data).
+    sens: Internal
+    'null': true
+    null_why: NULL = not yet provided
+  - name: organisation_size_band_id
+    type: UUID
+    domain: enum_ref
+    desc: Employee-count band shown publicly.
+    sens: Internal
+    'null': true
+    null_why: NULL = unknown; not asked yet
+  - name: website_url
+    type: STRING(500)
+    domain: url
+    desc: Company website.
+    sens: Public
+    'null': true
+    null_why: NULL = no website provided
+  - name: description
+    type: STRING
+    domain: long_text
+    desc: About-us text, written once in description_language_id.
+    sens: Public
+    'null': true
+    null_why: NULL = not provided
+    unbounded_why: Company-authored marketing text of unpredictable length
+  - name: description_language_id
+    type: UUID
+    domain: identifier
+    desc: Language of the description (Rule 7).
+    sens: Internal
+    'null': true
+    null_why: NULL = language unknown
+  - name: founded_year
+    type: INT2
+    domain: quantity
+    desc: Year the company was founded.
+    sens: Internal
+    'null': true
+    null_why: NULL = unknown
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Current aggregate verification outcome (derived from organisation_verification; denormalised for filters).
+    sens: Internal
+  - name: verified_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the organisation last reached a verified state.
+    sens: Internal
+    'null': true
+    null_why: NULL = never verified
+  - name: claimed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When a representative claimed the page.
+    sens: Internal
+    'null': true
+    null_why: NULL = unclaimed (page seeded from registry / import)
+  - name: visibility_level_id
+    type: UUID
+    domain: enum_ref
+    desc: Who can see the company page.
+    sens: Internal
+  - name: hq_country_id
+    type: UUID
+    domain: identifier
+    desc: Denormalised HQ country (from the headquarter location) for search.
+    sens: Internal
+    'null': true
+    null_why: NULL = no HQ location recorded yet
+  - name: hq_city_id
+    type: UUID
+    domain: identifier
+    desc: Denormalised HQ city (from the headquarter location).
+    sens: Internal
+    'null': true
+    null_why: NULL = no HQ location recorded yet
+  - name: logo_object_ref
+    type: STRING(300)
+    domain: free_text
+    desc: Object-storage key of the current logo (no FK; outside DB).
+    sens: Public
+    'null': true
+    null_why: NULL = no logo uploaded
+  - name: legacy_source_ref
+    type: STRING(100)
+    domain: free_text
+    desc: Id of this company in the legacy system (migration/sync key).
+    sens: Internal
+    'null': true
+    null_why: NULL = created natively, not migrated
+  constraints:
+  - name: ck_organisation_slug_format
+    type: check
+    expr: slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'
+    desc: Slug is lowercase kebab-case.
+  - name: ck_organisation_founded_year_range
+    type: check
+    expr: founded_year IS NULL OR founded_year BETWEEN 1600 AND 2100
+    desc: Plausible year; 'not in the future' is a job check (needs now()).
+  indexes:
+  - name: uq_organisation_slug
+    columns:
+    - slug
+    desc: Public page lookup by slug.
+    unique: true
+    where: deleted_at IS NULL
+  - name: uq_organisation_legacy_source_ref
+    columns:
+    - legacy_source_ref
+    desc: Idempotent legacy sync key.
+    unique: true
+    where: legacy_source_ref IS NOT NULL AND deleted_at IS NULL
+  - name: idx_organisation_legal_name_normalised
+    columns:
+    - legal_name_normalised
+    desc: Trigram GIN (gin_trgm_ops) on normalised name for type-ahead and duplicate detection (D-16).
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_organisation_organisation_type_id_organisation_status_id
+    columns:
+    - organisation_type_id
+    - organisation_status_id
+    - primary_industry_id
+    desc: Directory browse by type/status/industry.
+    where: deleted_at IS NULL
+  - name: idx_organisation_hq_country_id_hq_city_id
+    columns:
+    - hq_country_id
+    - hq_city_id
+    desc: Employers by city for search facets.
+    where: deleted_at IS NULL AND organisation_status_id IS NOT NULL
+  - name: idx_organisation_organisation_status_id
+    columns:
+    - organisation_status_id
+    desc: Leading index for FK fk_organisation_organisation_status_id (join/cascade checks).
+  - name: idx_organisation_primary_industry_id
+    columns:
+    - primary_industry_id
+    desc: Leading index for FK fk_organisation_primary_industry_id (join/cascade checks).
+  - name: idx_organisation_organisation_size_band_id
+    columns:
+    - organisation_size_band_id
+    desc: Leading index for FK fk_organisation_organisation_size_band_id (join/cascade checks).
+  - name: idx_organisation_description_language_id
+    columns:
+    - description_language_id
+    desc: Leading index for FK fk_organisation_description_language_id (join/cascade checks).
+  - name: idx_organisation_verification_status_id
+    columns:
+    - verification_status_id
+    desc: Leading index for FK fk_organisation_verification_status_id (join/cascade checks).
+  - name: idx_organisation_visibility_level_id
+    columns:
+    - visibility_level_id
+    desc: Leading index for FK fk_organisation_visibility_level_id (join/cascade checks).
+  - name: idx_organisation_hq_city_id
+    columns:
+    - hq_city_id
+    desc: Leading index for FK fk_organisation_hq_city_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_organisation_type_id
+    columns:
+    - organisation_type_id
+    ref: organisation_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired not deleted
+  - name: fk_organisation_organisation_status_id
+    columns:
+    - organisation_status_id
+    ref: organisation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired not deleted
+  - name: fk_organisation_primary_industry_id
+    columns:
+    - primary_industry_id
+    ref: industry
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data referenced by live rows
+  - name: fk_organisation_organisation_size_band_id
+    columns:
+    - organisation_size_band_id
+    ref: organisation_size_band
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_description_language_id
+    columns:
+    - description_language_id
+    ref: language
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_visibility_level_id
+    columns:
+    - visibility_level_id
+    ref: visibility_level
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_hq_country_id
+    columns:
+    - hq_country_id
+    ref: country
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_hq_city_id
+    columns:
+    - hq_city_id
+    ref: city
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+- name: organisation_location
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Office / site / campus of an organisation with structured address, optional coordinates and a single headquarters flag.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Owning organisation (tenant).
+    sens: Internal
+  - name: location_label
+    type: STRING(120)
+    domain: free_text
+    desc: Display label, e.g. 'Bengaluru - Whitefield'.
+    sens: Public
+  - name: address_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Kind of address (registered, office, campus...).
+    sens: Internal
+  - name: is_headquarters
+    type: BOOL
+    domain: boolean
+    desc: True for the single headquarters site.
+    sens: Internal
+    default: 'false'
+  - name: address_line1
+    type: STRING(200)
+    domain: free_text
+    desc: Street address line 1 (business address).
+    sens: Public
+  - name: address_line2
+    type: STRING(200)
+    domain: free_text
+    desc: Street address line 2.
+    sens: Public
+    'null': true
+    null_why: NULL = not applicable / no second line
+  - name: locality
+    type: STRING(120)
+    domain: free_text
+    desc: Locality / neighbourhood / district.
+    sens: Public
+    'null': true
+    null_why: NULL = not provided
+  - name: city_id
+    type: UUID
+    domain: identifier
+    desc: City.
+    sens: Internal
+  - name: state_region_id
+    type: UUID
+    domain: identifier
+    desc: State or region.
+    sens: Internal
+    'null': true
+    null_why: NULL = country without state level / unknown
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Country.
+    sens: Internal
+  - name: postal_code
+    type: STRING(20)
+    domain: free_text
+    desc: Postal / PIN code.
+    sens: Public
+    'null': true
+    null_why: NULL = not provided
+  - name: latitude
+    type: DECIMAL(9,6)
+    domain: latitude
+    desc: WGS84 latitude, 6 decimals (~0.1 m).
+    sens: Public
+    'null': true
+    null_why: NULL = not geocoded
+  - name: longitude
+    type: DECIMAL(9,6)
+    domain: longitude
+    desc: WGS84 longitude, 6 decimals.
+    sens: Public
+    'null': true
+    null_why: NULL = not geocoded
+  - name: geo_source_id
+    type: UUID
+    domain: enum_ref
+    desc: Source of the coordinates (geocoder / manual / device).
+    sens: Internal
+    'null': true
+    null_why: NULL = no coordinates stored
+  - name: place_ref
+    type: STRING(120)
+    domain: free_text
+    desc: Mapping-provider place id (reference only; provider owns the data).
+    sens: Internal
+    'null': true
+    null_why: NULL = not linked to a provider place
+  - name: time_zone
+    type: STRING(64)
+    domain: time_zone
+    desc: IANA time zone of the site, used for display.
+    sens: Public
+    'null': true
+    null_why: NULL = inherit from city
+  - name: headcount
+    type: INT4
+    domain: quantity
+    desc: Approximate employees at the site.
+    sens: Internal
+    'null': true
+    null_why: NULL = unknown
+  - name: opened_date
+    type: DATE
+    domain: date
+    desc: Date the site opened.
+    sens: Internal
+    'null': true
+    null_why: NULL = unknown
+  - name: closed_date
+    type: DATE
+    domain: date
+    desc: Date the site closed.
+    sens: Internal
+    'null': true
+    null_why: NULL = site still operating
+  constraints:
+  - name: uq_organisation_location_organisation_id_id
+    type: unique
+    columns:
+    - organisation_id
+    - id
+    desc: Target for same-tenant composite FKs from children (D-11/D-19).
+  - name: ck_organisation_location_latitude_range
+    type: check
+    expr: latitude IS NULL OR latitude BETWEEN -90 AND 90
+    desc: Valid latitude.
+  - name: ck_organisation_location_longitude_range
+    type: check
+    expr: longitude IS NULL OR longitude BETWEEN -180 AND 180
+    desc: Valid longitude.
+  - name: ck_organisation_location_coordinates_pair
+    type: check
+    expr: (latitude IS NULL) = (longitude IS NULL) AND (latitude IS NULL OR geo_source_id IS NOT NULL)
+    desc: Both or none; stated source when present.
+  - name: ck_organisation_location_closed_after_opened
+    type: check
+    expr: closed_date IS NULL OR opened_date IS NULL OR closed_date >= opened_date
+    desc: Closed not before opened.
+  indexes:
+  - name: uq_organisation_location_organisation_id
+    columns:
+    - organisation_id
+    desc: At most one live headquarters per organisation (P3).
+    unique: true
+    where: is_headquarters AND deleted_at IS NULL
+  - name: idx_organisation_location_city_id_organisation_id
+    columns:
+    - city_id
+    - organisation_id
+    desc: Find employers with a site in a city.
+    where: deleted_at IS NULL
+  - name: idx_organisation_location_address_type_id
+    columns:
+    - address_type_id
+    desc: Leading index for FK fk_organisation_location_address_type_id (join/cascade checks).
+  - name: idx_organisation_location_state_region_id
+    columns:
+    - state_region_id
+    desc: Leading index for FK fk_organisation_location_state_region_id (join/cascade checks).
+  - name: idx_organisation_location_country_id
+    columns:
+    - country_id
+    desc: Leading index for FK fk_organisation_location_country_id (join/cascade checks).
+  - name: idx_organisation_location_geo_source_id
+    columns:
+    - geo_source_id
+    desc: Leading index for FK fk_organisation_location_geo_source_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_location_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation is soft-deleted; locations follow via job
+  - name: fk_organisation_location_address_type_id
+    columns:
+    - address_type_id
+    ref: address_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_location_city_id
+    columns:
+    - city_id
+    ref: city
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_location_state_region_id
+    columns:
+    - state_region_id
+    ref: state_region
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_location_country_id
+    columns:
+    - country_id
+    ref: country
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_location_geo_source_id
+    columns:
+    - geo_source_id
+    ref: geo_source
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: account
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Commercial account kept 8 years after closure for tax/audit; soft-deleted only after closed_at + 8 years; contact Personal columns anonymised on request.
+  description: 'Billing/commercial account that groups one or more organisations: status, account manager, currency, tax residence, credit terms.'
+  columns:
+  - name: account_code
+    type: STRING(40)
+    domain: free_text
+    desc: Human-readable unique account number for finance and support.
+    sens: Internal
+  - name: account_name
+    type: STRING(200)
+    domain: free_text
+    desc: Account display name.
+    sens: Internal
+  - name: account_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Commercial status.
+    sens: Internal
+  - name: primary_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Lead organisation of the account.
+    sens: Internal
+    'null': true
+    null_why: NULL = account created before its first organisation is attached
+  - name: account_manager_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Internal sales/success owner (staff user).
+    sens: Internal
+    'null': true
+    null_why: NULL = unassigned
+  - name: billing_currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency invoices are issued in.
+    sens: Internal
+  - name: tax_residence_country_id
+    type: UUID
+    domain: identifier
+    desc: Country of tax residence (drives GST/VAT).
+    sens: Internal
+  - name: payment_term_id
+    type: UUID
+    domain: enum_ref
+    desc: Agreed payment / credit terms.
+    sens: Internal
+  - name: is_prepaid
+    type: BOOL
+    domain: boolean
+    desc: True when the account buys prepaid credits only (no credit facility).
+    sens: Internal
+    default: 'true'
+  - name: credit_limit
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Approved credit limit in billing_currency_id.
+    sens: Internal
+    'null': true
+    null_why: NULL = no credit facility (prepaid) - see is_prepaid
+  - name: billing_organisation_location_id
+    type: UUID
+    domain: identifier
+    desc: Location used as billing address.
+    sens: Internal
+    'null': true
+    null_why: NULL = billing address not provided yet
+  - name: billing_email
+    type: STRING(254)
+    domain: email
+    desc: Invoice recipient mailbox.
+    sens: Personal
+    'null': true
+    null_why: NULL = not provided
+    pii: Business mailbox may identify a person; access-controlled, masked outside finance, anonymised on erasure
+  - name: billing_contact_name
+    type: STRING(150)
+    domain: person_name
+    desc: Finance contact name.
+    sens: Personal
+    'null': true
+    null_why: NULL = not provided
+    pii: Access-controlled+audited; anonymised on erasure
+  - name: dunning_hold
+    type: BOOL
+    domain: boolean
+    desc: True while collection/dunning blocks new purchases.
+    sens: Internal
+    default: 'false'
+  - name: active_admin_count
+    type: INT4
+    domain: quantity
+    desc: Number of currently open account_admin rows; maintained in the same txn under FOR UPDATE (BR-ORG-06).
+    sens: Internal
+    default: '0'
+  - name: activated_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: First activation.
+    sens: Internal
+    'null': true
+    null_why: NULL = never activated (prospect)
+  - name: suspended_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Latest suspension.
+    sens: Internal
+    'null': true
+    null_why: NULL = never suspended
+  - name: closed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Closure instant.
+    sens: Internal
+    'null': true
+    null_why: NULL = account not closed
+  - name: external_billing_ref
+    type: STRING(100)
+    domain: free_text
+    desc: Customer id in the external billing/ERP system (reference only).
+    sens: Internal
+    'null': true
+    null_why: NULL = not synced yet
+  constraints:
+  - name: ck_account_credit_limit_nonneg
+    type: check
+    expr: credit_limit IS NULL OR credit_limit >= 0
+    desc: Non-negative.
+  - name: ck_account_prepaid_no_credit
+    type: check
+    expr: NOT is_prepaid OR credit_limit IS NULL
+    desc: Prepaid accounts carry no credit limit.
+  - name: ck_account_billing_email_lower
+    type: check
+    expr: billing_email IS NULL OR billing_email = lower(billing_email)
+    desc: Lowercase email (D-07).
+  - name: ck_account_admin_count_nonneg
+    type: check
+    expr: active_admin_count >= 0
+    desc: Counter sanity.
+  - name: ck_account_operational_needs_admin
+    type: check
+    expr: activated_at IS NULL OR closed_at IS NOT NULL OR active_admin_count >= 1
+    desc: An activated, not-closed account always has at least one active admin (declarative twin of BR-ORG-06).
+  - name: ck_account_closed_after_activated
+    type: check
+    expr: closed_at IS NULL OR activated_at IS NULL OR closed_at >= activated_at
+    desc: Closed after activation.
+  indexes:
+  - name: uq_account_account_code
+    columns:
+    - account_code
+    desc: Natural key of the account.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_account_account_status_id_account_manager_app_user_id
+    columns:
+    - account_status_id
+    - account_manager_app_user_id
+    desc: Manager worklists by status.
+    where: deleted_at IS NULL
+  - name: uq_account_external_billing_ref
+    columns:
+    - external_billing_ref
+    desc: Billing-system sync key.
+    unique: true
+    where: external_billing_ref IS NOT NULL AND deleted_at IS NULL
+  - name: idx_account_primary_organisation_id
+    columns:
+    - primary_organisation_id
+    desc: Leading index for FK fk_account_primary_organisation_id (join/cascade checks).
+  - name: idx_account_account_manager_app_user_id
+    columns:
+    - account_manager_app_user_id
+    desc: Leading index for FK fk_account_account_manager_app_user_id (join/cascade checks).
+  - name: idx_account_billing_currency_id
+    columns:
+    - billing_currency_id
+    desc: Leading index for FK fk_account_billing_currency_id (join/cascade checks).
+  - name: idx_account_tax_residence_country_id
+    columns:
+    - tax_residence_country_id
+    desc: Leading index for FK fk_account_tax_residence_country_id (join/cascade checks).
+  - name: idx_account_payment_term_id
+    columns:
+    - payment_term_id
+    desc: Leading index for FK fk_account_payment_term_id (join/cascade checks).
+  - name: idx_account_billing_organisation_location_id
+    columns:
+    - billing_organisation_location_id
+    desc: Leading index for FK fk_account_billing_organisation_location_id (join/cascade checks).
+  fks:
+  - name: fk_account_account_status_id
+    columns:
+    - account_status_id
+    ref: account_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_account_primary_organisation_id
+    columns:
+    - primary_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: an organisation leading an account cannot be purged
+  - name: fk_account_account_manager_app_user_id
+    columns:
+    - account_manager_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: manager leaving unassigns; account stays
+  - name: fk_account_billing_currency_id
+    columns:
+    - billing_currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_account_tax_residence_country_id
+    columns:
+    - tax_residence_country_id
+    ref: country
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_account_payment_term_id
+    columns:
+    - payment_term_id
+    ref: payment_term
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_account_billing_organisation_location_id
+    columns:
+    - billing_organisation_location_id
+    ref: organisation_location
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: dropping a location clears billing address; finance must re-pick
+- name: account_organisation
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Membership history kept 8 years with the account; rows are closed (effective_to), never deleted, until the account is purged.
+  description: 'Effective-dated link: which account bills which organisation. One open row per organisation.'
+  columns:
+  - name: account_id
+    type: UUID
+    domain: identifier
+    desc: Account.
+    sens: Internal
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation billed under the account.
+    sens: Internal
+  - name: is_billing_owner
+    type: BOOL
+    domain: boolean
+    desc: True if this organisation is the invoicing legal entity of the account.
+    sens: Internal
+    default: 'false'
+  - name: effective_from
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Start of membership.
+    sens: Internal
+    default: now()
+  - name: effective_to
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: End of membership.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended/ongoing
+  - name: end_note
+    type: STRING(200)
+    domain: free_text
+    desc: Why the organisation left the account.
+    sens: Internal
+    'null': true
+    null_why: NULL = still a member
+  constraints:
+  - name: ck_account_organisation_effective_range
+    type: check
+    expr: effective_to IS NULL OR effective_to >= effective_from
+    desc: End not before start.
+  - name: uq_account_organisation_account_id_organisation_id_effective_from
+    type: unique
+    columns:
+    - account_id
+    - organisation_id
+    - effective_from
+    desc: No duplicate start for the same pair.
+  indexes:
+  - name: uq_account_organisation_organisation_id
+    columns:
+    - organisation_id
+    desc: 'P3: an organisation belongs to at most one account at a time.'
+    unique: true
+    where: effective_to IS NULL
+  - name: idx_account_organisation_account_id_open
+    columns:
+    - account_id
+    desc: Current organisations of an account.
+    where: effective_to IS NULL
+  - name: uq_account_organisation_account_id_billing_owner
+    columns:
+    - account_id
+    desc: One billing-owner organisation per account at a time.
+    unique: true
+    where: is_billing_owner AND effective_to IS NULL
+  fks:
+  - name: fk_account_organisation_account_id
+    columns:
+    - account_id
+    ref: account
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_account_organisation_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+- name: account_admin
+  kind: link
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones: *id001
+  retention: Admin grant history kept 8 years after revocation for access audit; app_user erasure anonymises user reference via app_user, row retained.
+  description: Effective-dated assignment of platform users as administrators of an account (Account Admin actor). At least one active admin is guaranteed.
+  columns:
+  - name: account_id
+    type: UUID
+    domain: identifier
+    desc: Administered account.
+    sens: Internal
+  - name: admin_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Administrator (app_user).
+    sens: Personal
+    pii: Identifies a person; access-controlled and audited
+  - name: account_admin_level_id
+    type: UUID
+    domain: enum_ref
+    desc: Responsibility level.
+    sens: Internal
+  - name: is_primary_contact
+    type: BOOL
+    domain: boolean
+    desc: True for the single primary contact of the account.
+    sens: Internal
+    default: 'false'
+  - name: effective_from
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Grant start.
+    sens: Internal
+    default: now()
+  - name: effective_to
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Grant end.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended/ongoing
+  - name: revocation_reason
+    type: STRING(200)
+    domain: free_text
+    desc: Why the grant ended.
+    sens: Internal
+    'null': true
+    null_why: NULL = grant still active
+  constraints:
+  - name: ck_account_admin_effective_range
+    type: check
+    expr: effective_to IS NULL OR effective_to >= effective_from
+    desc: End not before start.
+  - name: ck_account_admin_revocation_pair
+    type: check
+    expr: (effective_to IS NULL) = (revocation_reason IS NULL OR effective_to IS NULL)
+    desc: Reason only on ended grants.
+  indexes:
+  - name: uq_account_admin_account_id_admin_app_user_id
+    columns:
+    - account_id
+    - admin_app_user_id
+    desc: 'P3: one open grant per user and account.'
+    unique: true
+    where: effective_to IS NULL
+  - name: uq_account_admin_account_id_primary
+    columns:
+    - account_id
+    desc: 'P3: one open primary contact per account.'
+    unique: true
+    where: is_primary_contact AND effective_to IS NULL
+  - name: idx_account_admin_admin_app_user_id_open
+    columns:
+    - admin_app_user_id
+    desc: Which accounts does this user administer (authorisation lookup).
+    where: effective_to IS NULL
+  - name: idx_account_admin_account_admin_level_id
+    columns:
+    - account_admin_level_id
+    desc: Leading index for FK fk_account_admin_account_admin_level_id (join/cascade checks).
+  fks:
+  - name: fk_account_admin_account_id
+    columns:
+    - account_id
+    ref: account
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_account_admin_admin_app_user_id
+    columns:
+    - admin_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: user is soft-deleted; grants are history
+  - name: fk_account_admin_account_admin_level_id
+    columns:
+    - account_admin_level_id
+    ref: account_admin_level
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: recruiter_organisation_mapping
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: 'Mapping history is access evidence: kept 7 years after effective_to, never updated except to close; rows never deleted before purge; recruiter erasure keeps the row (user reference anonymised
+    in app_user).'
+  description: OWNING TABLE for mapped recruiters. Effective-dated recruiter -> organisation mapping; non-overlap guaranteed by P1 chain FK + P3 single open row. Grants recruiter access to the organisation's
+    job requirements via vw_recruiter_job_requirement.
+  columns:
+  - name: recruiter_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Recruiter user.
+    sens: Personal
+    pii: Identifies a person; access-controlled and audited
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Company the recruiter may act for.
+    sens: Internal
+  - name: mapping_scope_id
+    type: UUID
+    domain: enum_ref
+    desc: Whether access includes descendant organisations.
+    sens: Internal
+  - name: sequence_no
+    type: INT4
+    domain: quantity
+    desc: 1-based position in the recruiter+organisation chain (P1).
+    sens: Internal
+  - name: prior_recruiter_organisation_mapping_id
+    type: UUID
+    domain: identifier
+    desc: Immediately preceding mapping of the same recruiter and organisation (P1).
+    sens: Internal
+    'null': true
+    null_why: NULL = first mapping in the chain
+  - name: prior_ended_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Copy of the predecessor's effective_to (P1 composite FK target).
+    sens: Internal
+    'null': true
+    null_why: NULL = first mapping in the chain
+  - name: effective_from
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Start of access (inclusive).
+    sens: Internal
+    default: now()
+  - name: effective_to
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: End of access (exclusive).
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended/ongoing
+  - name: mapping_end_reason_id
+    type: UUID
+    domain: enum_ref
+    desc: Why the mapping ended.
+    sens: Internal
+    'null': true
+    null_why: NULL = mapping still open
+  - name: approved_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Admin who approved the mapping.
+    sens: Personal
+    'null': true
+    null_why: NULL = auto-approved via invitation acceptance
+    pii: Identifies a person; audited
+  constraints:
+  - name: uq_recruiter_organisation_mapping_chain_target
+    type: unique
+    columns:
+    - id
+    - recruiter_app_user_id
+    - organisation_id
+    - effective_to
+    desc: Referenced by the P1 chain composite FK (D-19).
+  - name: uq_recruiter_organisation_mapping_prior_recruiter_organisation_mapping_id
+    type: unique
+    columns:
+    - prior_recruiter_organisation_mapping_id
+    desc: Each mapping has at most one successor (NULLs distinct).
+  - name: uq_recruiter_organisation_mapping_recruiter_app_user_id_organisation_id_sequence_no
+    type: unique
+    columns:
+    - recruiter_app_user_id
+    - organisation_id
+    - sequence_no
+    desc: Chain position unique.
+  - name: ck_recruiter_organisation_mapping_effective_range
+    type: check
+    expr: effective_to IS NULL OR effective_to > effective_from
+    desc: End after start.
+  - name: ck_recruiter_organisation_mapping_chain_nulls
+    type: check
+    expr: (prior_recruiter_organisation_mapping_id IS NULL) = (prior_ended_at IS NULL) AND (prior_recruiter_organisation_mapping_id IS NULL) = (sequence_no = 1)
+    desc: First row has no predecessor; others have both.
+  - name: ck_recruiter_organisation_mapping_starts_after_prior
+    type: check
+    expr: prior_ended_at IS NULL OR effective_from >= prior_ended_at
+    desc: No overlap with predecessor.
+  - name: ck_recruiter_organisation_mapping_end_reason_pair
+    type: check
+    expr: (effective_to IS NULL) = (mapping_end_reason_id IS NULL)
+    desc: Closed rows carry a reason; open rows do not.
+  indexes:
+  - name: uq_recruiter_organisation_mapping_recruiter_app_user_id_organisation_id_open
+    columns:
+    - recruiter_app_user_id
+    - organisation_id
+    desc: 'P3: at most one open mapping per recruiter and organisation.'
+    unique: true
+    where: effective_to IS NULL
+  - name: uq_recruiter_organisation_mapping_recruiter_app_user_id_organisation_id_first
+    columns:
+    - recruiter_app_user_id
+    - organisation_id
+    desc: 'P1: exactly one chain head per recruiter and organisation.'
+    unique: true
+    where: prior_recruiter_organisation_mapping_id IS NULL
+  - name: idx_recruiter_organisation_mapping_organisation_id_recruiter_app_user_id
+    columns:
+    - organisation_id
+    - recruiter_app_user_id
+    desc: Who is mapped to a company (open rows); hot path of vw_recruiter_job_requirement.
+    where: effective_to IS NULL
+    storing:
+    - mapping_scope_id
+    - effective_from
+  - name: idx_recruiter_organisation_mapping_recruiter_app_user_id_effective_from
+    columns:
+    - recruiter_app_user_id
+    - effective_from DESC
+    desc: Recruiter's mapping history.
+  - name: idx_recruiter_organisation_mapping_mapping_scope_id
+    columns:
+    - mapping_scope_id
+    desc: Leading index for FK fk_recruiter_organisation_mapping_mapping_scope_id (join/cascade checks).
+  - name: idx_recruiter_organisation_mapping_mapping_end_reason_id
+    columns:
+    - mapping_end_reason_id
+    desc: Leading index for FK fk_recruiter_organisation_mapping_mapping_end_reason_id (join/cascade checks).
+  - name: idx_recruiter_organisation_mapping_approved_by_app_user_id
+    columns:
+    - approved_by_app_user_id
+    desc: Leading index for FK fk_recruiter_organisation_mapping_approved_by_app_user_id (join/cascade checks).
+  fks:
+  - name: fk_recruiter_organisation_mapping_recruiter_app_user_id
+    columns:
+    - recruiter_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_recruiter_organisation_mapping_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_recruiter_organisation_mapping_mapping_scope_id
+    columns:
+    - mapping_scope_id
+    ref: mapping_scope
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_recruiter_organisation_mapping_mapping_end_reason_id
+    columns:
+    - mapping_end_reason_id
+    ref: mapping_end_reason
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_recruiter_organisation_mapping_approved_by_app_user_id
+    columns:
+    - approved_by_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: approver erasure keeps mapping
+  - name: fk_recruiter_organisation_mapping_prior_chain
+    columns:
+    - prior_recruiter_organisation_mapping_id
+    - recruiter_app_user_id
+    - organisation_id
+    - prior_ended_at
+    ref: recruiter_organisation_mapping
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'P1 chain: successor points at its predecessor''s (id, recruiter, organisation, effective_to); ON UPDATE RESTRICT freezes the predecessor''s end once a successor exists.'
+    ref_columns:
+    - id
+    - recruiter_app_user_id
+    - organisation_id
+    - effective_to
+- name: organisation_hierarchy
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Current-parent edge per organisation; history is in organisation_hierarchy_change (append-only, 7 years). Row deleted only when the organisation is purged.
+  description: 'Adjacency + materialised path + level for the corporate tree (subsidiary/division/branch). Exactly one row per organisation (roots have no parent). Cycles are impossible: child level = parent
+    level + 1 enforced by a self composite FK.'
+  columns:
+  - name: child_organisation_id
+    type: UUID
+    domain: identifier
+    desc: The organisation placed in the tree.
+    sens: Internal
+  - name: parent_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Its parent.
+    sens: Internal
+    'null': true
+    null_why: NULL = root (ultimate parent)
+  - name: root_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Ultimate parent of the tree (D&B 'global ultimate'); equals child for a root.
+    sens: Internal
+  - name: hierarchy_level
+    type: INT2
+    domain: quantity
+    desc: Depth from the root (root = 0).
+    sens: Internal
+  - name: parent_level
+    type: INT2
+    domain: quantity
+    desc: Parent's hierarchy_level (FK target for the level chain).
+    sens: Internal
+    'null': true
+    null_why: NULL = root has no parent
+  - name: hierarchy_relationship_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Relationship to parent.
+    sens: Internal
+    'null': true
+    null_why: NULL = root has no relationship
+  - name: ownership_percent
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Parent's ownership share.
+    sens: Internal
+    'null': true
+    null_why: NULL = unknown or not applicable (division/branch)
+  - name: ancestor_path
+    type: STRING(400)
+    domain: free_text
+    desc: Materialised path of ancestor ids '/root/.../parent/' for subtree prefix queries.
+    sens: Internal
+  - name: effective_from
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When this parent link took effect.
+    sens: Internal
+    default: now()
+  constraints:
+  - name: uq_organisation_hierarchy_child_organisation_id
+    type: unique
+    columns:
+    - child_organisation_id
+    desc: One current parent per organisation (tree, not DAG).
+  - name: uq_organisation_hierarchy_child_organisation_id_hierarchy_level
+    type: unique
+    columns:
+    - child_organisation_id
+    - hierarchy_level
+    desc: Referenced by the level-chain FK.
+  - name: ck_organisation_hierarchy_level_range
+    type: check
+    expr: hierarchy_level BETWEEN 0 AND 7
+    desc: Depth cap 8 levels (bounds closure size and recursion).
+  - name: ck_organisation_hierarchy_no_self_parent
+    type: check
+    expr: parent_organisation_id IS NULL OR parent_organisation_id <> child_organisation_id
+    desc: No self loop.
+  - name: ck_organisation_hierarchy_root_or_child
+    type: check
+    expr: (parent_organisation_id IS NULL) = (parent_level IS NULL) AND (parent_organisation_id IS NULL) = (hierarchy_level = 0)
+    desc: Root = level 0 = no parent.
+  - name: ck_organisation_hierarchy_level_increments
+    type: check
+    expr: parent_level IS NULL OR hierarchy_level = parent_level + 1
+    desc: Strictly increasing level => acyclic.
+  - name: ck_organisation_hierarchy_root_when_root
+    type: check
+    expr: parent_organisation_id IS NOT NULL OR root_organisation_id = child_organisation_id
+    desc: A root is its own ultimate parent.
+  - name: ck_organisation_hierarchy_ownership_range
+    type: check
+    expr: ownership_percent IS NULL OR ownership_percent BETWEEN 0 AND 100
+    desc: Percentage range.
+  indexes:
+  - name: idx_organisation_hierarchy_parent_organisation_id_child_organisation_id
+    columns:
+    - parent_organisation_id
+    - child_organisation_id
+    desc: Direct children of a node.
+  - name: idx_organisation_hierarchy_root_organisation_id_hierarchy_level
+    columns:
+    - root_organisation_id
+    - hierarchy_level
+    desc: Whole tree by level.
+  - name: idx_organisation_hierarchy_ancestor_path
+    columns:
+    - ancestor_path
+    desc: Prefix scan for subtree (STRING_PREFIX LIKE 'path%'); use varchar_pattern_ops-style prefix on CRDB by range scan.
+  - name: idx_organisation_hierarchy_hierarchy_relationship_type_id
+    columns:
+    - hierarchy_relationship_type_id
+    desc: Leading index for FK fk_organisation_hierarchy_hierarchy_relationship_type_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_hierarchy_child_organisation_id
+    columns:
+    - child_organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: edge is meaningless without the organisation row
+  - name: fk_organisation_hierarchy_parent_organisation_id
+    columns:
+    - parent_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: a parent with children cannot be purged
+  - name: fk_organisation_hierarchy_root_organisation_id
+    columns:
+    - root_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: root with descendants cannot be purged
+  - name: fk_organisation_hierarchy_hierarchy_relationship_type_id
+    columns:
+    - hierarchy_relationship_type_id
+    ref: hierarchy_relationship_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_hierarchy_parent_level_chain
+    columns:
+    - parent_organisation_id
+    - parent_level
+    ref: organisation_hierarchy
+    on_delete: RESTRICT
+    on_update: NO ACTION
+    desc: 'Level-chain: (parent, parent_level) must equal an existing node''s (child, hierarchy_level); with CHECK level = parent_level+1 this makes cycles unrepresentable.'
+    ref_columns:
+    - child_organisation_id
+    - hierarchy_level
+- name: organisation_hierarchy_closure
+  kind: bridge
+  delete_policy: hard
+  volume: high
+  tier: '1'
+  milestones: *id001
+  retention: 'Derived data: fully rebuildable from organisation_hierarchy; rows removed with the organisation; no retention beyond that.'
+  description: Closure (ancestor, descendant, depth) of organisation_hierarchy for O(1) subtree/ancestor queries and for recruiter mapping scope with_descendants. Written in the same txn as the edge.
+  no_hash_why: Keyed by random UUID pairs; no sequential access pattern.
+  columns:
+  - name: ancestor_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Ancestor (depth 0 = self).
+    sens: Internal
+  - name: descendant_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Descendant.
+    sens: Internal
+  - name: depth
+    type: INT2
+    domain: quantity
+    desc: Distance in edges (0 = self).
+    sens: Internal
+  constraints:
+  - name: uq_organisation_hierarchy_closure_ancestor_organisation_id_descendant_organisation_id
+    type: unique
+    columns:
+    - ancestor_organisation_id
+    - descendant_organisation_id
+    desc: One row per pair.
+  - name: ck_organisation_hierarchy_closure_depth_range
+    type: check
+    expr: depth BETWEEN 0 AND 7
+    desc: Matches the hierarchy depth cap.
+  - name: ck_organisation_hierarchy_closure_self_iff_zero
+    type: check
+    expr: (depth = 0) = (ancestor_organisation_id = descendant_organisation_id)
+    desc: Self rows only at depth 0; any cycle would need a self row at depth>0.
+  indexes:
+  - name: idx_organisation_hierarchy_closure_descendant_organisation_id_ancestor_organisation_id
+    columns:
+    - descendant_organisation_id
+    - ancestor_organisation_id
+    desc: Ancestors of a node.
+    storing:
+    - depth
+  fks:
+  - name: fk_organisation_hierarchy_closure_ancestor_organisation_id
+    columns:
+    - ancestor_organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: derived row
+  - name: fk_organisation_hierarchy_closure_descendant_organisation_id
+    columns:
+    - descendant_organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: derived row
+- name: organisation_hierarchy_change
+  kind: event
+  delete_policy: append_only
+  volume: low
+  tier: '1'
+  milestones: *id001
+  retention: Hierarchy history is a legal/audit record; kept 7 years then archived; INSERT-only.
+  description: Append-only log of re-parenting events (who moved which organisation from which parent to which).
+  columns:
+  - name: child_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation moved.
+    sens: Internal
+  - name: from_parent_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Parent before.
+    sens: Internal
+    'null': true
+    null_why: NULL = was a root
+  - name: to_parent_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Parent after.
+    sens: Internal
+    'null': true
+    null_why: NULL = became a root
+  - name: effective_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the change took effect.
+    sens: Internal
+    default: now()
+  - name: reason
+    type: STRING(300)
+    domain: free_text
+    desc: Business reason (acquisition, restructure).
+    sens: Internal
+    'null': true
+    null_why: NULL = not stated
+  - name: change_batch_ref
+    type: STRING(80)
+    domain: free_text
+    desc: Id of the bulk/import batch that caused the change.
+    sens: Internal
+    'null': true
+    null_why: NULL = manual single change
+  constraints: []
+  indexes:
+  - name: idx_organisation_hierarchy_change_child_organisation_id_effective_at
+    columns:
+    - child_organisation_id
+    - effective_at DESC
+    desc: Timeline of an organisation.
+  - name: idx_organisation_hierarchy_change_from_parent_organisation_id
+    columns:
+    - from_parent_organisation_id
+    desc: Leading index for FK fk_organisation_hierarchy_change_from_parent_organisation_id (join/cascade checks).
+  - name: idx_organisation_hierarchy_change_to_parent_organisation_id
+    columns:
+    - to_parent_organisation_id
+    desc: Leading index for FK fk_organisation_hierarchy_change_to_parent_organisation_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_hierarchy_change_child_organisation_id
+    columns:
+    - child_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_organisation_hierarchy_change_from_parent_organisation_id
+    columns:
+    - from_parent_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_organisation_hierarchy_change_to_parent_organisation_id
+    columns:
+    - to_parent_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+- name: organisation_identifier
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Kept while the organisation exists; after deletion ciphertext and hash are crypto-shredded (key version retired) 7 years after deleted_at.
+  description: Tax and registration identifiers (GSTIN, PAN, CIN, EIN, VAT...) by country and type. Stored as ciphertext + HMAC blind index + masked display; never in clear.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Owning organisation.
+    sens: Internal
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Issuing country.
+    sens: Internal
+  - name: tax_id_type_id
+    type: UUID
+    domain: identifier
+    desc: Identifier type for the country (master data tax_id_type; carries the validation regex/checksum rule).
+    sens: Internal
+  - name: value_encrypted
+    type: BYTES
+    domain: encrypted
+    desc: AES-256-GCM envelope-encrypted normalised identifier (D-10).
+    sens: Sensitive
+    pii: App-layer envelope encryption (KMS data key per tenant); decrypt only for verification calls and authorised finance/compliance roles, audited
+  - name: value_lookup_hash
+    type: BYTES
+    domain: token
+    desc: HMAC-SHA256 blind index of the normalised value (upper-case, separators stripped) for equality lookup and uniqueness.
+    sens: Sensitive
+    pii: Keyed HMAC (pepper in KMS), not reversible; used only for equality search
+  - name: masked_value
+    type: STRING(32)
+    domain: tax_id
+    desc: Display form with all but last 4 characters masked, e.g. XXXXXXXXXX1Z5.
+    sens: Sensitive
+    pii: Masked at write time; shown to employer admins and staff; full value never returned by the API
+  - name: key_version
+    type: INT2
+    domain: quantity
+    desc: Encryption key version used (rotation support).
+    sens: Internal
+    default: '1'
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Latest verification outcome of this identifier.
+    sens: Internal
+  - name: is_primary
+    type: BOOL
+    domain: boolean
+    desc: Primary identifier for invoicing in its country.
+    sens: Internal
+    default: 'false'
+  - name: issued_date
+    type: DATE
+    domain: date
+    desc: Registration / issue date.
+    sens: Internal
+    'null': true
+    null_why: NULL = unknown
+  - name: valid_until_date
+    type: DATE
+    domain: date
+    desc: Validity end (licences, e.g. GST suspension).
+    sens: Internal
+    'null': true
+    null_why: NULL = no expiry
+  constraints:
+  - name: uq_organisation_identifier_id_organisation_id
+    type: unique
+    columns:
+    - id
+    - organisation_id
+    desc: Same-tenant composite target (organisation_verification).
+  - name: ck_organisation_identifier_hash_length
+    type: check
+    expr: octet_length(value_lookup_hash) = 32
+    desc: HMAC-SHA256 digest length.
+  - name: ck_organisation_identifier_valid_range
+    type: check
+    expr: valid_until_date IS NULL OR issued_date IS NULL OR valid_until_date >= issued_date
+    desc: Valid-until not before issued.
+  indexes:
+  - name: uq_organisation_identifier_country_id_tax_id_type_id_value_lookup_hash
+    columns:
+    - country_id
+    - tax_id_type_id
+    - value_lookup_hash
+    desc: A tax/registration number belongs to one live organisation (dedupe + fraud).
+    unique: true
+    where: deleted_at IS NULL
+  - name: uq_organisation_identifier_organisation_id_tax_id_type_id
+    columns:
+    - organisation_id
+    - country_id
+    - tax_id_type_id
+    desc: One live identifier per organisation, country and type.
+    unique: true
+    where: deleted_at IS NULL
+  - name: uq_organisation_identifier_organisation_id_primary
+    columns:
+    - organisation_id
+    - country_id
+    desc: One primary identifier per organisation and country.
+    unique: true
+    where: is_primary AND deleted_at IS NULL
+  - name: idx_organisation_identifier_tax_id_type_id
+    columns:
+    - tax_id_type_id
+    desc: Leading index for FK fk_organisation_identifier_tax_id_type_id (join/cascade checks).
+  - name: idx_organisation_identifier_verification_status_id
+    columns:
+    - verification_status_id
+    desc: Leading index for FK fk_organisation_identifier_verification_status_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_identifier_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: identifier follows organisation purge via job
+  - name: fk_organisation_identifier_country_id
+    columns:
+    - country_id
+    ref: country
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_identifier_tax_id_type_id
+    columns:
+    - tax_id_type_id
+    ref: tax_id_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_identifier_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_verification
+  kind: event
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Verification evidence kept 7 years from checked_at; vendor tokens purged after 90 days; corrections are new attempts.
+  description: 'Company registration & tax verification boundary (docket Section 6): one row per request/attempt to the external vendor with idempotency key, vendor reference, outcome and expiry. Vendor
+    owns truth; we store status + identifiers used.'
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation being verified.
+    sens: Internal
+  - name: organisation_identifier_id
+    type: UUID
+    domain: identifier
+    desc: Identifier used for the lookup.
+    sens: Internal
+    'null': true
+    null_why: NULL = non-identifier check (domain, address)
+  - name: verification_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: What is being verified.
+    sens: Internal
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Outcome (pending / verified / failed / unavailable ...).
+    sens: Internal
+  - name: vendor_code
+    type: STRING(40)
+    domain: code
+    desc: Verification vendor/registry used (e.g. mca_api, gstn_api).
+    sens: Internal
+  - name: vendor_reference
+    type: STRING(120)
+    domain: free_text
+    desc: Vendor's request/transaction reference.
+    sens: Internal
+    'null': true
+    null_why: NULL = request not yet accepted by vendor (vendor down / queued)
+  - name: idempotency_key
+    type: STRING(100)
+    domain: free_text
+    desc: Client-generated key; vendor retries and our retries with the same key cannot create duplicates.
+    sens: Internal
+  - name: attempt_no
+    type: INT2
+    domain: quantity
+    desc: 1-based attempt counter per organisation and kind.
+    sens: Internal
+    default: '1'
+  - name: requested_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the request was sent.
+    sens: Internal
+    default: now()
+  - name: checked_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the vendor returned an outcome.
+    sens: Internal
+    'null': true
+    null_why: NULL = no outcome yet
+  - name: expires_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the outcome must be re-checked.
+    sens: Internal
+    'null': true
+    null_why: NULL = outcome has no expiry or not yet determined
+  - name: retry_after_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Earliest next attempt after a transient vendor failure.
+    sens: Internal
+    'null': true
+    null_why: NULL = no retry scheduled
+  - name: registered_name_returned
+    type: STRING(300)
+    domain: free_text
+    desc: Legal name as returned by the registry (for name matching).
+    sens: Internal
+    'null': true
+    null_why: NULL = not returned
+  - name: name_match_score
+    type: DECIMAL(5,2)
+    domain: ratio
+    desc: Similarity (0-100) between submitted and returned legal name.
+    sens: Internal
+    'null': true
+    null_why: NULL = not computed
+  - name: outcome_detail
+    type: STRING(300)
+    domain: free_text
+    desc: Vendor message / failure reason (no raw ID numbers).
+    sens: Internal
+    'null': true
+    null_why: NULL = none
+  - name: vendor_token
+    type: STRING(200)
+    domain: token
+    desc: Opaque vendor token/handle of the verification record.
+    sens: Sensitive
+    'null': true
+    null_why: NULL = vendor returns no token
+    pii: Opaque vendor token stored encrypted at storage layer; never shown; purged after 90 days
+  - name: requested_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: User who triggered it.
+    sens: Personal
+    'null': true
+    null_why: NULL = automatic re-check job
+    pii: Identifies a person; audited
+  constraints:
+  - name: uq_organisation_verification_idempotency_key
+    type: unique
+    columns:
+    - idempotency_key
+    desc: Duplicate vendor/retry submissions collapse to one row.
+  - name: uq_organisation_verification_organisation_id_verification_kind_id_attempt_no
+    type: unique
+    columns:
+    - organisation_id
+    - verification_kind_id
+    - attempt_no
+    desc: Attempt sequence.
+  - name: ck_organisation_verification_score_range
+    type: check
+    expr: name_match_score IS NULL OR name_match_score BETWEEN 0 AND 100
+    desc: Percentage range.
+  - name: ck_organisation_verification_checked_after_requested
+    type: check
+    expr: checked_at IS NULL OR checked_at >= requested_at
+    desc: Outcome after request.
+  - name: ck_organisation_verification_expires_after_checked
+    type: check
+    expr: expires_at IS NULL OR checked_at IS NULL OR expires_at >= checked_at
+    desc: Expiry after check.
+  indexes:
+  - name: idx_organisation_verification_organisation_id_verification_kind_id_requested_at
+    columns:
+    - organisation_id
+    - verification_kind_id
+    - requested_at DESC
+    desc: Latest outcome per kind.
+  - name: idx_organisation_verification_expires_at
+    columns:
+    - expires_at
+    desc: Re-verification job.
+    where: expires_at IS NOT NULL
+  - name: uq_organisation_verification_vendor_code_vendor_reference
+    columns:
+    - vendor_code
+    - vendor_reference
+    desc: Vendor callback correlation.
+    unique: true
+    where: vendor_reference IS NOT NULL
+  - name: idx_organisation_verification_organisation_identifier_id
+    columns:
+    - organisation_identifier_id
+    desc: Leading index for FK fk_organisation_verification_identifier_same_org (join/cascade checks).
+  - name: idx_organisation_verification_verification_kind_id
+    columns:
+    - verification_kind_id
+    desc: Leading index for FK fk_organisation_verification_verification_kind_id (join/cascade checks).
+  - name: idx_organisation_verification_verification_status_id
+    columns:
+    - verification_status_id
+    desc: Leading index for FK fk_organisation_verification_verification_status_id (join/cascade checks).
+  - name: idx_organisation_verification_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    desc: Leading index for FK fk_organisation_verification_requested_by_app_user_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_verification_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: evidence must survive
+  - name: fk_organisation_verification_identifier_same_org
+    columns:
+    - organisation_identifier_id
+    - organisation_id
+    ref: organisation_identifier
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: identifier must belong to the same organisation (tenant-safe)
+    ref_columns:
+    - id
+    - organisation_id
+  - name: fk_organisation_verification_verification_kind_id
+    columns:
+    - verification_kind_id
+    ref: verification_kind
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_verification_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_verification_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: requester erasure keeps evidence
+- name: organisation_document
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: KYC documents kept 7 years after verification; files in object storage deleted with row purge; erasure of directors' personal data inside documents handled by deleting the file.
+  description: KYC / compliance document references (certificate of incorporation, GST certificate, authorisation letter). The database stores the object reference and review state only.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Owning organisation.
+    sens: Internal
+  - name: document_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Document type (master data).
+    sens: Internal
+  - name: file_name
+    type: STRING(200)
+    domain: free_text
+    desc: Original file name.
+    sens: Internal
+  - name: storage_ref
+    type: STRING(500)
+    domain: free_text
+    desc: Private object-store key (no FK).
+    sens: Sensitive
+    pii: Private bucket, SSE-KMS, short-lived signed URLs; key never exposed to clients
+  - name: mime_type
+    type: STRING(100)
+    domain: free_text
+    desc: Content type.
+    sens: Internal
+  - name: file_size_bytes
+    type: INT8
+    domain: quantity
+    desc: File size.
+    sens: Internal
+  - name: checksum_sha256
+    type: STRING(64)
+    domain: code
+    desc: SHA-256 of the file (dedupe, integrity).
+    sens: Internal
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Review outcome.
+    sens: Internal
+  - name: moderation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Automated malware/content screening state.
+    sens: Internal
+  - name: reviewed_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Reviewer.
+    sens: Personal
+    'null': true
+    null_why: NULL = not yet reviewed
+    pii: Identifies staff; audited
+  - name: reviewed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Review time.
+    sens: Internal
+    'null': true
+    null_why: NULL = not yet reviewed
+  - name: rejection_reason
+    type: STRING(300)
+    domain: free_text
+    desc: Reason shown to uploader.
+    sens: Internal
+    'null': true
+    null_why: NULL = not rejected
+  - name: issued_date
+    type: DATE
+    domain: date
+    desc: Issue date on the document.
+    sens: Internal
+    'null': true
+    null_why: NULL = unreadable/unknown
+  - name: expiry_date
+    type: DATE
+    domain: date
+    desc: Document expiry.
+    sens: Internal
+    'null': true
+    null_why: NULL = document does not expire
+  constraints:
+  - name: ck_organisation_document_size_positive
+    type: check
+    expr: file_size_bytes > 0
+    desc: Non-empty file.
+  - name: ck_organisation_document_expiry_after_issue
+    type: check
+    expr: expiry_date IS NULL OR issued_date IS NULL OR expiry_date >= issued_date
+    desc: Expiry not before issue.
+  indexes:
+  - name: uq_organisation_document_organisation_id_checksum_sha256
+    columns:
+    - organisation_id
+    - checksum_sha256
+    desc: No duplicate upload of the same file per organisation.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_organisation_document_organisation_id_document_type_id
+    columns:
+    - organisation_id
+    - document_type_id
+    desc: Documents of a type.
+    where: deleted_at IS NULL
+  - name: idx_organisation_document_verification_status_id_expiry_date
+    columns:
+    - verification_status_id
+    - expiry_date
+    desc: Review queue and expiry sweeps.
+    where: deleted_at IS NULL
+  - name: idx_organisation_document_document_type_id
+    columns:
+    - document_type_id
+    desc: Leading index for FK fk_organisation_document_document_type_id (join/cascade checks).
+  - name: idx_organisation_document_moderation_status_id
+    columns:
+    - moderation_status_id
+    desc: Leading index for FK fk_organisation_document_moderation_status_id (join/cascade checks).
+  - name: idx_organisation_document_reviewed_by_app_user_id
+    columns:
+    - reviewed_by_app_user_id
+    desc: Leading index for FK fk_organisation_document_reviewed_by_app_user_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_document_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_document_document_type_id
+    columns:
+    - document_type_id
+    ref: document_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_document_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_document_moderation_status_id
+    columns:
+    - moderation_status_id
+    ref: moderation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_document_reviewed_by_app_user_id
+    columns:
+    - reviewed_by_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: reviewer erasure keeps record
+- name: organisation_contact
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Named business contacts of an organisation (HR head, billing, legal). Personal data of company staff; not platform users unless linked.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: contact_role_id
+    type: UUID
+    domain: enum_ref
+    desc: Role of the contact.
+    sens: Internal
+  - name: contact_name
+    type: STRING(150)
+    domain: person_name
+    desc: Contact person name.
+    sens: Personal
+    pii: Access-controlled+audited; masked for non-account-admins; anonymised on erasure
+  - name: job_title
+    type: STRING(150)
+    domain: free_text
+    desc: Job title.
+    sens: Personal
+    'null': true
+    null_why: NULL = not provided
+    pii: Access-controlled; anonymised on erasure
+  - name: email
+    type: STRING(254)
+    domain: email
+    desc: Business email.
+    sens: Personal
+    'null': true
+    null_why: NULL = phone-only contact
+    pii: Access-controlled+audited; masked in lists; anonymised on erasure
+  - name: phone
+    type: STRING(16)
+    domain: phone
+    desc: E.164 business phone.
+    sens: Personal
+    'null': true
+    null_why: NULL = email-only contact
+    pii: Access-controlled+audited; masked in lists; anonymised on erasure
+  - name: phone_country_id
+    type: UUID
+    domain: identifier
+    desc: Country of the phone number.
+    sens: Internal
+    'null': true
+    null_why: NULL = no phone
+  - name: app_user_id
+    type: UUID
+    domain: identifier
+    desc: Platform user for this contact.
+    sens: Personal
+    'null': true
+    null_why: NULL = contact is not a platform user
+    pii: Links person to account; audited
+  - name: is_primary
+    type: BOOL
+    domain: boolean
+    desc: Primary contact for this role.
+    sens: Internal
+    default: 'false'
+  - name: visibility_level_id
+    type: UUID
+    domain: enum_ref
+    desc: Who sees the contact (public / members / internal).
+    sens: Internal
+  - name: verified_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Contact verified (OTP/email link).
+    sens: Internal
+    'null': true
+    null_why: NULL = unverified
+  constraints:
+  - name: ck_organisation_contact_email_lower
+    type: check
+    expr: email IS NULL OR email = lower(email)
+    desc: Lowercase email.
+  - name: ck_organisation_contact_phone_e164
+    type: check
+    expr: phone IS NULL OR phone ~ '^\+[1-9][0-9]{6,14}$'
+    desc: E.164 format.
+  - name: ck_organisation_contact_phone_country_pair
+    type: check
+    expr: (phone IS NULL) = (phone_country_id IS NULL)
+    desc: Phone and its country together.
+  - name: ck_organisation_contact_reachable
+    type: check
+    expr: email IS NOT NULL OR phone IS NOT NULL
+    desc: At least one channel.
+  indexes:
+  - name: uq_organisation_contact_organisation_id_contact_role_id
+    columns:
+    - organisation_id
+    - contact_role_id
+    desc: One primary contact per role (P3).
+    unique: true
+    where: is_primary AND deleted_at IS NULL
+  - name: idx_organisation_contact_email
+    columns:
+    - email
+    desc: Contact lookup by email.
+    where: email IS NOT NULL AND deleted_at IS NULL
+  - name: idx_organisation_contact_contact_role_id
+    columns:
+    - contact_role_id
+    desc: Leading index for FK fk_organisation_contact_contact_role_id (join/cascade checks).
+  - name: idx_organisation_contact_phone_country_id
+    columns:
+    - phone_country_id
+    desc: Leading index for FK fk_organisation_contact_phone_country_id (join/cascade checks).
+  - name: idx_organisation_contact_app_user_id
+    columns:
+    - app_user_id
+    desc: Leading index for FK fk_organisation_contact_app_user_id (join/cascade checks).
+  - name: idx_organisation_contact_visibility_level_id
+    columns:
+    - visibility_level_id
+    desc: Leading index for FK fk_organisation_contact_visibility_level_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_contact_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_contact_contact_role_id
+    columns:
+    - contact_role_id
+    ref: contact_role
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_contact_phone_country_id
+    columns:
+    - phone_country_id
+    ref: country
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_contact_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: contact stays when user erased
+  - name: fk_organisation_contact_visibility_level_id
+    columns:
+    - visibility_level_id
+    ref: visibility_level
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_domain
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones: *id001
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Verified email domains of an organisation; used for auto-association of staff, anti-impersonation and reviewer employment verification.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: domain_name
+    type: STRING(253)
+    domain: free_text
+    desc: Lowercase DNS name, e.g. example.com.
+    sens: Public
+  - name: domain_verification_method_id
+    type: UUID
+    domain: enum_ref
+    desc: Proof method.
+    sens: Internal
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Verification state.
+    sens: Internal
+  - name: challenge_token
+    type: STRING(100)
+    domain: token
+    desc: One-time DNS/email challenge value.
+    sens: Sensitive
+    'null': true
+    null_why: NULL = verification not started or already completed (token cleared)
+    pii: Random one-time token, stored hashed-equivalent; cleared on success; expires
+  - name: verified_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Ownership proven.
+    sens: Internal
+    'null': true
+    null_why: NULL = unverified
+  - name: expires_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Next re-verification due.
+    sens: Internal
+    'null': true
+    null_why: NULL = no re-verification scheduled
+  - name: is_primary
+    type: BOOL
+    domain: boolean
+    desc: Primary company domain.
+    sens: Internal
+    default: 'false'
+  - name: allows_auto_join
+    type: BOOL
+    domain: boolean
+    desc: Users with a verified email at this domain are associated automatically.
+    sens: Internal
+    default: 'false'
+  constraints:
+  - name: ck_organisation_domain_domain_lower
+    type: check
+    expr: domain_name = lower(domain_name) AND domain_name ~ '^[a-z0-9.-]+\.[a-z]{2,}$'
+    desc: Normalised hostname.
+  indexes:
+  - name: uq_organisation_domain_domain_name
+    columns:
+    - domain_name
+    desc: A verified domain belongs to exactly one live organisation.
+    unique: true
+    where: verified_at IS NOT NULL AND deleted_at IS NULL
+  - name: uq_organisation_domain_organisation_id_domain_name
+    columns:
+    - organisation_id
+    - domain_name
+    desc: Same domain once per organisation.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_organisation_domain_expires_at
+    columns:
+    - expires_at
+    desc: Re-verification sweep.
+    where: expires_at IS NOT NULL AND deleted_at IS NULL
+  - name: idx_organisation_domain_domain_verification_method_id
+    columns:
+    - domain_verification_method_id
+    desc: Leading index for FK fk_organisation_domain_domain_verification_method_id (join/cascade checks).
+  - name: idx_organisation_domain_verification_status_id
+    columns:
+    - verification_status_id
+    desc: Leading index for FK fk_organisation_domain_verification_status_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_domain_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_domain_domain_verification_method_id
+    columns:
+    - domain_verification_method_id
+    ref: domain_verification_method
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_domain_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_social_link
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones: *id001
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Outbound links to the organisation's social profiles (links only, Section 6).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: social_platform_id
+    type: UUID
+    domain: enum_ref
+    desc: Platform.
+    sens: Internal
+  - name: profile_url
+    type: STRING(500)
+    domain: url
+    desc: Profile URL (https).
+    sens: Public
+  - name: handle
+    type: STRING(100)
+    domain: free_text
+    desc: Handle / vanity name.
+    sens: Public
+    'null': true
+    null_why: NULL = not parseable from URL
+  - name: is_verified_link
+    type: BOOL
+    domain: boolean
+    desc: Link ownership confirmed.
+    sens: Internal
+    default: 'false'
+  constraints:
+  - name: ck_organisation_social_link_profile_url_https
+    type: check
+    expr: profile_url ~ '^https://'
+    desc: HTTPS only.
+  indexes:
+  - name: uq_organisation_social_link_organisation_id_social_platform_id
+    columns:
+    - organisation_id
+    - social_platform_id
+    desc: One link per platform.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_organisation_social_link_social_platform_id
+    columns:
+    - social_platform_id
+    desc: Leading index for FK fk_organisation_social_link_social_platform_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_social_link_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_social_link_social_platform_id
+    columns:
+    - social_platform_id
+    ref: social_platform
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_media
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Logo, cover and gallery assets of the company page (object references only).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: media_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Asset type.
+    sens: Internal
+  - name: storage_ref
+    type: STRING(500)
+    domain: free_text
+    desc: Object-store key.
+    sens: Public
+  - name: mime_type
+    type: STRING(100)
+    domain: free_text
+    desc: Content type.
+    sens: Internal
+  - name: checksum_sha256
+    type: STRING(64)
+    domain: code
+    desc: SHA-256 (dedupe).
+    sens: Internal
+  - name: width_px
+    type: INT4
+    domain: quantity
+    desc: Width.
+    sens: Internal
+    'null': true
+    null_why: NULL = not an image
+  - name: height_px
+    type: INT4
+    domain: quantity
+    desc: Height.
+    sens: Internal
+    'null': true
+    null_why: NULL = not an image
+  - name: caption
+    type: STRING(300)
+    domain: free_text
+    desc: Public caption.
+    sens: Public
+    'null': true
+    null_why: NULL = no caption
+  - name: alt_text
+    type: STRING(300)
+    domain: free_text
+    desc: Accessibility text.
+    sens: Public
+    'null': true
+    null_why: NULL = not provided
+  - name: display_order
+    type: INT4
+    domain: quantity
+    desc: Order in gallery.
+    sens: Internal
+    default: '0'
+  - name: is_primary
+    type: BOOL
+    domain: boolean
+    desc: Current logo/cover of its type.
+    sens: Internal
+    default: 'false'
+  - name: moderation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Moderation state.
+    sens: Internal
+  constraints:
+  - name: ck_organisation_media_dimensions_positive
+    type: check
+    expr: (width_px IS NULL OR width_px > 0) AND (height_px IS NULL OR height_px > 0)
+    desc: Positive dimensions.
+  indexes:
+  - name: uq_organisation_media_organisation_id_media_type_id
+    columns:
+    - organisation_id
+    - media_type_id
+    desc: One primary asset per type (P3).
+    unique: true
+    where: is_primary AND deleted_at IS NULL
+  - name: uq_organisation_media_organisation_id_checksum_sha256
+    columns:
+    - organisation_id
+    - checksum_sha256
+    desc: No duplicate uploads.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_organisation_media_media_type_id
+    columns:
+    - media_type_id
+    desc: Leading index for FK fk_organisation_media_media_type_id (join/cascade checks).
+  - name: idx_organisation_media_moderation_status_id
+    columns:
+    - moderation_status_id
+    desc: Leading index for FK fk_organisation_media_moderation_status_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_media_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_media_media_type_id
+    columns:
+    - media_type_id
+    ref: media_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_media_moderation_status_id
+    columns:
+    - moderation_status_id
+    ref: moderation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_benefit
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Benefits, perks and culture highlights listed on the company page (Naukri/AmbitionBox 'perks' coverage).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: benefit_category_id
+    type: UUID
+    domain: enum_ref
+    desc: Category.
+    sens: Internal
+  - name: title
+    type: STRING(150)
+    domain: free_text
+    desc: Benefit headline.
+    sens: Public
+  - name: description_text
+    type: STRING(1000)
+    domain: free_text
+    desc: Detail.
+    sens: Public
+    'null': true
+    null_why: NULL = headline only
+  - name: language_id
+    type: UUID
+    domain: identifier
+    desc: Language of the text.
+    sens: Internal
+    'null': true
+    null_why: NULL = unknown
+  - name: display_order
+    type: INT4
+    domain: quantity
+    desc: Display order.
+    sens: Internal
+    default: '0'
+  constraints: []
+  indexes:
+  - name: uq_organisation_benefit_organisation_id_benefit_category_id
+    columns:
+    - organisation_id
+    - benefit_category_id
+    - title
+    desc: No duplicate benefit titles.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_organisation_benefit_benefit_category_id
+    columns:
+    - benefit_category_id
+    desc: Leading index for FK fk_organisation_benefit_benefit_category_id (join/cascade checks).
+  - name: idx_organisation_benefit_language_id
+    columns:
+    - language_id
+    desc: Leading index for FK fk_organisation_benefit_language_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_benefit_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_benefit_benefit_category_id
+    columns:
+    - benefit_category_id
+    ref: benefit_category
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_benefit_language_id
+    columns:
+    - language_id
+    ref: language
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+- name: organisation_follow
+  kind: link
+  delete_policy: hard
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B25
+  - B28
+  - B31
+  - B75
+  retention: Unfollow deletes the row; follower rows erased with the user.
+  description: Candidate/user follows a company page (LinkedIn 'follow'); drives job-alert fan-out. Follower counts are computed in analytics, not a hot counter.
+  no_hash_why: Both access paths lead with random UUID columns; no monotonic key.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Followed organisation.
+    sens: Internal
+  - name: follower_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Follower.
+    sens: Personal
+    pii: Identifies a person's interests; owner-only; erased with user
+  - name: notify_new_jobs
+    type: BOOL
+    domain: boolean
+    desc: Receive new-job notifications.
+    sens: Internal
+    default: 'true'
+  constraints:
+  - name: uq_organisation_follow_organisation_id_follower_app_user_id
+    type: unique
+    columns:
+    - organisation_id
+    - follower_app_user_id
+    desc: A user follows a company once.
+  indexes:
+  - name: idx_organisation_follow_follower_app_user_id_created_at
+    columns:
+    - follower_app_user_id
+    - created_at DESC
+    desc: My followed companies.
+  fks:
+  - name: fk_organisation_follow_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: follows are meaningless without the page
+  - name: fk_organisation_follow_follower_app_user_id
+    columns:
+    - follower_app_user_id
+    ref: app_user
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: erased with the user
+- name: organisation_review
+  kind: entity
+  delete_policy: soft
+  volume: high
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  - B75
+  retention: Reviews kept while the company exists; on reviewer erasure reviewer_app_user_id is set NULL and text retained anonymously; rejected reviews purged after 12 months.
+  description: 'User-generated company review (Glassdoor/AmbitionBox style): overall + dimension ratings, pros/cons, relationship to company, moderation lifecycle. Reference benchmarks/ratings from external
+    providers live in tier3_reference.'
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Reviewed company.
+    sens: Internal
+  - name: reviewer_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Reviewer.
+    sens: Personal
+    'null': true
+    null_why: NULL = reviewer erased/anonymised
+    pii: Never exposed publicly (anonymous by default); audited access; set NULL on erasure
+  - name: reviewer_relation_id
+    type: UUID
+    domain: enum_ref
+    desc: Relationship to the company.
+    sens: Internal
+  - name: employment_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Employment type of the reviewer.
+    sens: Internal
+    'null': true
+    null_why: NULL = not stated (interviewee/other)
+  - name: job_role_id
+    type: UUID
+    domain: identifier
+    desc: Reviewer's role.
+    sens: Internal
+    'null': true
+    null_why: NULL = not stated
+  - name: organisation_location_id
+    type: UUID
+    domain: identifier
+    desc: Site reviewed.
+    sens: Internal
+    'null': true
+    null_why: NULL = not stated
+  - name: rating_overall
+    type: INT2
+    domain: quantity
+    desc: Overall rating 1-5.
+    sens: Internal
+  - name: rating_culture
+    type: INT2
+    domain: quantity
+    desc: Culture and values 1-5.
+    sens: Internal
+    'null': true
+    null_why: NULL = dimension not rated
+  - name: rating_work_life
+    type: INT2
+    domain: quantity
+    desc: Work-life balance 1-5.
+    sens: Internal
+    'null': true
+    null_why: NULL = dimension not rated
+  - name: rating_compensation
+    type: INT2
+    domain: quantity
+    desc: Compensation and benefits 1-5.
+    sens: Internal
+    'null': true
+    null_why: NULL = dimension not rated
+  - name: rating_management
+    type: INT2
+    domain: quantity
+    desc: Senior management 1-5.
+    sens: Internal
+    'null': true
+    null_why: NULL = dimension not rated
+  - name: rating_career
+    type: INT2
+    domain: quantity
+    desc: Career opportunities 1-5.
+    sens: Internal
+    'null': true
+    null_why: NULL = dimension not rated
+  - name: recommendation_answer_id
+    type: UUID
+    domain: enum_ref
+    desc: Would recommend to a friend.
+    sens: Internal
+  - name: title
+    type: STRING(200)
+    domain: free_text
+    desc: Review headline.
+    sens: Personal
+    pii: Free text may contain PII; moderated, encrypted at rest (D-17)
+  - name: pros
+    type: STRING
+    domain: long_text
+    desc: What the reviewer liked.
+    sens: Personal
+    pii: Free text may contain PII; moderated, encrypted at rest (D-17)
+    unbounded_why: User-written review text; length varies and is bounded by the application (max 5,000 chars), not by schema
+  - name: cons
+    type: STRING
+    domain: long_text
+    desc: What could be better.
+    sens: Personal
+    pii: Free text may contain PII; moderated, encrypted at rest (D-17)
+    unbounded_why: User-written review text; length varies and is bounded by the application (max 5,000 chars), not by schema
+  - name: advice_to_management
+    type: STRING
+    domain: long_text
+    desc: Advice to leadership.
+    sens: Personal
+    'null': true
+    null_why: NULL = not provided
+    pii: Free text may contain PII; moderated, encrypted at rest (D-17)
+    unbounded_why: User-written review text; length varies and is bounded by the application (max 5,000 chars), not by schema
+  - name: language_id
+    type: UUID
+    domain: identifier
+    desc: Language the review was written in.
+    sens: Internal
+    'null': true
+    null_why: NULL = not detected
+  - name: tenure_months
+    type: INT2
+    domain: quantity
+    desc: Months spent at the company.
+    sens: Internal
+    'null': true
+    null_why: NULL = not stated
+  - name: is_anonymous
+    type: BOOL
+    domain: boolean
+    desc: Hide reviewer identity publicly.
+    sens: Internal
+    default: 'true'
+  - name: is_employment_verified
+    type: BOOL
+    domain: boolean
+    desc: Reviewer proved employment (verified domain email / payslip token).
+    sens: Internal
+    default: 'false'
+  - name: moderation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Moderation state.
+    sens: Internal
+  - name: is_published
+    type: BOOL
+    domain: boolean
+    desc: Visible publicly (approved and not removed).
+    sens: Internal
+    default: 'false'
+  - name: published_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Publication time.
+    sens: Internal
+    'null': true
+    null_why: NULL = not published
+  - name: helpful_count
+    type: INT4
+    domain: quantity
+    desc: Denormalised helpful votes (batched update).
+    sens: Internal
+    default: '0'
+  constraints:
+  - name: uq_organisation_review_organisation_id_id
+    type: unique
+    columns:
+    - organisation_id
+    - id
+    desc: Same-tenant composite target for review_response.
+  - name: ck_organisation_review_rating_overall_range
+    type: check
+    expr: rating_overall BETWEEN 1 AND 5
+    desc: 1-5.
+  - name: ck_organisation_review_rating_dimensions_range
+    type: check
+    expr: (rating_culture IS NULL OR rating_culture BETWEEN 1 AND 5) AND (rating_work_life IS NULL OR rating_work_life BETWEEN 1 AND 5) AND (rating_compensation IS NULL OR rating_compensation BETWEEN 1
+      AND 5) AND (rating_management IS NULL OR rating_management BETWEEN 1 AND 5) AND (rating_career IS NULL OR rating_career BETWEEN 1 AND 5)
+    desc: 1-5 each.
+  - name: ck_organisation_review_tenure_range
+    type: check
+    expr: tenure_months IS NULL OR tenure_months BETWEEN 0 AND 720
+    desc: Plausible tenure.
+  - name: ck_organisation_review_published_pair
+    type: check
+    expr: is_published = (published_at IS NOT NULL)
+    desc: Flag matches timestamp.
+  indexes:
+  - name: uq_organisation_review_organisation_id_reviewer_app_user_id_reviewer_relation_id
+    columns:
+    - organisation_id
+    - reviewer_app_user_id
+    - reviewer_relation_id
+    desc: One live review per reviewer, company and relationship (anti-spam).
+    unique: true
+    where: reviewer_app_user_id IS NOT NULL AND deleted_at IS NULL
+  - name: idx_organisation_review_organisation_id_published_at
+    columns:
+    - organisation_id
+    - published_at DESC
+    desc: Public review list per company.
+    where: is_published AND deleted_at IS NULL
+    storing:
+    - rating_overall
+    - helpful_count
+  - name: idx_organisation_review_moderation_status_id_created_at
+    columns:
+    - moderation_status_id
+    - created_at
+    desc: Moderation queue (oldest first).
+    hash: true
+    bucket_count: 8
+    where: deleted_at IS NULL
+  - name: idx_organisation_review_reviewer_app_user_id
+    columns:
+    - reviewer_app_user_id
+    desc: My reviews / erasure.
+    where: reviewer_app_user_id IS NOT NULL
+  - name: idx_organisation_review_reviewer_relation_id
+    columns:
+    - reviewer_relation_id
+    desc: Leading index for FK fk_organisation_review_reviewer_relation_id (join/cascade checks).
+  - name: idx_organisation_review_employment_type_id
+    columns:
+    - employment_type_id
+    desc: Leading index for FK fk_organisation_review_employment_type_id (join/cascade checks).
+  - name: idx_organisation_review_job_role_id
+    columns:
+    - job_role_id
+    desc: Leading index for FK fk_organisation_review_job_role_id (join/cascade checks).
+  - name: idx_organisation_review_recommendation_answer_id
+    columns:
+    - recommendation_answer_id
+    desc: Leading index for FK fk_organisation_review_recommendation_answer_id (join/cascade checks).
+  - name: idx_organisation_review_language_id
+    columns:
+    - language_id
+    desc: Leading index for FK fk_organisation_review_language_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_review_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: reviews follow organisation purge
+  - name: fk_organisation_review_reviewer_app_user_id
+    columns:
+    - reviewer_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: keep review anonymously after erasure
+  - name: fk_organisation_review_reviewer_relation_id
+    columns:
+    - reviewer_relation_id
+    ref: reviewer_relation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_review_employment_type_id
+    columns:
+    - employment_type_id
+    ref: employment_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_review_job_role_id
+    columns:
+    - job_role_id
+    ref: job_role
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_review_recommendation_answer_id
+    columns:
+    - recommendation_answer_id
+    ref: recommendation_answer
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_review_language_id
+    columns:
+    - language_id
+    ref: language
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_review_moderation_status_id
+    columns:
+    - moderation_status_id
+    ref: moderation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_review_location_same_org
+    columns:
+    - organisation_id
+    - organisation_location_id
+    ref: organisation_location
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: site must belong to the reviewed company
+    ref_columns:
+    - organisation_id
+    - id
+- name: organisation_review_response
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Kept with the review; removed when the review is purged.
+  description: Employer's public reply to a review (one per review); moderated like the review.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation (tenant) replying; must equal the review's.
+    sens: Internal
+  - name: organisation_review_id
+    type: UUID
+    domain: identifier
+    desc: Review answered.
+    sens: Internal
+  - name: responder_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Employer representative.
+    sens: Personal
+    'null': true
+    null_why: NULL = responder erased
+    pii: Hidden publicly (shows company name); audited
+  - name: body
+    type: STRING
+    domain: long_text
+    desc: Reply text.
+    sens: Personal
+    pii: May contain PII; moderated
+    unbounded_why: User-written review text; length varies and is bounded by the application (max 5,000 chars), not by schema
+  - name: language_id
+    type: UUID
+    domain: identifier
+    desc: Reply language.
+    sens: Internal
+    'null': true
+    null_why: NULL = not detected
+  - name: moderation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Moderation state.
+    sens: Internal
+  - name: is_published
+    type: BOOL
+    domain: boolean
+    desc: Public.
+    sens: Internal
+    default: 'false'
+  - name: published_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Publication time.
+    sens: Internal
+    'null': true
+    null_why: NULL = not published
+  constraints:
+  - name: ck_organisation_review_response_published_pair
+    type: check
+    expr: is_published = (published_at IS NOT NULL)
+    desc: Flag matches timestamp.
+  indexes:
+  - name: uq_organisation_review_response_organisation_review_id
+    columns:
+    - organisation_review_id
+    desc: One live response per review.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_organisation_review_response_organisation_id_published_at
+    columns:
+    - organisation_id
+    - published_at DESC
+    desc: Company's replies.
+    where: is_published AND deleted_at IS NULL
+  - name: idx_organisation_review_response_responder_app_user_id
+    columns:
+    - responder_app_user_id
+    desc: Leading index for FK fk_organisation_review_response_responder_app_user_id (join/cascade checks).
+  - name: idx_organisation_review_response_language_id
+    columns:
+    - language_id
+    desc: Leading index for FK fk_organisation_review_response_language_id (join/cascade checks).
+  - name: idx_organisation_review_response_moderation_status_id
+    columns:
+    - moderation_status_id
+    desc: Leading index for FK fk_organisation_review_response_moderation_status_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_review_response_review_same_org
+    columns:
+    - organisation_id
+    - organisation_review_id
+    ref: organisation_review
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: reply must belong to the same company as the review
+    ref_columns:
+    - organisation_id
+    - id
+  - name: fk_organisation_review_response_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: tenant
+  - name: fk_organisation_review_response_responder_app_user_id
+    columns:
+    - responder_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: keep reply after user erasure
+  - name: fk_organisation_review_response_language_id
+    columns:
+    - language_id
+    ref: language
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_review_response_moderation_status_id
+    columns:
+    - moderation_status_id
+    ref: moderation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_review_vote
+  kind: link
+  delete_policy: hard
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Votes erased with the user or the review.
+  description: Helpful / not helpful vote on a review (one per user).
+  no_hash_why: Random UUID leading keys; no monotonic access path.
+  columns:
+  - name: organisation_review_id
+    type: UUID
+    domain: identifier
+    desc: Review voted on.
+    sens: Internal
+  - name: voter_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Voter.
+    sens: Personal
+    pii: Behavioural data; owner-only; erased with user
+  - name: is_helpful
+    type: BOOL
+    domain: boolean
+    desc: True = helpful, false = not helpful.
+    sens: Internal
+    default: 'true'
+  constraints:
+  - name: uq_organisation_review_vote_organisation_review_id_voter_app_user_id
+    type: unique
+    columns:
+    - organisation_review_id
+    - voter_app_user_id
+    desc: One vote per user per review.
+  indexes:
+  - name: idx_organisation_review_vote_voter_app_user_id
+    columns:
+    - voter_app_user_id
+    desc: Votes of a user.
+  fks:
+  - name: fk_organisation_review_vote_organisation_review_id
+    columns:
+    - organisation_review_id
+    ref: organisation_review
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: votes die with the review
+  - name: fk_organisation_review_vote_voter_app_user_id
+    columns:
+    - voter_app_user_id
+    ref: app_user
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: erased with user
+- name: organisation_review_moderation
+  kind: audit
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  - B75
+  retention: Moderation decisions kept 5 years as evidence; INSERT-only.
+  description: Append-only moderation trail for reviews (automated rule hit, user report, moderator decision).
+  columns:
+  - name: organisation_review_id
+    type: UUID
+    domain: identifier
+    desc: Review moderated.
+    sens: Internal
+  - name: moderation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Status after this event.
+    sens: Internal
+  - name: moderator_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Moderator.
+    sens: Personal
+    'null': true
+    null_why: NULL = automated rule or user report
+    pii: Staff identity; audited
+  - name: rule_code
+    type: STRING(40)
+    domain: code
+    desc: Automated rule or report reason code.
+    sens: Internal
+    'null': true
+    null_why: NULL = manual decision without rule
+  - name: note
+    type: STRING(300)
+    domain: free_text
+    desc: Moderator note.
+    sens: Internal
+    'null': true
+    null_why: NULL = none
+  constraints: []
+  indexes:
+  - name: idx_organisation_review_moderation_organisation_review_id_created_at
+    columns:
+    - organisation_review_id
+    - created_at
+    desc: Review's moderation timeline.
+  - name: idx_organisation_review_moderation_created_at
+    columns:
+    - created_at
+    desc: Time-ordered scan for reporting.
+    hash: true
+    bucket_count: 8
+  - name: idx_organisation_review_moderation_moderation_status_id
+    columns:
+    - moderation_status_id
+    desc: Leading index for FK fk_organisation_review_moderation_moderation_status_id (join/cascade checks).
+  - name: idx_organisation_review_moderation_moderator_app_user_id
+    columns:
+    - moderator_app_user_id
+    desc: Leading index for FK fk_organisation_review_moderation_moderator_app_user_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_review_moderation_organisation_review_id
+    columns:
+    - organisation_review_id
+    ref: organisation_review
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: evidence must survive
+  - name: fk_organisation_review_moderation_moderation_status_id
+    columns:
+    - moderation_status_id
+    ref: moderation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_review_moderation_moderator_app_user_id
+    columns:
+    - moderator_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: keep decision after moderator erasure
+- name: organisation_rating_summary
+  kind: snapshot
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Recomputable aggregate; replaced on refresh; deleted with the organisation.
+  description: Current aggregate of this platform's own published reviews per company (count, averages, recommend ratio). Distinct from tier3_reference company_rating_snapshot (external, dated, attributed
+    benchmarks).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: review_count
+    type: INT4
+    domain: quantity
+    desc: Published review count.
+    sens: Internal
+    default: '0'
+  - name: rating_overall_avg
+    type: DECIMAL(3,2)
+    domain: measure
+    desc: Mean overall rating.
+    sens: Internal
+    'null': true
+    null_why: NULL = no reviews yet (not zero)
+  - name: dimension_averages
+    type: JSONB
+    domain: json
+    desc: Mean per dimension {culture, work_life, compensation, management, career}.
+    sens: Internal
+    'null': true
+    null_why: NULL = no reviews yet
+  - name: recommend_ratio
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Share of reviews answering yes (0-100).
+    sens: Internal
+    'null': true
+    null_why: NULL = no reviews yet
+  - name: computed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Refresh time.
+    sens: Internal
+  - name: source_review_watermark
+    type: INT8
+    domain: quantity
+    desc: Highest review change sequence included (incremental refresh).
+    sens: Internal
+    default: '0'
+  constraints:
+  - name: uq_organisation_rating_summary_organisation_id
+    type: unique
+    columns:
+    - organisation_id
+    desc: One summary per organisation.
+  - name: ck_organisation_rating_summary_avg_range
+    type: check
+    expr: rating_overall_avg IS NULL OR rating_overall_avg BETWEEN 1 AND 5
+    desc: 1-5.
+  - name: ck_organisation_rating_summary_recommend_range
+    type: check
+    expr: recommend_ratio IS NULL OR recommend_ratio BETWEEN 0 AND 100
+    desc: 0-100.
+  indexes: []
+  fks:
+  - name: fk_organisation_rating_summary_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: derived data
+- name: organisation_size_history
+  kind: snapshot
+  delete_policy: append_only
+  volume: low
+  tier: '1'
+  milestones: *id001
+  retention: Kept for the life of the organisation; INSERT-only.
+  description: Dated employee-count observations with source attribution (company growth trend; Section 6 attribution rule).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: as_of_date
+    type: DATE
+    domain: date
+    desc: Date the figure refers to.
+    sens: Internal
+  - name: organisation_size_band_id
+    type: UUID
+    domain: enum_ref
+    desc: Band at that date.
+    sens: Internal
+  - name: employee_count
+    type: INT4
+    domain: quantity
+    desc: Exact headcount if known.
+    sens: Internal
+    'null': true
+    null_why: NULL = only the band is known
+  - name: attribution_source_id
+    type: UUID
+    domain: enum_ref
+    desc: Where the figure came from.
+    sens: Internal
+  - name: source_ref
+    type: STRING(200)
+    domain: free_text
+    desc: Reference/URL of the source.
+    sens: Internal
+    'null': true
+    null_why: NULL = no external reference
+  constraints:
+  - name: uq_organisation_size_history_organisation_id_as_of_date_attribution_source_id
+    type: unique
+    columns:
+    - organisation_id
+    - as_of_date
+    - attribution_source_id
+    desc: One observation per source and date.
+  - name: ck_organisation_size_history_employee_count_positive
+    type: check
+    expr: employee_count IS NULL OR employee_count > 0
+    desc: Positive.
+  indexes:
+  - name: idx_organisation_size_history_organisation_size_band_id
+    columns:
+    - organisation_size_band_id
+    desc: Leading index for FK fk_organisation_size_history_organisation_size_band_id (join/cascade checks).
+  - name: idx_organisation_size_history_attribution_source_id
+    columns:
+    - attribution_source_id
+    desc: Leading index for FK fk_organisation_size_history_attribution_source_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_size_history_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_organisation_size_history_organisation_size_band_id
+    columns:
+    - organisation_size_band_id
+    ref: organisation_size_band
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_size_history_attribution_source_id
+    columns:
+    - attribution_source_id
+    ref: attribution_source
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_status_history
+  kind: audit
+  delete_policy: append_only
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Status transitions kept 7 years; INSERT-only (sensitive action trail, docket Section 3).
+  description: Append-only status transitions of an organisation (suspension, closure, merge) written in the same txn as the change.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: from_organisation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Previous status.
+    sens: Internal
+    'null': true
+    null_why: NULL = initial creation
+  - name: to_organisation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: New status.
+    sens: Internal
+  - name: effective_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When effective.
+    sens: Internal
+    default: now()
+  - name: reason
+    type: STRING(300)
+    domain: free_text
+    desc: Reason.
+    sens: Internal
+    'null': true
+    null_why: NULL = not stated
+  - name: actor_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Acting user.
+    sens: Personal
+    'null': true
+    null_why: NULL = system job
+    pii: Staff identity; audited
+  constraints: []
+  indexes:
+  - name: idx_organisation_status_history_organisation_id_effective_at
+    columns:
+    - organisation_id
+    - effective_at DESC
+    desc: Timeline.
+  - name: idx_organisation_status_history_from_organisation_status_id
+    columns:
+    - from_organisation_status_id
+    desc: Leading index for FK fk_organisation_status_history_from_organisation_status_id (join/cascade checks).
+  - name: idx_organisation_status_history_to_organisation_status_id
+    columns:
+    - to_organisation_status_id
+    desc: Leading index for FK fk_organisation_status_history_to_organisation_status_id (join/cascade checks).
+  - name: idx_organisation_status_history_actor_app_user_id
+    columns:
+    - actor_app_user_id
+    desc: Leading index for FK fk_organisation_status_history_actor_app_user_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_status_history_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_organisation_status_history_from_organisation_status_id
+    columns:
+    - from_organisation_status_id
+    ref: organisation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_status_history_to_organisation_status_id
+    columns:
+    - to_organisation_status_id
+    ref: organisation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_status_history_actor_app_user_id
+    columns:
+    - actor_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: actor erasure keeps trail
+- name: account_status_history
+  kind: audit
+  delete_policy: append_only
+  volume: medium
+  tier: '1'
+  milestones: *id001
+  retention: Account status transitions kept 8 years; INSERT-only.
+  description: Append-only account status transitions (activation, hold, suspension, closure).
+  columns:
+  - name: account_id
+    type: UUID
+    domain: identifier
+    desc: Account.
+    sens: Internal
+  - name: from_account_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Previous status.
+    sens: Internal
+    'null': true
+    null_why: NULL = initial creation
+  - name: to_account_status_id
+    type: UUID
+    domain: enum_ref
+    desc: New status.
+    sens: Internal
+  - name: effective_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When effective.
+    sens: Internal
+    default: now()
+  - name: reason
+    type: STRING(300)
+    domain: free_text
+    desc: Reason.
+    sens: Internal
+    'null': true
+    null_why: NULL = not stated
+  - name: actor_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Acting user.
+    sens: Personal
+    'null': true
+    null_why: NULL = system job
+    pii: Staff identity; audited
+  constraints: []
+  indexes:
+  - name: idx_account_status_history_account_id_effective_at
+    columns:
+    - account_id
+    - effective_at DESC
+    desc: Timeline.
+  - name: idx_account_status_history_from_account_status_id
+    columns:
+    - from_account_status_id
+    desc: Leading index for FK fk_account_status_history_from_account_status_id (join/cascade checks).
+  - name: idx_account_status_history_to_account_status_id
+    columns:
+    - to_account_status_id
+    desc: Leading index for FK fk_account_status_history_to_account_status_id (join/cascade checks).
+  - name: idx_account_status_history_actor_app_user_id
+    columns:
+    - actor_app_user_id
+    desc: Leading index for FK fk_account_status_history_actor_app_user_id (join/cascade checks).
+  fks:
+  - name: fk_account_status_history_account_id
+    columns:
+    - account_id
+    ref: account
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: history must survive
+  - name: fk_account_status_history_from_account_status_id
+    columns:
+    - from_account_status_id
+    ref: account_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_account_status_history_to_account_status_id
+    columns:
+    - to_account_status_id
+    ref: account_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_account_status_history_actor_app_user_id
+    columns:
+    - actor_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: actor erasure keeps trail
+- name: organisation_note
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  - B75
+  retention: Internal staff notes kept 3 years after organisation closure; may contain personal contact details, anonymised on erasure.
+  description: 'Internal (staff-only) notes about an organisation: sales, compliance, risk. Never visible to the organisation.'
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: note_category_id
+    type: UUID
+    domain: enum_ref
+    desc: Category.
+    sens: Internal
+  - name: body
+    type: STRING
+    domain: long_text
+    desc: Note text.
+    sens: Personal
+    pii: May hold contact details; staff-only privilege; audited; anonymised on erasure
+    unbounded_why: Free-form staff commentary of unpredictable length
+  - name: is_pinned
+    type: BOOL
+    domain: boolean
+    desc: Pinned on the organisation admin view.
+    sens: Internal
+    default: 'false'
+  - name: language_id
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = language of the free text is unknown (not stated by the author, not detected).
+    sens: Internal
+    desc: Language the free text of this row was written in, where known (Rule 7); the text is stored once in that language.
+  constraints: []
+  indexes:
+  - name: idx_organisation_note_organisation_id_created_at
+    columns:
+    - organisation_id
+    - created_at DESC
+    desc: Latest notes.
+    where: deleted_at IS NULL
+  - name: idx_organisation_note_note_category_id
+    columns:
+    - note_category_id
+    desc: Leading index for FK fk_organisation_note_note_category_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_note_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_note_note_category_id
+    columns:
+    - note_category_id
+    ref: note_category
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_note_language_id
+    columns:
+    - language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Language master data is never deleted (retired via is_active).
+    index_exempt: master data language rows are never deleted, so no child scan is needed
+- name: organisation_tag
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Tags retained until unused for 24 months, then purged.
+  description: Staff-defined free label (e.g. 'strategic', 'fraud-watch') for segmentation of organisations; not an enumeration used by business logic.
+  columns:
+  - name: tag_name
+    type: STRING(60)
+    domain: free_text
+    desc: Display tag.
+    sens: Internal
+  - name: tag_name_normalised
+    type: STRING(60)
+    domain: free_text
+    desc: Lower-cased tag.
+    sens: Internal
+    computed: lower(tag_name)
+  - name: tag_description
+    type: STRING(200)
+    domain: free_text
+    desc: What the tag means.
+    sens: Internal
+    'null': true
+    null_why: NULL = self-explanatory
+  constraints: []
+  indexes:
+  - name: uq_organisation_tag_tag_name_normalised
+    columns:
+    - tag_name_normalised
+    desc: Unique live tag name.
+    unique: true
+    where: deleted_at IS NULL
+  fks: []
+- name: organisation_tag_assignment
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Removed when untagged or when the organisation/tag is purged.
+  description: Tag applied to an organisation.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: organisation_tag_id
+    type: UUID
+    domain: identifier
+    desc: Tag.
+    sens: Internal
+  constraints:
+  - name: uq_organisation_tag_assignment_organisation_id_organisation_tag_id
+    type: unique
+    columns:
+    - organisation_id
+    - organisation_tag_id
+    desc: Tag once per organisation.
+  indexes:
+  - name: idx_organisation_tag_assignment_organisation_tag_id
+    columns:
+    - organisation_tag_id
+    - organisation_id
+    desc: Organisations carrying a tag.
+  fks:
+  - name: fk_organisation_tag_assignment_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: link only
+  - name: fk_organisation_tag_assignment_organisation_tag_id
+    columns:
+    - organisation_tag_id
+    ref: organisation_tag
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: link only
+- name: organisation_alias
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B28
+  - B31
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Alternate names (former, trade, abbreviation, transliteration, merged duplicate) for matching job postings and imports to the right organisation.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: alias_name
+    type: STRING(300)
+    domain: free_text
+    desc: Alternate name.
+    sens: Public
+  - name: alias_normalised
+    type: STRING(300)
+    domain: free_text
+    desc: Lower-cased alias for matching.
+    sens: Public
+    computed: lower(alias_name)
+  - name: alias_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Type of alias.
+    sens: Internal
+  - name: language_id
+    type: UUID
+    domain: identifier
+    desc: Language/script of the alias.
+    sens: Internal
+    'null': true
+    null_why: NULL = unknown
+  constraints: []
+  indexes:
+  - name: uq_organisation_alias_organisation_id_alias_normalised
+    columns:
+    - organisation_id
+    - alias_normalised
+    desc: No duplicate alias per organisation.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_organisation_alias_alias_normalised
+    columns:
+    - alias_normalised
+    desc: Trigram GIN (gin_trgm_ops) for dedupe/match.
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_organisation_alias_alias_type_id
+    columns:
+    - alias_type_id
+    desc: Leading index for FK fk_organisation_alias_alias_type_id (join/cascade checks).
+  - name: idx_organisation_alias_language_id
+    columns:
+    - language_id
+    desc: Leading index for FK fk_organisation_alias_language_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_alias_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_alias_alias_type_id
+    columns:
+    - alias_type_id
+    ref: alias_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_alias_language_id
+    columns:
+    - language_id
+    ref: language
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+- name: organisation_merge
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B25
+  - B28
+  - B31
+  - B34
+  retention: Merge records kept permanently (re-pointing evidence); never deleted.
+  description: 'Duplicate-organisation merge workflow: survivor absorbs merged; a job re-points children (jobs, mappings, accounts) and writes aliases; reversible via stored re-point map.'
+  columns:
+  - name: survivor_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation kept.
+    sens: Internal
+  - name: merged_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Duplicate absorbed.
+    sens: Internal
+  - name: merge_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Workflow state.
+    sens: Internal
+  - name: match_score
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Duplicate-detection confidence (0-100).
+    sens: Internal
+    'null': true
+    null_why: NULL = manually proposed
+  - name: match_basis
+    type: JSONB
+    domain: json
+    desc: Evidence {matching identifier, domain, name similarity}.
+    sens: Internal
+    'null': true
+    null_why: NULL = manual proposal
+  - name: reason
+    type: STRING(300)
+    domain: free_text
+    desc: Why merged.
+    sens: Internal
+    'null': true
+    null_why: NULL = not stated
+  - name: approved_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Approving admin.
+    sens: Personal
+    'null': true
+    null_why: NULL = not yet approved
+    pii: Staff identity; audited
+  - name: approved_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Approval time.
+    sens: Internal
+    'null': true
+    null_why: NULL = not yet approved
+  - name: executed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Execution time.
+    sens: Internal
+    'null': true
+    null_why: NULL = not executed
+  - name: rolled_back_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Rollback time.
+    sens: Internal
+    'null': true
+    null_why: NULL = not rolled back
+  - name: repoint_map
+    type: JSONB
+    domain: json
+    desc: Table -> row ids re-pointed (enables rollback).
+    sens: Internal
+    'null': true
+    null_why: NULL = not executed yet
+  constraints:
+  - name: ck_organisation_merge_distinct_organisations
+    type: check
+    expr: survivor_organisation_id <> merged_organisation_id
+    desc: Cannot merge into itself.
+  - name: ck_organisation_merge_match_score_range
+    type: check
+    expr: match_score IS NULL OR match_score BETWEEN 0 AND 100
+    desc: Percentage range.
+  - name: ck_organisation_merge_execution_order
+    type: check
+    expr: executed_at IS NULL OR approved_at IS NOT NULL
+    desc: Only approved merges execute.
+  - name: uq_organisation_merge_merged_organisation_id_survivor_organisation_id
+    type: unique
+    columns:
+    - merged_organisation_id
+    - survivor_organisation_id
+    desc: A pair is proposed once.
+  indexes:
+  - name: uq_organisation_merge_merged_organisation_id
+    columns:
+    - merged_organisation_id
+    desc: An organisation is absorbed by at most one live merge.
+    unique: true
+    where: executed_at IS NOT NULL AND rolled_back_at IS NULL
+  - name: idx_organisation_merge_survivor_organisation_id
+    columns:
+    - survivor_organisation_id
+    - merge_status_id
+    desc: Merges into a survivor.
+  - name: idx_organisation_merge_merge_status_id
+    columns:
+    - merge_status_id
+    desc: Leading index for FK fk_organisation_merge_merge_status_id (join/cascade checks).
+  - name: idx_organisation_merge_approved_by_app_user_id
+    columns:
+    - approved_by_app_user_id
+    desc: Leading index for FK fk_organisation_merge_approved_by_app_user_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_merge_survivor_organisation_id
+    columns:
+    - survivor_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: permanent evidence
+  - name: fk_organisation_merge_merged_organisation_id
+    columns:
+    - merged_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: permanent evidence
+  - name: fk_organisation_merge_merge_status_id
+    columns:
+    - merge_status_id
+    ref: merge_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_merge_approved_by_app_user_id
+    columns:
+    - approved_by_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: keep record
+- name: client_relationship
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B28
+  - B31
+  - B34
+  retention: Commercial terms retained 8 years after termination (contract/tax), then purged.
+  description: Staffing agency/consultancy -> client company relationship with contract dates and commercial terms. Gates which client jobs an agency's recruiters may post for (together with recruiter mapping).
+  columns:
+  - name: agency_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Consultancy / agency organisation.
+    sens: Internal
+  - name: client_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Client company.
+    sens: Internal
+  - name: client_relationship_status_id
+    type: UUID
+    domain: enum_ref
+    desc: State.
+    sens: Internal
+  - name: contract_reference
+    type: STRING(100)
+    domain: free_text
+    desc: Contract / MSA number.
+    sens: Internal
+    'null': true
+    null_why: NULL = no signed contract (prospect)
+  - name: effective_from
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Contract start.
+    sens: Internal
+    default: now()
+  - name: effective_to
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Contract end.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended/ongoing
+  - name: fee_model_id
+    type: UUID
+    domain: enum_ref
+    desc: Fee model.
+    sens: Internal
+    'null': true
+    null_why: NULL = not agreed yet
+  - name: fee_percent
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Fee as percentage of annual CTC (placement_percent model).
+    sens: Internal
+    'null': true
+    null_why: NULL = not a percentage model
+  - name: margin_percent
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Agency margin/markup on the client's bill rate.
+    sens: Internal
+    'null': true
+    null_why: NULL = not applicable or not disclosed
+  - name: payment_term_id
+    type: UUID
+    domain: enum_ref
+    desc: Payment terms with this client.
+    sens: Internal
+    'null': true
+    null_why: NULL = defaults to account terms
+  - name: guarantee_days
+    type: INT2
+    domain: quantity
+    desc: Replacement guarantee period.
+    sens: Internal
+    'null': true
+    null_why: NULL = no guarantee
+  - name: is_exclusive
+    type: BOOL
+    domain: boolean
+    desc: Agency holds exclusivity for this client.
+    sens: Internal
+    default: 'false'
+  constraints:
+  - name: ck_client_relationship_distinct_parties
+    type: check
+    expr: agency_organisation_id <> client_organisation_id
+    desc: No self-client.
+  - name: ck_client_relationship_effective_range
+    type: check
+    expr: effective_to IS NULL OR effective_to >= effective_from
+    desc: End not before start.
+  - name: ck_client_relationship_fee_percent_range
+    type: check
+    expr: fee_percent IS NULL OR fee_percent BETWEEN 0 AND 100
+    desc: Percentage range.
+  - name: ck_client_relationship_margin_percent_range
+    type: check
+    expr: margin_percent IS NULL OR margin_percent BETWEEN 0 AND 100
+    desc: Percentage range.
+  - name: ck_client_relationship_guarantee_range
+    type: check
+    expr: guarantee_days IS NULL OR guarantee_days BETWEEN 0 AND 730
+    desc: Plausible guarantee.
+  indexes:
+  - name: uq_client_relationship_agency_organisation_id_client_organisation_id
+    columns:
+    - agency_organisation_id
+    - client_organisation_id
+    desc: 'P3: one open contract per agency/client pair.'
+    unique: true
+    where: effective_to IS NULL AND deleted_at IS NULL
+  - name: idx_client_relationship_client_organisation_id_effective_to
+    columns:
+    - client_organisation_id
+    - effective_to
+    desc: Agencies serving a client.
+    where: deleted_at IS NULL
+  - name: idx_client_relationship_client_relationship_status_id
+    columns:
+    - client_relationship_status_id
+    desc: Leading index for FK fk_client_relationship_client_relationship_status_id (join/cascade checks).
+  - name: idx_client_relationship_fee_model_id
+    columns:
+    - fee_model_id
+    desc: Leading index for FK fk_client_relationship_fee_model_id (join/cascade checks).
+  - name: idx_client_relationship_payment_term_id
+    columns:
+    - payment_term_id
+    desc: Leading index for FK fk_client_relationship_payment_term_id (join/cascade checks).
+  fks:
+  - name: fk_client_relationship_agency_organisation_id
+    columns:
+    - agency_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept
+  - name: fk_client_relationship_client_organisation_id
+    columns:
+    - client_organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept
+  - name: fk_client_relationship_client_relationship_status_id
+    columns:
+    - client_relationship_status_id
+    ref: client_relationship_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_client_relationship_fee_model_id
+    columns:
+    - fee_model_id
+    ref: fee_model
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_client_relationship_payment_term_id
+    columns:
+    - payment_term_id
+    ref: payment_term
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_department
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B28
+  - B31
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Internal departments/teams/business units (hiring-manager targeting, job requirement owner). Tree acyclicity uses the same level-chain FK trick as the organisation tree. Not an access-control
+    construct.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation (tenant).
+    sens: Internal
+  - name: parent_organisation_department_id
+    type: UUID
+    domain: identifier
+    desc: Parent unit.
+    sens: Internal
+    'null': true
+    null_why: NULL = top-level unit
+  - name: department_level
+    type: INT2
+    domain: quantity
+    desc: Depth (top level = 0).
+    sens: Internal
+  - name: parent_level
+    type: INT2
+    domain: quantity
+    desc: Parent's department_level.
+    sens: Internal
+    'null': true
+    null_why: NULL = top-level unit
+  - name: department_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Kind of unit.
+    sens: Internal
+  - name: department_name
+    type: STRING(150)
+    domain: free_text
+    desc: Name.
+    sens: Public
+  - name: cost_centre_code
+    type: STRING(30)
+    domain: code
+    desc: Finance cost-centre code.
+    sens: Internal
+    'null': true
+    null_why: NULL = no cost centre
+  - name: organisation_location_id
+    type: UUID
+    domain: identifier
+    desc: Main site of the unit.
+    sens: Internal
+    'null': true
+    null_why: NULL = not site-specific
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    desc: Unit in use.
+    sens: Internal
+    default: 'true'
+  constraints:
+  - name: uq_organisation_department_organisation_id_id_department_level
+    type: unique
+    columns:
+    - organisation_id
+    - id
+    - department_level
+    desc: Level-chain FK target.
+  - name: uq_organisation_department_organisation_id_id
+    type: unique
+    columns:
+    - organisation_id
+    - id
+    desc: Same-tenant target (job requirement owner).
+  - name: ck_organisation_department_level_range
+    type: check
+    expr: department_level BETWEEN 0 AND 5
+    desc: Depth cap.
+  - name: ck_organisation_department_parent_chain_nulls
+    type: check
+    expr: (parent_organisation_department_id IS NULL) = (parent_level IS NULL) AND (parent_level IS NULL) = (department_level = 0)
+    desc: Top level iff no parent.
+  - name: ck_organisation_department_level_increments
+    type: check
+    expr: parent_level IS NULL OR department_level = parent_level + 1
+    desc: Strictly increasing level => acyclic.
+  indexes:
+  - name: uq_organisation_department_organisation_id_department_name
+    columns:
+    - organisation_id
+    - department_name
+    desc: Unique live name per organisation.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_organisation_department_department_kind_id
+    columns:
+    - department_kind_id
+    desc: Leading index for FK fk_organisation_department_department_kind_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_department_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_department_department_kind_id
+    columns:
+    - department_kind_id
+    ref: department_kind
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_department_parent_chain
+    columns:
+    - organisation_id
+    - parent_organisation_department_id
+    - parent_level
+    ref: organisation_department
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Parent must be in the same organisation and exactly one level above (acyclic, tenant-safe).
+    ref_columns:
+    - organisation_id
+    - id
+    - department_level
+  - name: fk_organisation_department_location_same_org
+    columns:
+    - organisation_id
+    - organisation_location_id
+    ref: organisation_location
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: site must belong to the same organisation
+    ref_columns:
+    - organisation_id
+    - id
+- name: organisation_invitation
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B28
+  - B34
+  - B75
+  retention: 'TTL: rows deleted 180 days after expires_at; accepted invitations are evidenced by the mapping and audit_event.'
+  description: Invitation for a recruiter to join an organisation; acceptance creates a recruiter_organisation_mapping row (P1/P3).
+  ttl:
+    expire_after: 180 days
+    column: expires_at
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Inviting organisation.
+    sens: Internal
+  - name: invited_email
+    type: STRING(254)
+    domain: email
+    desc: Invitee email.
+    sens: Personal
+    pii: Access-controlled; deleted by TTL; masked in admin lists
+  - name: invitation_status_id
+    type: UUID
+    domain: enum_ref
+    desc: State.
+    sens: Internal
+  - name: mapping_scope_id
+    type: UUID
+    domain: enum_ref
+    desc: Scope of the mapping to create.
+    sens: Internal
+  - name: token_hash
+    type: STRING(100)
+    domain: secret_hash
+    desc: SHA-256 hex of the one-time invitation token.
+    sens: Sensitive
+    pii: Only the hash is stored; raw token sent once by email
+  - name: invited_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Inviter.
+    sens: Personal
+    pii: Identifies a person; audited
+  - name: invitee_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Invitee user once matched.
+    sens: Personal
+    'null': true
+    null_why: NULL = invitee has no account yet
+    pii: Identifies a person; audited
+  - name: recruiter_organisation_mapping_id
+    type: UUID
+    domain: identifier
+    desc: Mapping created on acceptance.
+    sens: Internal
+    'null': true
+    null_why: NULL = not accepted
+  - name: resend_count
+    type: INT2
+    domain: quantity
+    desc: Resends.
+    sens: Internal
+    default: '0'
+  - name: expires_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Expiry.
+    sens: Internal
+  - name: accepted_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Acceptance.
+    sens: Internal
+    'null': true
+    null_why: NULL = not accepted
+  - name: revoked_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Revocation.
+    sens: Internal
+    'null': true
+    null_why: NULL = not revoked
+  constraints:
+  - name: uq_organisation_invitation_token_hash
+    type: unique
+    columns:
+    - token_hash
+    desc: Token lookup.
+  - name: ck_organisation_invitation_invited_email_lower
+    type: check
+    expr: invited_email = lower(invited_email)
+    desc: Lowercase email.
+  - name: ck_organisation_invitation_single_outcome
+    type: check
+    expr: accepted_at IS NULL OR revoked_at IS NULL
+    desc: Accepted xor revoked.
+  - name: ck_organisation_invitation_resend_range
+    type: check
+    expr: resend_count BETWEEN 0 AND 10
+    desc: Resend cap.
+  indexes:
+  - name: uq_organisation_invitation_organisation_id_invited_email
+    columns:
+    - organisation_id
+    - invited_email
+    desc: One open invitation per email and organisation.
+    unique: true
+    where: accepted_at IS NULL AND revoked_at IS NULL
+  - name: idx_organisation_invitation_invited_email
+    columns:
+    - invited_email
+    desc: Inbox lookup at sign-up.
+    where: accepted_at IS NULL AND revoked_at IS NULL
+  - name: idx_organisation_invitation_invitation_status_id
+    columns:
+    - invitation_status_id
+    desc: Leading index for FK fk_organisation_invitation_invitation_status_id (join/cascade checks).
+  - name: idx_organisation_invitation_mapping_scope_id
+    columns:
+    - mapping_scope_id
+    desc: Leading index for FK fk_organisation_invitation_mapping_scope_id (join/cascade checks).
+  - name: idx_organisation_invitation_invited_by_app_user_id
+    columns:
+    - invited_by_app_user_id
+    desc: Leading index for FK fk_organisation_invitation_invited_by_app_user_id (join/cascade checks).
+  - name: idx_organisation_invitation_invitee_app_user_id
+    columns:
+    - invitee_app_user_id
+    desc: Leading index for FK fk_organisation_invitation_invitee_app_user_id (join/cascade checks).
+  - name: idx_organisation_invitation_recruiter_organisation_mapping_id
+    columns:
+    - recruiter_organisation_mapping_id
+    desc: Leading index for FK fk_organisation_invitation_recruiter_organisation_mapping_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_invitation_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: invitations meaningless without the organisation
+  - name: fk_organisation_invitation_invitation_status_id
+    columns:
+    - invitation_status_id
+    ref: invitation_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_invitation_mapping_scope_id
+    columns:
+    - mapping_scope_id
+    ref: mapping_scope
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+  - name: fk_organisation_invitation_invited_by_app_user_id
+    columns:
+    - invited_by_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: inviter retained as user soft-deleted
+  - name: fk_organisation_invitation_invitee_app_user_id
+    columns:
+    - invitee_app_user_id
+    ref: app_user
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: invitee erasure
+  - name: fk_organisation_invitation_recruiter_organisation_mapping_id
+    columns:
+    - recruiter_organisation_mapping_id
+    ref: recruiter_organisation_mapping
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: mapping purge
+- name: account_setting
+  kind: config
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Retained with the account; superseded values overwritten (changes in audit_event).
+  description: Per-account configuration values keyed by the account_setting_key registry (typed JSON value).
+  columns:
+  - name: account_id
+    type: UUID
+    domain: identifier
+    desc: Account.
+    sens: Internal
+  - name: account_setting_key_id
+    type: UUID
+    domain: enum_ref
+    desc: Setting.
+    sens: Internal
+  - name: setting_value
+    type: JSONB
+    domain: json
+    desc: Typed value.
+    sens: Internal
+  - name: effective_from
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Value applies from.
+    sens: Internal
+    default: now()
+  constraints: []
+  indexes:
+  - name: uq_account_setting_account_id_account_setting_key_id
+    columns:
+    - account_id
+    - account_setting_key_id
+    desc: One live value per key.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_account_setting_account_setting_key_id
+    columns:
+    - account_setting_key_id
+    desc: Leading index for FK fk_account_setting_account_setting_key_id (join/cascade checks).
+  fks:
+  - name: fk_account_setting_account_id
+    columns:
+    - account_id
+    ref: account
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with account
+  - name: fk_account_setting_account_setting_key_id
+    columns:
+    - account_setting_key_id
+    ref: account_setting_key
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup
+- name: organisation_brand
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Brands/employer brands under one organisation (a consultancy hiring under a client brand, a group with several brands).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Owning organisation.
+    sens: Internal
+  - name: brand_name
+    type: STRING(150)
+    domain: free_text
+    desc: Brand name.
+    sens: Public
+  - name: brand_name_normalised
+    type: STRING(150)
+    domain: free_text
+    desc: Lower-cased brand name.
+    sens: Public
+    computed: lower(brand_name)
+  - name: logo_object_ref
+    type: STRING(300)
+    domain: free_text
+    desc: Brand logo key.
+    sens: Public
+    'null': true
+    null_why: NULL = no logo
+  - name: website_url
+    type: STRING(500)
+    domain: url
+    desc: Brand site.
+    sens: Public
+    'null': true
+    null_why: NULL = none
+  - name: tagline
+    type: STRING(200)
+    domain: free_text
+    desc: Brand tagline.
+    sens: Public
+    'null': true
+    null_why: NULL = none
+  - name: is_default
+    type: BOOL
+    domain: boolean
+    desc: Default brand for new jobs.
+    sens: Internal
+    default: 'false'
+  constraints:
+  - name: uq_organisation_brand_organisation_id_id
+    type: unique
+    columns:
+    - organisation_id
+    - id
+    desc: Same-tenant target (career page).
+  indexes:
+  - name: uq_organisation_brand_organisation_id_brand_name_normalised
+    columns:
+    - organisation_id
+    - brand_name_normalised
+    desc: Unique live brand name.
+    unique: true
+    where: deleted_at IS NULL
+  - name: uq_organisation_brand_organisation_id_default
+    columns:
+    - organisation_id
+    desc: At most one default brand (P3).
+    unique: true
+    where: is_default AND deleted_at IS NULL
+  fks:
+  - name: fk_organisation_brand_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+- name: organisation_career_page
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Active rows kept while the organisation exists; soft-deleted rows purged 24 months after deleted_at; erasure requests anonymise Personal columns in place.
+  description: Branded careers microsite configuration (slug, custom domain, headline, theme, SEO).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: organisation_brand_id
+    type: UUID
+    domain: identifier
+    desc: Brand shown.
+    sens: Internal
+    'null': true
+    null_why: NULL = organisation's own brand
+  - name: page_slug
+    type: STRING(120)
+    domain: free_text
+    desc: Public path.
+    sens: Public
+  - name: custom_domain
+    type: STRING(253)
+    domain: free_text
+    desc: CNAME domain.
+    sens: Public
+    'null': true
+    null_why: NULL = platform domain only
+  - name: headline
+    type: STRING(200)
+    domain: free_text
+    desc: Page headline.
+    sens: Public
+    'null': true
+    null_why: NULL = default headline
+  - name: intro_text
+    type: STRING
+    domain: long_text
+    desc: Intro copy.
+    sens: Public
+    'null': true
+    null_why: NULL = none
+    unbounded_why: Marketing text of unpredictable length
+  - name: theme
+    type: JSONB
+    domain: json
+    desc: Colours/layout JSON.
+    sens: Public
+    'null': true
+    null_why: NULL = default theme
+  - name: language_id
+    type: UUID
+    domain: identifier
+    desc: Page language.
+    sens: Internal
+    'null': true
+    null_why: NULL = by visitor
+  - name: seo_title
+    type: STRING(70)
+    domain: free_text
+    desc: Meta title.
+    sens: Public
+    'null': true
+    null_why: NULL = derived
+  - name: seo_description
+    type: STRING(160)
+    domain: free_text
+    desc: Meta description.
+    sens: Public
+    'null': true
+    null_why: NULL = derived
+  - name: is_published
+    type: BOOL
+    domain: boolean
+    desc: Public.
+    sens: Internal
+    default: 'false'
+  - name: published_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Publication time.
+    sens: Internal
+    'null': true
+    null_why: NULL = not published
+  constraints:
+  - name: ck_organisation_career_page_published_pair
+    type: check
+    expr: is_published = (published_at IS NOT NULL)
+    desc: Flag matches timestamp.
+  - name: ck_organisation_career_page_page_slug_format
+    type: check
+    expr: page_slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'
+    desc: Kebab-case.
+  indexes:
+  - name: uq_organisation_career_page_page_slug
+    columns:
+    - page_slug
+    desc: Global unique careers path.
+    unique: true
+    where: deleted_at IS NULL
+  - name: uq_organisation_career_page_custom_domain
+    columns:
+    - custom_domain
+    desc: Custom domain routing.
+    unique: true
+    where: custom_domain IS NOT NULL AND deleted_at IS NULL
+  - name: idx_organisation_career_page_organisation_id
+    columns:
+    - organisation_id
+    desc: Leading index for FK fk_organisation_career_page_organisation_id (join/cascade checks).
+  - name: idx_organisation_career_page_language_id
+    columns:
+    - language_id
+    desc: Leading index for FK fk_organisation_career_page_language_id (join/cascade checks).
+  fks:
+  - name: fk_organisation_career_page_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: kept with organisation
+  - name: fk_organisation_career_page_language_id
+    columns:
+    - language_id
+    ref: language
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+  - name: fk_organisation_career_page_brand_same_org
+    columns:
+    - organisation_id
+    - organisation_brand_id
+    ref: organisation_brand
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: brand must belong to the same organisation
+    ref_columns:
+    - organisation_id
+    - id
+- name: organisation_industry
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: Removed when the link is edited or the organisation purged.
+  description: Secondary industries of an organisation (primary stays on organisation.primary_industry_id).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation.
+    sens: Internal
+  - name: industry_id
+    type: UUID
+    domain: identifier
+    desc: Additional industry.
+    sens: Internal
+  constraints:
+  - name: uq_organisation_industry_organisation_id_industry_id
+    type: unique
+    columns:
+    - organisation_id
+    - industry_id
+    desc: Once per industry.
+  indexes:
+  - name: idx_organisation_industry_industry_id
+    columns:
+    - industry_id
+    - organisation_id
+    desc: Organisations by industry.
+  fks:
+  - name: fk_organisation_industry_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: link only
+  - name: fk_organisation_industry_industry_id
+    columns:
+    - industry_id
+    ref: industry
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: master data
+views:
+- name: vw_recruiter_job_requirement
+  kind: view
+  tables:
+  - job_requirement
+  - recruiter_organisation_mapping
+  - organisation
+  - organisation_hierarchy_closure
+  purpose: 'The ONLY path recruiters use to see/act on job requirements: requirements of organisations the viewing recruiter is mapped to (directly or via descendants). One row per (viewer recruiter, requirement)
+    pair, so the viewer filter is MANDATORY; the single definition of this view in the model.'
+  security: 'Application recruiter role has EXECUTE on fn_recruiter_job_requirement(p_viewer_app_user_id UUID) and SELECT on this view only (no grant on job_requirement). The viewer id is a function/query
+    ARGUMENT injected by the data-access layer from the authenticated session, never from client input and never a custom session variable (custom variables are unverified, crdb_capabilities row 10). An
+    unfiltered SELECT on the view is a fan-out over all recruiter mappings: pool roles run with statement_timeout, and the CI lint rejects SQL that references the view without the viewer predicate (test
+    AT-01/AT-25). Effective dating of mappings is applied inside the view.'
+  sql_sketch: |-
+    CREATE VIEW vw_recruiter_job_requirement AS
+    SELECT m.recruiter_app_user_id AS viewer_app_user_id, jr.*, m.id AS recruiter_organisation_mapping_id
+    FROM job_requirement jr
+    JOIN organisation_hierarchy_closure c ON c.descendant_organisation_id = jr.organisation_id
+    JOIN recruiter_organisation_mapping m ON m.organisation_id = c.ancestor_organisation_id
+         AND m.effective_from <= now() AND (m.effective_to IS NULL OR m.effective_to > now())
+         AND (c.depth = 0 OR m.mapping_scope_id = (SELECT id FROM mapping_scope WHERE code = 'with_descendants'))
+    JOIN organisation o ON o.id = m.organisation_id AND o.deleted_at IS NULL
+         AND o.organisation_status_id = (SELECT id FROM organisation_status WHERE code = 'active')
+    WHERE jr.deleted_at IS NULL;
+    -- preferred access path (viewer id is an argument; no session variable):
+    CREATE FUNCTION fn_recruiter_job_requirement(p_viewer_app_user_id UUID) RETURNS SETOF vw_recruiter_job_requirement
+    LANGUAGE SQL STABLE AS $$ SELECT * FROM vw_recruiter_job_requirement WHERE viewer_app_user_id = p_viewer_app_user_id $$;
+    -- fallback if SETOF-view-type functions are not available on the pinned image: prepared statement
+    --   SELECT ... FROM vw_recruiter_job_requirement WHERE viewer_app_user_id = $1 AND ...;
+- name: vw_organisation_public
+  kind: view
+  tables:
+  - organisation
+  - organisation_location
+  purpose: 'Public company page projection: live, active, public-visible organisations; no identifiers, notes or internal ids.'
+  security: Granted to guest/candidate roles; excludes Sensitive/Internal columns.
+  sql_sketch: SELECT o.id, o.slug, o.display_name, o.tagline, o.website_url, o.description, o.organisation_size_band_id, o.primary_industry_id, o.founded_year, o.verification_status_id, o.logo_object_ref
+    FROM organisation o WHERE o.deleted_at IS NULL AND o.visibility_level_id = (SELECT id FROM visibility_level WHERE code='public')
+- name: vw_organisation_review_public
+  kind: view
+  tables:
+  - organisation_review
+  - organisation_review_response
+  purpose: Published reviews with employer replies; reviewer id never exposed.
+  security: Granted to authenticated candidates; excludes reviewer_app_user_id and moderation internals.
+  sql_sketch: SELECT r.id, r.organisation_id, r.rating_overall, r.title, r.pros, r.cons, r.published_at, resp.body AS response_body FROM organisation_review r LEFT JOIN organisation_review_response resp
+    ON resp.organisation_review_id = r.id AND resp.is_published AND resp.deleted_at IS NULL WHERE r.is_published AND r.deleted_at IS NULL
+- name: vw_account_active_admin
+  kind: view
+  tables:
+  - account_admin
+  - account
+  purpose: Current administrators of each account for authorisation checks.
+  security: Internal; used by the access layer.
+  sql_sketch: SELECT a.account_id, a.admin_app_user_id, a.account_admin_level_id FROM account_admin a WHERE a.effective_to IS NULL
+business_rules:
+- id: BR-ORG-01
+  rule: A recruiter has at most one open mapping per organisation.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: Unique index uq_recruiter_organisation_mapping_recruiter_app_user_id_organisation_id_open ON (recruiter_app_user_id, organisation_id) WHERE effective_to IS NULL (P3).
+  tables:
+  - recruiter_organisation_mapping
+  milestone: B34
+- id: BR-ORG-02
+  rule: Recruiter-organisation mapping periods never overlap and the chain per pair has one head.
+  mechanism_type: CHAIN_FK
+  mechanism: 'P1: sequence_no, prior_recruiter_organisation_mapping_id UNIQUE, composite FK (prior id, recruiter, organisation, prior_ended_at) -> (id, recruiter, organisation, effective_to) ON UPDATE RESTRICT,
+    CHECK effective_from >= prior_ended_at, partial unique head WHERE prior id IS NULL.'
+  tables:
+  - recruiter_organisation_mapping
+  milestone: B34
+- id: BR-ORG-03
+  rule: A recruiter may see and act only on job requirements of organisations they are currently mapped to.
+  mechanism_type: VIEW
+  mechanism: Recruiter role granted SELECT on vw_recruiter_job_requirement only; view joins in-force mapping (effective_from <= now() < effective_to/NULL), active organisation, closure for with_descendants
+    scope; writes go through functions/queries that re-check the same predicate (app layer).
+  tables:
+  - recruiter_organisation_mapping
+  - organisation
+  - job_requirement
+  - organisation_hierarchy_closure
+  milestone: B34
+- id: BR-ORG-04
+  rule: Changing a mapping (close + reopen) is atomic.
+  mechanism_type: TXN_LOCK
+  mechanism: 'SERIALIZABLE txn: SELECT ... FROM organisation WHERE id=$1 FOR UPDATE; UPDATE old row effective_to/end_reason; INSERT successor with sequence_no+1; P4 serialises concurrent admin edits, P1/P3
+    backstop.'
+  tables:
+  - recruiter_organisation_mapping
+  - organisation
+  milestone: B34
+- id: BR-ORG-05
+  rule: Mapping may be created only from an accepted invitation or by an account admin; invitations expire.
+  mechanism_type: APP_LAYER
+  mechanism: Accept endpoint verifies token hash, status and expires_at, then runs BR-ORG-04 txn and stores recruiter_organisation_mapping_id on the invitation; TTL purges expired rows.
+  tables:
+  - organisation_invitation
+  - recruiter_organisation_mapping
+  milestone: B34
+- id: BR-ORG-06
+  rule: An activated, non-closed account always has at least one active administrator.
+  mechanism_type: CHECK
+  mechanism: account.active_admin_count maintained in the same txn as account_admin insert/close under SELECT account FOR UPDATE; CHECK ck_account_operational_needs_admin (activated_at IS NULL OR closed_at
+    IS NOT NULL OR active_admin_count >= 1); nightly job recounts open account_admin rows.
+  tables:
+  - account
+  - account_admin
+  milestone: B34
+- id: BR-ORG-07
+  rule: A user has at most one open admin grant per account and one primary contact.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: Partial uniques on account_admin (account_id, admin_app_user_id) WHERE effective_to IS NULL and (account_id) WHERE is_primary_contact AND effective_to IS NULL.
+  tables:
+  - account_admin
+  milestone: B34
+- id: BR-ORG-08
+  rule: An organisation belongs to at most one account at a time and one billing owner per account.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: Partial unique account_organisation(organisation_id) WHERE effective_to IS NULL; (account_id) WHERE is_billing_owner AND effective_to IS NULL; close+insert in one txn (P4 on the organisation
+    row).
+  tables:
+  - account_organisation
+  milestone: B34
+- id: BR-ORG-09
+  rule: The organisation tree is acyclic, one parent per organisation, max 8 levels.
+  mechanism_type: CHAIN_FK
+  mechanism: 'organisation_hierarchy: UNIQUE(child), self composite FK (parent, parent_level) -> (child, hierarchy_level), CHECK hierarchy_level = parent_level + 1 and 0..7, CHECK parent <> child.'
+  tables:
+  - organisation_hierarchy
+  milestone: B28
+- id: BR-ORG-10
+  rule: Closure table matches the tree.
+  mechanism_type: JOB
+  mechanism: Closure rows written in the same txn as the edge; nightly job rebuilds from organisation_hierarchy and alerts on diff; CHECK depth 0..7 and self rows only at depth 0.
+  tables:
+  - organisation_hierarchy_closure
+  - organisation_hierarchy
+  milestone: B28
+- id: BR-ORG-11
+  rule: At most one live headquarters per organisation.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq_organisation_location_organisation_id ON (organisation_id) WHERE is_headquarters AND deleted_at IS NULL.
+  tables:
+  - organisation_location
+  milestone: B25
+- id: BR-ORG-12
+  rule: Organisation slug is unique among live organisations and URL-safe.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq_organisation_slug WHERE deleted_at IS NULL + CHECK slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'.
+  tables:
+  - organisation
+  milestone: B31
+- id: BR-ORG-13
+  rule: A tax/registration number identifies one live organisation per country and type.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq on (country_id, tax_id_type_id, value_lookup_hash) WHERE deleted_at IS NULL; hash is HMAC-SHA256 of the normalised value; CHECK octet_length = 32.
+  tables:
+  - organisation_identifier
+  milestone: B75
+- id: BR-ORG-14
+  rule: Tax/registration numbers are never stored or logged in clear text.
+  mechanism_type: APP_LAYER
+  mechanism: AES-GCM envelope encryption in app layer (value_encrypted, key_version), masked_value for display, HMAC blind index for lookup; decrypt privilege limited to verification service and compliance
+    role; each decrypt writes audit_event.
+  tables:
+  - organisation_identifier
+  milestone: B75
+- id: BR-ORG-15
+  rule: Verification requests are idempotent and recorded per attempt.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE(idempotency_key) and UNIQUE(organisation_id, verification_kind_id, attempt_no); vendor callbacks correlate via unique (vendor_code, vendor_reference).
+  tables:
+  - organisation_verification
+  milestone: B31
+- id: BR-ORG-16
+  rule: A verified domain belongs to one live organisation.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq on organisation_domain(domain_name) WHERE verified_at IS NOT NULL AND deleted_at IS NULL; CHECK lowercase hostname.
+  tables:
+  - organisation_domain
+  milestone: B31
+- id: BR-ORG-17
+  rule: A user may keep one live review per company and relationship; ratings are 1-5.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq (organisation_id, reviewer_app_user_id, reviewer_relation_id) WHERE reviewer_app_user_id IS NOT NULL AND deleted_at IS NULL; CHECKs on rating columns.
+  tables:
+  - organisation_review
+  milestone: B31
+- id: BR-ORG-18
+  rule: Only moderated (approved) reviews and replies are public; the reply belongs to the same company as the review.
+  mechanism_type: VIEW
+  mechanism: vw_organisation_review_public filters is_published; CHECK is_published = (published_at IS NOT NULL); composite FK (organisation_id, organisation_review_id) -> review (organisation_id, id);
+    unique response per review.
+  tables:
+  - organisation_review
+  - organisation_review_response
+  milestone: B31
+- id: BR-ORG-19
+  rule: Moderation decisions are append-only.
+  mechanism_type: PRIVILEGE
+  mechanism: 'organisation_review_moderation, organisation_status_history, account_status_history, organisation_hierarchy_change: INSERT/SELECT grants only (P5).'
+  tables:
+  - organisation_review_moderation
+  - organisation_status_history
+  - account_status_history
+  - organisation_hierarchy_change
+  milestone: B34
+- id: BR-ORG-20
+  rule: An agency has at most one open contract per client and cannot be its own client.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq (agency_organisation_id, client_organisation_id) WHERE effective_to IS NULL AND deleted_at IS NULL; CHECK agency <> client; percentages 0..100.
+  tables:
+  - client_relationship
+  milestone: B34
+- id: BR-ORG-21
+  rule: An organisation can be absorbed by at most one executed merge and never into itself.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq (merged_organisation_id) WHERE executed_at IS NOT NULL AND rolled_back_at IS NULL; CHECK survivor <> merged; CHECK executed requires approved_at.
+  tables:
+  - organisation_merge
+  milestone: B28
+- id: BR-ORG-22
+  rule: Department tree is acyclic and tenant-safe.
+  mechanism_type: CHAIN_FK
+  mechanism: Composite FK (organisation_id, parent id, parent_level) -> (organisation_id, id, department_level) and CHECK department_level = parent_level + 1.
+  tables:
+  - organisation_department
+  milestone: B28
+- id: BR-ORG-23
+  rule: Organisation status changes are logged in the same transaction.
+  mechanism_type: APP_LAYER
+  mechanism: Status update + INSERT organisation_status_history in one txn (append-only table gives tamper evidence); sensitive actions also emit audit_event.
+  tables:
+  - organisation
+  - organisation_status_history
+  milestone: B34
+- id: BR-ORG-24
+  rule: Only one open invitation per email and organisation; tokens stored hashed.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq (organisation_id, invited_email) WHERE accepted_at IS NULL AND revoked_at IS NULL; UNIQUE(token_hash); TTL on expires_at.
+  tables:
+  - organisation_invitation
+  milestone: B34
+- id: BR-ORG-25
+  rule: Contacts have at least one channel and E.164 phones.
+  mechanism_type: CHECK
+  mechanism: CHECK reachable (email OR phone), phone ~ E.164 regex, phone/phone_country_id both-or-none.
+  tables:
+  - organisation_contact
+  milestone: B31

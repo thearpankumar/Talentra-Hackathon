@@ -1,0 +1,6412 @@
+module: subscriptions_payments
+notes: |
+  ## subscriptions_payments - design notes (milestones B38, B41, B44, B47, B76)
+  **Scope.** 39 tables + 35 lookups: catalogue (subscription_plan, plan_version, plan_price, plan_entitlement, credit_rate_card, credit_pack, credit_pack_price),
+  contract (subscription, subscription_period, subscription_status_history, subscription_cancellation, subscription_renewal_attempt, subscription_entitlement),
+  money (wallet, wallet_ledger_entry, wallet_expiry_bucket, wallet_bucket_consumption, spend_limit, coupon, coupon_redemption),
+  payments (payment_order, payment_attempt, payment_event, payment_event_outcome, payment_method_token, refund, reconciliation_run/item),
+  billing (invoice, invoice_line, invoice_tax_line, invoice_number_series, tax_rate, tax_registration, billing_address, credit_note, currency_exchange_rate),
+  usage/payout (profile_download, consultant_payout). Modelled on Stripe (price/subscription/invoice/credit note), Razorpay (order -> payment -> refund, signed webhooks),
+  Chargebee/Recurly (plan versions, dunning), LinkedIn Recruiter / Naukri RESDEX (credit-based downloads, plan quotas). Competitor sites were not re-fetched for this
+  pass; the CockroachDB behaviours below were checked against the CRDB docs (foreign-key, SELECT FOR UPDATE pages).
+
+  **Wallet unit = CREDITS (INT8), not money.** Recruiter products (download, outreach message, posting) are priced in credits that vary by plan (credit_rate_card)
+  and expire in lots; money appears only at purchase (payment_order/invoice, DECIMAL(18,4) + currency_id per D-06). A wallet is per owner AND currency because a pack
+  bought in INR is refunded in INR; credit balances are never converted. Integer credits make balance CHECKs and hash chains exact (no rounding).
+
+  **Ledger choice.** wallet_ledger_entry is a single-entry, signed, per-wallet ledger (the model LinkedIn/Naukri-style credit systems use) with running balance_after,
+  hash chain (prev_hash,row_hash), gapless sequence and reversals. Full double-entry accounting (Modern Treasury / Square style: debit and credit accounts per posting)
+  is deliberately OUT of the OLTP model: finance gets a nightly accounting export from invoice/payment_order/refund/wallet_ledger_entry (deferred revenue = credits
+  purchased minus consumed, breakage = expiry entries). Extension point: a `ledger_account` + `journal_line` pair can be added without touching this ledger.
+  Cross-ledger invariants are checked by vw_wallet_balance_drift (wallet.credit_balance = SUM(credits_delta)).
+
+  **Append-only enforcement (P5).** App roles get INSERT+SELECT only on wallet_ledger_entry, wallet_bucket_consumption, payment_event, payment_event_outcome, profile_download,
+  coupon_redemption, subscription_status_history, currency_exchange_rate (no UPDATE/DELETE grants; a separate migration role owns DDL). Tamper evidence: row_hash chain per wallet
+  verified by a nightly job; a changefeed ships ledger rows to an immutable object-store sink. Corrections: new `reversal` row with reverses_wallet_ledger_entry_id (UNIQUE, so once).
+  Refunds of credits use type `refund` + refund_id (partial amounts); a reversal uses reverses_wallet_ledger_entry_id only - hence exactly-one-of reference columns.
+  Reference design: wallet_ledger_entry has explicit nullable FKs (payment_order, refund, outreach_batch, job_requirement, coupon_redemption, wallet_expiry_bucket,
+  self-reverses) with CHECK num_nonnulls(...) = CASE WHEN has_fk_reference THEN 1 ELSE 0. Download deductions point the other way (profile_download.wallet_ledger_entry_id,
+  UNIQUE) because CRDB has no deferrable FKs and a two-way pointer would be unwritable; the download row is created in the same txn right after the ledger row.
+
+  **Idempotency.** Every money-moving write has a unique caller key: ledger.idempotency_key, payment_order.idempotency_key, refund.idempotency_key,
+  profile_download.idempotency_key, webhook UNIQUE(payment_gateway_id, gateway_event_ref). Replays hit the unique index and the app returns the original row.
+  Retries on SQLSTATE 40001 re-run the whole txn; idempotency keys make that safe.
+
+  **Locking caveat (verified in CRDB docs).** Under SERIALIZABLE, SELECT ... FOR UPDATE is best-effort (unreplicated locks may be lost on lease transfer/range split; the txn
+  then retries with 40001) - so correctness never depends on the lock alone: it comes from SERIALIZABLE + CHECK(credit_balance >= 0) + UNIQUE(wallet_id, sequence_no).
+  Optionally set `enable_durable_locking_for_serializable = true` for the billing role to make locks durable. The wallet row is a hot row by design (one writer per wallet).
+
+  **Wallet debit algorithm (BR-SUB-08).** BEGIN; 1) SELECT existing ledger by idempotency_key -> return if found. 2) SELECT * FROM wallet WHERE id=$w FOR UPDATE; require status active.
+  3) Resolve free quota: SELECT subscription_entitlement ... FOR UPDATE; if used_count < limit -> free path (UPDATE used_count+1, insert profile_download with subscription_entitlement_id, no ledger).
+  4) Else cost = credit_rate_card lookup; check spend_limit (SUM credits_delta of actor in window); require credit_balance >= cost.
+  5) seq = ledger_sequence+1; prev_hash = row_hash of seq-1; insert ledger (delta=-cost, balance_after, hashes, idempotency_key).
+  6) FIFO: SELECT lots WHERE credits_remaining>0 ORDER BY expires_at FOR UPDATE; decrement lots, insert wallet_bucket_consumption.
+  7) INSERT profile_download(wallet_ledger_entry_id, credits_charged). 8) UPDATE wallet SET credit_balance=credit_balance-cost, ledger_sequence=seq, last_entry_at=now().
+  COMMIT; on 40001 retry (backoff, max 5). A duplicate key on idempotency_key = replay, return the first result.
+
+  **subscription_period chain proof (P1 CHAIN_FK, BR-SUB-03).** Half-open periods [start,end). Constraints: UNIQUE(prior_period_id); partial UNIQUE(licence_id) WHERE prior_period_id IS NULL;
+  UNIQUE(licence_id, sequence_no); CHECK (sequence_no=1) = (prior_period_id IS NULL); composite FK (prior_period_id, licence_id, prior_period_end_date) ->
+  (id, licence_id, period_end_date) ON UPDATE RESTRICT (target UNIQUE(id, licence_id, period_end_date); we also declare the brief's UNIQUE(id, period_end_date)); CHECK period_start_date >= prior_period_end_date and start <= end.
+  Proof: each licence has exactly one root; each period has <= 1 successor (unique prior) and a predecessor inside the SAME licence (licence_id is part of the FK); the FK copy of the
+  predecessor's end is frozen by ON UPDATE RESTRICT, so start(n+1) >= end(n) holds forever; by induction start(n+k) >= end(n), so any two periods of a licence are ordered and disjoint.
+  Cycles are impossible because sequence is unique per licence, sequence 1 is the only root and prior_period_id is never UPDATEd (column-level UPDATE grant excludes it).
+  Gaps (lapse between periods) are allowed; overlap is not. Early cancellation: only the TAIL period (no successor) may be shortened (UPDATE period_end_date to an earlier date, set
+  original_period_end_date/shortened_at, status cancelled); a non-tail end cannot change (FK RESTRICT). If a scheduled future period exists it is first hard-deleted (allowed only for scheduled, uninvoiced rows - invoice_line FK
+  RESTRICT protects billed ones) and then the new tail is shortened. Renewal creates the next period in the same txn as the renewal payment_order and the status history row.
+  Edge cases: (a) zero-length period (start=end) is an empty interval and cannot overlap; (b) renewal on the same day as end (start = prior end) is fine; (c) lengthening a tail is overlap-safe;
+  (d) CRDB MATCH SIMPLE: first period has NULL prior columns so the FK is skipped (verified in docs); (e) licence moved between subscriptions - the chain follows the licence, composite FK (subscription_id, licence_id) keeps them consistent;
+  (f) concurrent renewals race on UNIQUE(prior_period_id)/UNIQUE(licence_id, sequence_no): the loser gets 23505 and re-reads; (g) backdated corrections use cancel-and-reissue, never UPDATE of start.
+  Validation SQL (expect 0 rows): see vw_subscription_period_overlap (self-join on a.start < b.end AND b.start < a.end for the same licence, excluding empty intervals).
+
+  **Invoice numbering (BR-SUB-12).** Gapless per (seller_country, kind, prefix, fiscal year) series. Drafts have NULL number (never reserved). Issue txn: SELECT next_number FROM invoice_number_series
+  WHERE id=$s FOR UPDATE; UPDATE next_number+1; set invoice_number/label/issued_at/issue_date in the same txn; rollback releases the number, so no gaps. Voiding keeps the number and a credit note
+  corrects it. Trade-off: the series row is a serialisation point (~hundreds/s is ample for B2B invoices); shard by series per fiscal year/entity if needed. Not a CRDB SEQUENCE (they skip on rollback).
+  Credit notes use their own series (series_document_kind).
+
+  **Integration boundary (docket sec. 6).** No PAN/CVV/bank account/UPI VPA is stored. payment_method_token keeps gateway tokens (Sensitive: encrypted) + display last4/expiry (Personal);
+  payment_event.payload is allow-list sanitised, encrypted, TTL 540 days. Gateway down: order stays `created/pending` (expires_at), checkout retried with the same idempotency_key; webhooks are
+  reconciled by reconciliation_run/item (gateway settlement vs paid orders) and periodic order-status polling.
+
+  **PII/Sensitive (B76).** Sensitive: payment_method_token.token_ref, tax_registration.tax_number_encrypted/_hmac, consultant_payout.payout_ref, payment_event.payload.
+  Personal: billing_address fields, invoice.address_snapshot, last4, cancellation feedback. All other columns Internal; credits/amounts are business data, not personal.
+
+  **Deviations/extension points.** (1) Hard delete on subscription_period only for scheduled uninvoiced rows. (2) FKs to registry tables are ON DELETE RESTRICT (financial history).
+  (3) Gig escrow/payouts reuse wallet/payment_order (D-15); gig-specific settlement tables belong to gig_marketplace. (4) Taxes: GST CGST/SGST vs IGST chosen by place of supply vs seller state; e-invoicing IRN fields can be added to invoice.
+  (5) Consultant payouts store references only - the transfer runs at the payout provider.
+
+  ## TTL versus foreign keys (decision F-01)
+  CockroachDB row-level TTL deletes fail while a RESTRICT/NO ACTION child references the expiring row, so every foreign key that points at a TTL table now states
+  what happens when the parent expires:
+  * `profile_download.device_session_id` -> `device_session`: ON DELETE SET NULL (column now nullable)
+  * `payment_event_outcome.payment_event_id` -> `payment_event`: ON DELETE SET NULL (column now nullable)
+  * Foreign-key actions are executed by the engine, not by an application role, so the INSERT/SELECT-only grants of append-only children stay intact; the nulled column is
+    excluded from any row_hash/prev_hash computation (hash only immutable business columns).
+  * Rule applied everywhere: evidence rows outlive the row they point at (SET NULL); high-volume samples that are only meaningful with the parent follow it (CASCADE).
+    A TTL table must never be the target of a RESTRICT/NO ACTION foreign key (checked by rule check A09 in 08_rule_compliance).
+lookups:
+- name: payment_gateway
+  description: 'External payment gateways/rails we integrate with (boundary: only references are stored).'
+  values:
+  - code: razorpay
+    en: Razorpay
+    hi: रेज़रपे
+    sort: 10
+  - code: stripe
+    en: Stripe
+    hi: स्ट्राइप
+    sort: 20
+  - code: payu
+    en: PayU
+    hi: पेयू
+    sort: 30
+  - code: cashfree
+    en: Cashfree
+    hi: कैशफ्री
+    sort: 40
+  - code: bank_transfer
+    en: Manual bank transfer
+    hi: बैंक ट्रांसफर
+    sort: 50
+- name: payment_order_status
+  description: Lifecycle of a payment order.
+  values:
+  - code: created
+    en: Created
+    hi: बनाया गया
+    sort: 10
+  - code: pending
+    en: Pending
+    hi: लंबित
+    sort: 20
+  - code: authorised
+    en: Authorised
+    hi: अधिकृत
+    sort: 30
+  - code: paid
+    en: Paid
+    hi: भुगतान हुआ
+    sort: 40
+  - code: failed
+    en: Failed
+    hi: विफल
+    sort: 50
+  - code: cancelled
+    en: Cancelled
+    hi: रद्द
+    sort: 60
+  - code: expired
+    en: Expired
+    hi: समाप्त
+    sort: 70
+  - code: partially_refunded
+    en: Partially refunded
+    hi: आंशिक वापसी
+    sort: 80
+  - code: refunded
+    en: Refunded
+    hi: वापस किया गया
+    sort: 90
+- name: payment_attempt_status
+  description: Outcome of one attempt to pay an order.
+  values:
+  - code: initiated
+    en: Initiated
+    hi: शुरू
+    sort: 10
+  - code: authenticating
+    en: Authenticating
+    hi: प्रमाणीकरण जारी
+    sort: 20
+  - code: succeeded
+    en: Succeeded
+    hi: सफल
+    sort: 30
+  - code: failed
+    en: Failed
+    hi: विफल
+    sort: 40
+  - code: abandoned
+    en: Abandoned
+    hi: छोड़ा गया
+    sort: 50
+- name: payment_purpose
+  description: Why money is being collected.
+  values:
+  - code: subscription_fee
+    en: Subscription fee
+    hi: सदस्यता शुल्क
+    sort: 10
+  - code: wallet_recharge
+    en: Wallet recharge
+    hi: वॉलेट रिचार्ज
+    sort: 20
+  - code: invoice_settlement
+    en: Invoice settlement
+    hi: बिल निपटान
+    sort: 30
+  - code: add_on
+    en: Add-on purchase
+    hi: ऐड-ऑन खरीद
+    sort: 40
+- name: payment_method_kind
+  description: Payment instrument family (never instrument details).
+  values:
+  - code: card
+    en: Card
+    hi: कार्ड
+    sort: 10
+  - code: upi
+    en: UPI
+    hi: यूपीआई
+    sort: 20
+  - code: netbanking
+    en: Net banking
+    hi: नेट बैंकिंग
+    sort: 30
+  - code: external_wallet
+    en: External wallet
+    hi: बाहरी वॉलेट
+    sort: 40
+  - code: bank_transfer
+    en: Bank transfer
+    hi: बैंक ट्रांसफर
+    sort: 50
+  - code: emi
+    en: EMI
+    hi: ईएमआई
+    sort: 60
+- name: refund_status
+  description: Refund workflow state.
+  values:
+  - code: requested
+    en: Requested
+    hi: अनुरोधित
+    sort: 10
+  - code: approved
+    en: Approved
+    hi: स्वीकृत
+    sort: 20
+  - code: processing
+    en: Processing
+    hi: प्रक्रियाधीन
+    sort: 30
+  - code: completed
+    en: Completed
+    hi: पूर्ण
+    sort: 40
+  - code: rejected
+    en: Rejected
+    hi: अस्वीकृत
+    sort: 50
+  - code: failed
+    en: Failed
+    hi: विफल
+    sort: 60
+- name: refund_reason
+  description: Reason a refund was issued.
+  values:
+  - code: duplicate_payment
+    en: Duplicate payment
+    hi: दोहरा भुगतान
+    sort: 10
+  - code: service_not_delivered
+    en: Service not delivered
+    hi: सेवा नहीं मिली
+    sort: 20
+  - code: customer_request
+    en: Customer request
+    hi: ग्राहक अनुरोध
+    sort: 30
+  - code: plan_downgrade
+    en: Plan downgrade
+    hi: प्लान डाउनग्रेड
+    sort: 40
+  - code: gateway_error
+    en: Gateway error
+    hi: गेटवे त्रुटि
+    sort: 50
+  - code: chargeback
+    en: Chargeback
+    hi: चार्जबैक
+    sort: 60
+  - code: goodwill
+    en: Goodwill
+    hi: सद्भावना
+    sort: 70
+- name: subscription_status
+  description: Subscription lifecycle state.
+  values:
+  - code: trialing
+    en: Trialing
+    hi: परीक्षण
+    sort: 10
+  - code: active
+    en: Active
+    hi: सक्रिय
+    sort: 20
+  - code: past_due
+    en: Past due
+    hi: देय बकाया
+    sort: 30
+  - code: suspended
+    en: Suspended
+    hi: निलंबित
+    sort: 40
+  - code: cancelled
+    en: Cancelled
+    hi: रद्द
+    sort: 50
+  - code: expired
+    en: Expired
+    hi: समाप्त
+    sort: 60
+- name: renewal_mode
+  description: How a subscription renews.
+  values:
+  - code: auto_renew
+    en: Auto renew
+    hi: स्वतः नवीनीकरण
+    sort: 10
+  - code: manual_renew
+    en: Manual renew
+    hi: मैन्युअल नवीनीकरण
+    sort: 20
+  - code: fixed_term
+    en: Fixed term (no renewal)
+    hi: निश्चित अवधि
+    sort: 30
+- name: billing_interval
+  description: Billing cadence of a price point.
+  values:
+  - code: monthly
+    en: Monthly
+    hi: मासिक
+    sort: 10
+  - code: quarterly
+    en: Quarterly
+    hi: त्रैमासिक
+    sort: 20
+  - code: half_yearly
+    en: Half-yearly
+    hi: छमाही
+    sort: 30
+  - code: annual
+    en: Annual
+    hi: वार्षिक
+    sort: 40
+  - code: one_time
+    en: One time
+    hi: एकमुश्त
+    sort: 50
+- name: plan_audience
+  description: Customer segment a plan targets.
+  values:
+  - code: employer
+    en: Employer / recruiter
+    hi: नियोक्ता
+    sort: 10
+  - code: staffing_agency
+    en: Staffing agency
+    hi: स्टाफिंग एजेंसी
+    sort: 20
+  - code: gig_requester
+    en: Gig requester
+    hi: गिग अनुरोधकर्ता
+    sort: 30
+  - code: consultant
+    en: Consultant
+    hi: सलाहकार
+    sort: 40
+- name: cancellation_reason
+  description: Customer-stated cancellation reason.
+  values:
+  - code: too_expensive
+    en: Too expensive
+    hi: बहुत महंगा
+    sort: 10
+  - code: not_enough_candidates
+    en: Not enough candidates
+    hi: पर्याप्त उम्मीदवार नहीं
+    sort: 20
+  - code: switched_competitor
+    en: Switched to competitor
+    hi: प्रतिस्पर्धी पर गए
+    sort: 30
+  - code: hiring_complete
+    en: Hiring complete
+    hi: भर्ती पूर्ण
+    sort: 40
+  - code: poor_support
+    en: Poor support
+    hi: खराब सहायता
+    sort: 50
+  - code: company_closure
+    en: Company closure
+    hi: कंपनी बंद
+    sort: 60
+  - code: non_payment
+    en: Non-payment (system)
+    hi: भुगतान न होना
+    sort: 70
+  - code: other
+    en: Other
+    hi: अन्य
+    sort: 80
+- name: cancellation_mode
+  description: When a cancellation takes effect.
+  values:
+  - code: immediate
+    en: Immediate
+    hi: तुरंत
+    sort: 10
+  - code: period_end
+    en: At period end
+    hi: अवधि के अंत में
+    sort: 20
+- name: subscription_period_status
+  description: State of one billing/entitlement period.
+  values:
+  - code: scheduled
+    en: Scheduled
+    hi: निर्धारित
+    sort: 10
+  - code: active
+    en: Active
+    hi: सक्रिय
+    sort: 20
+  - code: completed
+    en: Completed
+    hi: पूर्ण
+    sort: 30
+  - code: cancelled
+    en: Cancelled
+    hi: रद्द
+    sort: 40
+- name: wallet_status
+  description: Wallet state.
+  values:
+  - code: active
+    en: Active
+    hi: सक्रिय
+    sort: 10
+  - code: frozen
+    en: Frozen
+    hi: फ्रीज़
+    sort: 20
+  - code: closed
+    en: Closed
+    hi: बंद
+    sort: 30
+- name: ledger_entry_type
+  description: Type of wallet ledger movement.
+  values:
+  - code: recharge
+    en: Recharge
+    hi: रिचार्ज
+    sort: 10
+  - code: consumption_download
+    en: Profile download
+    hi: प्रोफ़ाइल डाउनलोड
+    sort: 20
+  - code: consumption_outreach
+    en: Outreach
+    hi: आउटरीच
+    sort: 30
+  - code: consumption_posting
+    en: Job posting
+    hi: नौकरी पोस्टिंग
+    sort: 40
+  - code: refund
+    en: Refund
+    hi: वापसी
+    sort: 50
+  - code: adjustment
+    en: Manual adjustment
+    hi: समायोजन
+    sort: 60
+  - code: expiry
+    en: Expiry
+    hi: समाप्ति
+    sort: 70
+  - code: reversal
+    en: Reversal
+    hi: प्रतिवर्तन
+    sort: 80
+  - code: promo_grant
+    en: Promotional grant
+    hi: प्रचार क्रेडिट
+    sort: 90
+- name: invoice_status
+  description: Invoice lifecycle.
+  values:
+  - code: draft
+    en: Draft
+    hi: मसौदा
+    sort: 10
+  - code: issued
+    en: Issued
+    hi: जारी
+    sort: 20
+  - code: partially_paid
+    en: Partially paid
+    hi: आंशिक भुगतान
+    sort: 30
+  - code: paid
+    en: Paid
+    hi: भुगतान हुआ
+    sort: 40
+  - code: void
+    en: Void
+    hi: रद्द
+    sort: 50
+  - code: uncollectible
+    en: Uncollectible
+    hi: वसूली अयोग्य
+    sort: 60
+- name: invoice_line_kind
+  description: Kind of invoice line.
+  values:
+  - code: plan_fee
+    en: Plan fee
+    hi: प्लान शुल्क
+    sort: 10
+  - code: credit_pack
+    en: Credit pack
+    hi: क्रेडिट पैक
+    sort: 20
+  - code: add_on
+    en: Add-on
+    hi: ऐड-ऑन
+    sort: 30
+  - code: discount
+    en: Discount
+    hi: छूट
+    sort: 40
+  - code: proration
+    en: Proration
+    hi: आनुपातिक
+    sort: 50
+  - code: adjustment
+    en: Adjustment
+    hi: समायोजन
+    sort: 60
+- name: tax_component
+  description: Tax component (GST/VAT/...).
+  values:
+  - code: cgst
+    en: CGST
+    hi: सीजीएसटी
+    sort: 10
+  - code: sgst
+    en: SGST
+    hi: एसजीएसटी
+    sort: 20
+  - code: igst
+    en: IGST
+    hi: आईजीएसटी
+    sort: 30
+  - code: utgst
+    en: UTGST
+    hi: यूटीजीएसटी
+    sort: 40
+  - code: vat
+    en: VAT
+    hi: वैट
+    sort: 50
+  - code: sales_tax
+    en: Sales tax
+    hi: बिक्री कर
+    sort: 60
+  - code: cess
+    en: Cess
+    hi: उपकर
+    sort: 70
+  - code: withholding
+    en: Withholding (TDS)
+    hi: टीडीएस
+    sort: 80
+- name: series_document_kind
+  description: Document kinds that get gapless numbers.
+  values:
+  - code: invoice
+    en: Invoice
+    hi: बिल
+    sort: 10
+  - code: credit_note
+    en: Credit note
+    hi: क्रेडिट नोट
+    sort: 20
+- name: credit_note_reason
+  description: Reason for a credit note.
+  values:
+  - code: refund
+    en: Refund
+    hi: वापसी
+    sort: 10
+  - code: price_correction
+    en: Price correction
+    hi: मूल्य सुधार
+    sort: 20
+  - code: cancellation
+    en: Cancellation
+    hi: रद्दीकरण
+    sort: 30
+  - code: goodwill
+    en: Goodwill
+    hi: सद्भावना
+    sort: 40
+  - code: tax_correction
+    en: Tax correction
+    hi: कर सुधार
+    sort: 50
+- name: discount_type
+  description: Coupon discount mechanics.
+  values:
+  - code: percent_off
+    en: Percent off
+    hi: प्रतिशत छूट
+    sort: 10
+  - code: amount_off
+    en: Amount off
+    hi: राशि छूट
+    sort: 20
+  - code: bonus_credits
+    en: Bonus credits
+    hi: बोनस क्रेडिट
+    sort: 30
+- name: billable_action
+  description: Actions that consume credits / entitlements.
+  values:
+  - code: profile_download
+    en: Profile download
+    hi: प्रोफ़ाइल डाउनलोड
+    sort: 10
+  - code: resume_file_download
+    en: Resume file download
+    hi: रिज्यूमे डाउनलोड
+    sort: 20
+  - code: contact_unlock
+    en: Contact unlock
+    hi: संपर्क अनलॉक
+    sort: 30
+  - code: outreach_email
+    en: Outreach email
+    hi: आउटरीच ईमेल
+    sort: 40
+  - code: outreach_sms
+    en: Outreach SMS
+    hi: आउटरीच एसएमएस
+    sort: 50
+  - code: outreach_whatsapp
+    en: Outreach WhatsApp
+    hi: आउटरीच व्हाट्सऐप
+    sort: 60
+  - code: job_posting
+    en: Job posting
+    hi: नौकरी पोस्टिंग
+    sort: 70
+  - code: job_boost
+    en: Job boost
+    hi: नौकरी बूस्ट
+    sort: 80
+- name: entitlement_feature
+  description: Plan features with a numeric limit.
+  values:
+  - code: user_seats
+    en: User seats
+    hi: यूज़र सीट
+    sort: 10
+  - code: devices_per_user
+    en: Devices per user
+    hi: प्रति यूज़र डिवाइस
+    sort: 20
+  - code: profile_downloads
+    en: Profile downloads
+    hi: प्रोफ़ाइल डाउनलोड
+    sort: 30
+  - code: outreach_messages
+    en: Outreach messages
+    hi: आउटरीच संदेश
+    sort: 40
+  - code: job_postings
+    en: Job postings
+    hi: नौकरी पोस्टिंग
+    sort: 50
+  - code: candidate_searches
+    en: Candidate searches
+    hi: उम्मीदवार खोज
+    sort: 60
+  - code: bulk_exports
+    en: Bulk exports
+    hi: बल्क एक्सपोर्ट
+    sort: 70
+- name: entitlement_reset_interval
+  description: When a usage counter resets.
+  values:
+  - code: never
+    en: Never (lifetime)
+    hi: कभी नहीं
+    sort: 10
+  - code: daily
+    en: Daily
+    hi: दैनिक
+    sort: 20
+  - code: monthly
+    en: Monthly
+    hi: मासिक
+    sort: 30
+  - code: per_period
+    en: Per subscription period
+    hi: प्रति अवधि
+    sort: 40
+- name: renewal_outcome
+  description: Result of a renewal/dunning attempt.
+  values:
+  - code: scheduled
+    en: Scheduled
+    hi: निर्धारित
+    sort: 10
+  - code: succeeded
+    en: Succeeded
+    hi: सफल
+    sort: 20
+  - code: payment_failed
+    en: Payment failed
+    hi: भुगतान विफल
+    sort: 30
+  - code: no_payment_method
+    en: No payment method
+    hi: भुगतान विधि नहीं
+    sort: 40
+  - code: skipped
+    en: Skipped
+    hi: छोड़ा
+    sort: 50
+  - code: abandoned
+    en: Abandoned
+    hi: त्यागा
+    sort: 60
+- name: download_kind
+  description: What was downloaded.
+  values:
+  - code: profile_full
+    en: Full profile
+    hi: पूर्ण प्रोफ़ाइल
+    sort: 10
+  - code: contact_details
+    en: Contact details
+    hi: संपर्क विवरण
+    sort: 20
+  - code: resume_file
+    en: Resume file
+    hi: रिज्यूमे फ़ाइल
+    sort: 30
+  - code: profile_pdf
+    en: Profile PDF
+    hi: प्रोफ़ाइल पीडीएफ़
+    sort: 40
+- name: download_source
+  description: Where the download was initiated.
+  values:
+  - code: search_result
+    en: Search result
+    hi: खोज परिणाम
+    sort: 10
+  - code: shortlist
+    en: Shortlist
+    hi: शॉर्टलिस्ट
+    sort: 20
+  - code: application
+    en: Application
+    hi: आवेदन
+    sort: 30
+  - code: sourcing_request
+    en: Sourcing request
+    hi: सोर्सिंग अनुरोध
+    sort: 40
+  - code: api
+    en: API
+    hi: एपीआई
+    sort: 50
+- name: match_state
+  description: Reconciliation match result.
+  values:
+  - code: matched
+    en: Matched
+    hi: मिलान
+    sort: 10
+  - code: amount_mismatch
+    en: Amount mismatch
+    hi: राशि असंगत
+    sort: 20
+  - code: missing_in_ledger
+    en: Missing in ledger
+    hi: बही में नहीं
+    sort: 30
+  - code: missing_at_gateway
+    en: Missing at gateway
+    hi: गेटवे में नहीं
+    sort: 40
+  - code: duplicate
+    en: Duplicate
+    hi: दोहराव
+    sort: 50
+- name: reconciliation_run_status
+  description: Reconciliation run state.
+  values:
+  - code: running
+    en: Running
+    hi: चालू
+    sort: 10
+  - code: completed
+    en: Completed
+    hi: पूर्ण
+    sort: 20
+  - code: completed_with_exceptions
+    en: Completed with exceptions
+    hi: अपवादों के साथ पूर्ण
+    sort: 30
+  - code: failed
+    en: Failed
+    hi: विफल
+    sort: 40
+- name: payout_status
+  description: Consultant payout state.
+  values:
+  - code: pending
+    en: Pending
+    hi: लंबित
+    sort: 10
+  - code: approved
+    en: Approved
+    hi: स्वीकृत
+    sort: 20
+  - code: processing
+    en: Processing
+    hi: प्रक्रियाधीन
+    sort: 30
+  - code: paid
+    en: Paid
+    hi: भुगतान हुआ
+    sort: 40
+  - code: failed
+    en: Failed
+    hi: विफल
+    sort: 50
+  - code: on_hold
+    en: On hold
+    hi: रोका गया
+    sort: 60
+- name: spend_limit_scope
+  description: Who a spend limit applies to.
+  values:
+  - code: organisation
+    en: Organisation
+    hi: संगठन
+    sort: 10
+  - code: user
+    en: Single user
+    hi: एकल उपयोगकर्ता
+    sort: 20
+  - code: licence
+    en: Licence
+    hi: लाइसेंस
+    sort: 30
+- name: spend_limit_period
+  description: Window of a spend limit.
+  values:
+  - code: daily
+    en: Daily
+    hi: दैनिक
+    sort: 10
+  - code: weekly
+    en: Weekly
+    hi: साप्ताहिक
+    sort: 20
+  - code: monthly
+    en: Monthly
+    hi: मासिक
+    sort: 30
+- name: exchange_rate_source
+  description: Provider of an FX rate.
+  values:
+  - code: ecb
+    en: ECB reference
+    hi: ईसीबी
+    sort: 10
+  - code: rbi_reference
+    en: RBI reference
+    hi: आरबीआई संदर्भ
+    sort: 20
+  - code: openexchangerates
+    en: Open Exchange Rates
+    hi: ओपन एक्सचेंज रेट्स
+    sort: 30
+  - code: manual
+    en: Manual
+    hi: मैन्युअल
+    sort: 40
+- name: webhook_outcome
+  description: Processing result of an inbound gateway event.
+  values:
+  - code: processed
+    en: Processed
+    hi: संसाधित
+    sort: 10
+  - code: ignored_duplicate
+    en: Ignored duplicate
+    hi: दोहराव अनदेखा
+    sort: 20
+  - code: ignored_unmatched
+    en: Ignored (no order)
+    hi: अनदेखा (ऑर्डर नहीं)
+    sort: 30
+  - code: rejected_signature
+    en: Rejected (bad signature)
+    hi: अस्वीकृत (हस्ताक्षर)
+    sort: 40
+  - code: failed
+    en: Failed
+    hi: विफल
+    sort: 50
+tables:
+- name: subscription_plan
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Commercial catalogue; retired plans kept (is_active=false) while any subscription references them; 8 years after last subscription for tax/audit.
+  description: Sellable plan family (e.g. Recruiter Pro). Immutable commercial terms live in plan_version; this row is the stable identity.
+  columns:
+  - name: plan_code
+    type: STRING(40)
+    domain: code
+    desc: Stable machine code of the plan (e.g. recruiter_pro).
+    sens: Internal
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''.'
+    sens: Public
+  - name: plan_audience_id
+    type: UUID
+    domain: enum_ref
+    desc: Customer segment the plan targets.
+    sens: Internal
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    desc: False = no longer sold; existing subscriptions continue.
+    sens: Internal
+    default: 'true'
+  - name: is_public
+    type: BOOL
+    domain: boolean
+    desc: True = listed on the public pricing page; false = custom/enterprise negotiated.
+    sens: Internal
+    default: 'true'
+  constraints:
+  - name: uq_subscription_plan_plan_code
+    type: unique
+    columns:
+    - plan_code
+    desc: Natural key of the plan (soft-deleted rows keep their code reserved).
+  - name: ck_subscription_plan_name_has_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes: []
+  fks:
+  - name: fk_subscription_plan_plan_audience_id
+    columns:
+    - plan_audience_id
+    ref: plan_audience
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: plan_version
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  - B47
+  retention: Never deleted once referenced by a subscription; superseded by a newer version; 8 years.
+  description: Versioned, immutable terms of a plan (limits, trial, credits included). Subscriptions snapshot a version so later price/limit changes never alter running contracts.
+  columns:
+  - name: subscription_plan_id
+    type: UUID
+    domain: identifier
+    desc: Plan family this version belongs to.
+    sens: Internal
+  - name: version_no
+    type: INT4
+    domain: quantity
+    desc: Monotonic version number within the plan.
+    sens: Internal
+  - name: effective_from_date
+    type: DATE
+    domain: date
+    desc: First date the version can be sold.
+    sens: Internal
+  - name: effective_to_date
+    type: DATE
+    domain: date
+    desc: Last date the version can be sold.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended (still sellable).
+  - name: max_users
+    type: INT4
+    domain: quantity
+    desc: Seats (users) per licence included.
+    sens: Internal
+  - name: max_devices_per_user
+    type: INT4
+    domain: quantity
+    desc: Devices per user included (feeds licence limits, rule group 9).
+    sens: Internal
+  - name: included_credits
+    type: INT8
+    domain: quantity
+    desc: Credits granted into the wallet at each period start (0 = none).
+    sens: Internal
+    default: '0'
+  - name: trial_days
+    type: INT4
+    domain: quantity
+    desc: Free-trial length in days (0 = no trial).
+    sens: Internal
+    default: '0'
+  constraints:
+  - name: uq_plan_version_subscription_plan_id_version_no
+    type: unique
+    columns:
+    - subscription_plan_id
+    - version_no
+    desc: One row per plan version number.
+  - name: ck_plan_version_dates
+    type: check
+    expr: effective_to_date IS NULL OR effective_to_date >= effective_from_date
+    desc: End not before start.
+  - name: ck_plan_version_limits_positive
+    type: check
+    expr: max_users > 0 AND max_devices_per_user > 0 AND included_credits >= 0 AND trial_days >= 0 AND version_no > 0
+    desc: Positive limits (rule group 9).
+  indexes: []
+  fks:
+  - name: fk_plan_version_subscription_plan_id
+    columns:
+    - subscription_plan_id
+    ref: subscription_plan
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: plan_price
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Kept with the plan version for invoice reproducibility; 8 years.
+  description: Price point of a plan version per currency and billing interval (the price-list lookup).
+  columns:
+  - name: plan_version_id
+    type: UUID
+    domain: identifier
+    desc: Plan version priced.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of the price.
+    sens: Internal
+  - name: billing_interval_id
+    type: UUID
+    domain: enum_ref
+    desc: Billing cadence this price applies to.
+    sens: Internal
+  - name: amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: List price per interval, tax-exclusive.
+    sens: Internal
+  constraints:
+  - name: uq_plan_price_version_currency_interval
+    type: unique
+    columns:
+    - plan_version_id
+    - currency_id
+    - billing_interval_id
+    desc: One price per version/currency/interval.
+  - name: ck_plan_price_amount_nonneg
+    type: check
+    expr: amount >= 0
+    desc: Free tiers allowed, never negative.
+  indexes:
+  - name: idx_plan_price_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_plan_price_plan_version_id
+    columns:
+    - plan_version_id
+    ref: plan_version
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_plan_price_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_plan_price_billing_interval_id
+    columns:
+    - billing_interval_id
+    ref: billing_interval
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: subscription
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B44
+  - B47
+  retention: 'Financial record: kept 8 years after end (tax law); org erasure anonymises contacts only, never deletes the contract.'
+  description: A customer organisation's contract for a plan version, bound to exactly one licence; status, renewal mode, price snapshot, cancellation flag.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Customer (tenant) organisation.
+    sens: Internal
+  - name: account_id
+    type: UUID
+    domain: identifier
+    desc: Customer account that owns the contract.
+    sens: Internal
+  - name: licence_id
+    type: UUID
+    domain: identifier
+    desc: Licence this subscription provisions (seats/devices come from it).
+    sens: Internal
+  - name: plan_version_id
+    type: UUID
+    domain: identifier
+    desc: Plan version snapshot bought.
+    sens: Internal
+  - name: subscription_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Current lifecycle status (history in subscription_status_history).
+    sens: Internal
+  - name: renewal_mode_id
+    type: UUID
+    domain: enum_ref
+    desc: auto_renew / manual_renew / fixed_term.
+    sens: Internal
+  - name: billing_interval_id
+    type: UUID
+    domain: enum_ref
+    desc: Billing cadence agreed.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Contract currency.
+    sens: Internal
+  - name: recurring_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Tax-exclusive amount per interval snapshotted from plan_price (after negotiated discount).
+    sens: Internal
+  - name: payment_method_token_id
+    type: UUID
+    domain: identifier
+    desc: Default instrument for auto-renewal.
+    sens: Internal
+    'null': true
+    null_why: NULL = invoiced/manual payment, no stored instrument.
+  - name: started_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Contract start instant.
+    sens: Internal
+  - name: trial_ends_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: End of free trial.
+    sens: Internal
+    'null': true
+    null_why: NULL = no trial.
+  - name: cancel_at_period_end
+    type: BOOL
+    domain: boolean
+    desc: True when cancellation is scheduled for the end of the current period.
+    sens: Internal
+    default: 'false'
+  - name: ended_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Instant the contract ended (cancelled/expired).
+    sens: Internal
+    'null': true
+    null_why: NULL = still live.
+  constraints:
+  - name: uq_subscription_id_licence
+    type: unique
+    columns:
+    - id
+    - licence_id
+    desc: Composite FK target so periods prove they carry the subscription's licence.
+  - name: ck_subscription_recurring_nonneg
+    type: check
+    expr: recurring_amount >= 0
+    desc: No negative price.
+  - name: ck_subscription_ended_after_start
+    type: check
+    expr: ended_at IS NULL OR ended_at >= started_at
+    desc: End not before start.
+  indexes:
+  - name: uq_subscription_licence_id_live
+    columns:
+    - licence_id
+    desc: At most one live subscription per licence.
+    unique: true
+    where: ended_at IS NULL AND deleted_at IS NULL
+  - name: idx_subscription_organisation_id_status
+    columns:
+    - organisation_id
+    - subscription_status_id
+    desc: Org billing page / dunning lists.
+  - name: idx_subscription_account_id
+    columns:
+    - account_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_subscription_plan_version_id
+    columns:
+    - plan_version_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_subscription_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_subscription_payment_method_token_id
+    columns:
+    - payment_method_token_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: payment_method_token_id IS NOT NULL
+  fks:
+  - name: fk_subscription_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_account_id
+    columns:
+    - account_id
+    ref: account
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_plan_version_id
+    columns:
+    - plan_version_id
+    ref: plan_version
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_subscription_status_id
+    columns:
+    - subscription_status_id
+    ref: subscription_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_renewal_mode_id
+    columns:
+    - renewal_mode_id
+    ref: renewal_mode
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_billing_interval_id
+    columns:
+    - billing_interval_id
+    ref: billing_interval
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_payment_method_token_id
+    columns:
+    - payment_method_token_id
+    ref: payment_method_token
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: subscription_period
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B47
+  retention: Entitlement/billing history kept 8 years with the subscription; hard DELETE only for never-invoiced future 'scheduled' tail rows (cancellation).
+  description: One contiguous billing/entitlement period [period_start_date, period_end_date) of a licence. Non-overlap per licence via P1 CHAIN_FK (see notes).
+  columns:
+  - name: subscription_id
+    type: UUID
+    domain: identifier
+    desc: Owning subscription.
+    sens: Internal
+  - name: licence_id
+    type: UUID
+    domain: identifier
+    desc: Denormalised licence (must equal the subscription's; enforced by composite FK) - the chain key.
+    sens: Internal
+  - name: sequence_no
+    type: INT4
+    domain: quantity
+    desc: 1-based position of the period in the licence's chain.
+    sens: Internal
+  - name: period_start_date
+    type: DATE
+    domain: date
+    desc: Inclusive first day of the period.
+    sens: Internal
+  - name: period_end_date
+    type: DATE
+    domain: date
+    desc: EXCLUSIVE end (= renewal date); the next period starts on or after this date.
+    sens: Internal
+  - name: prior_period_id
+    type: UUID
+    domain: identifier
+    desc: Predecessor period in the same licence chain.
+    sens: Internal
+    'null': true
+    null_why: NULL only for the first period of a licence.
+  - name: prior_period_end_date
+    type: DATE
+    domain: date
+    desc: Copy of the predecessor's period_end_date, FK-pinned so the predecessor's end cannot move while a successor exists.
+    sens: Internal
+    'null': true
+    null_why: NULL only for the first period (same as prior_period_id).
+  - name: subscription_period_status_id
+    type: UUID
+    domain: enum_ref
+    desc: scheduled/active/completed/cancelled.
+    sens: Internal
+  - name: plan_version_id
+    type: UUID
+    domain: identifier
+    desc: Plan version in force for this period.
+    sens: Internal
+  - name: billed_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Tax-exclusive amount billed for the period.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of billed_amount.
+    sens: Internal
+  - name: invoice_id
+    type: UUID
+    domain: identifier
+    desc: Invoice that billed this period.
+    sens: Internal
+    'null': true
+    null_why: NULL until invoiced (scheduled/trial/free periods).
+  - name: original_period_end_date
+    type: DATE
+    domain: date
+    desc: End date before an early-cancellation shortening.
+    sens: Internal
+    'null': true
+    null_why: NULL = never shortened.
+  - name: shortened_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Instant the tail period was shortened/cancelled early.
+    sens: Internal
+    'null': true
+    null_why: NULL = never shortened.
+  constraints:
+  - name: uq_subscription_period_id_period_end_date
+    type: unique
+    columns:
+    - id
+    - period_end_date
+    desc: Non-partial unique required as composite-FK target (D-12 P1 / D-19).
+  - name: uq_subscription_period_id_licence_end
+    type: unique
+    columns:
+    - id
+    - licence_id
+    - period_end_date
+    desc: 'Stronger FK target: also pins the licence so a chain can never hop licences.'
+  - name: uq_subscription_period_prior_period_id
+    type: unique
+    columns:
+    - prior_period_id
+    desc: A period has at most one successor (no branching); NULLs distinct.
+  - name: uq_subscription_period_licence_id_sequence_no
+    type: unique
+    columns:
+    - licence_id
+    - sequence_no
+    desc: Chain position unique per licence.
+  - name: ck_subscription_period_dates
+    type: check
+    expr: period_start_date <= period_end_date
+    desc: End not before start (zero length = cancelled before it began).
+  - name: ck_subscription_period_chain_pair
+    type: check
+    expr: (prior_period_id IS NULL) = (prior_period_end_date IS NULL)
+    desc: Predecessor id and end date are both set or both NULL.
+  - name: ck_subscription_period_chain_first
+    type: check
+    expr: (sequence_no = 1) = (prior_period_id IS NULL)
+    desc: Only sequence 1 is the root.
+  - name: ck_subscription_period_no_overlap_prior
+    type: check
+    expr: prior_period_end_date IS NULL OR period_start_date >= prior_period_end_date
+    desc: Starts at/after predecessor's end (core non-overlap).
+  - name: ck_subscription_period_not_self_prior
+    type: check
+    expr: prior_period_id IS NULL OR prior_period_id <> id
+    desc: No self loop.
+  - name: ck_subscription_period_shorten_pair
+    type: check
+    expr: (original_period_end_date IS NULL) = (shortened_at IS NULL) AND (original_period_end_date IS NULL OR original_period_end_date >= period_end_date)
+    desc: Shortening only ever moves the end earlier and is recorded.
+  - name: ck_subscription_period_amount_nonneg
+    type: check
+    expr: billed_amount >= 0
+    desc: No negative billing.
+  indexes:
+  - name: uq_subscription_period_licence_id_first
+    columns:
+    - licence_id
+    desc: Exactly one first period per licence (chain root).
+    unique: true
+    where: prior_period_id IS NULL
+  - name: idx_subscription_period_subscription_id_start
+    columns:
+    - subscription_id
+    - period_start_date DESC
+    desc: Periods of a subscription, newest first.
+  - name: idx_subscription_period_period_end_date
+    columns:
+    - period_end_date
+    desc: 'Renewal job: periods ending soon.'
+  - name: idx_subscription_period_plan_version_id
+    columns:
+    - plan_version_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_subscription_period_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_subscription_period_invoice_id
+    columns:
+    - invoice_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: invoice_id IS NOT NULL
+  fks:
+  - name: fk_subscription_period_subscription_id
+    columns:
+    - subscription_id
+    ref: subscription
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_period_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_period_subscription_period_status_id
+    columns:
+    - subscription_period_status_id
+    ref: subscription_period_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_period_plan_version_id
+    columns:
+    - plan_version_id
+    ref: plan_version
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_period_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_period_invoice_id
+    columns:
+    - invoice_id
+    ref: invoice
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_period_prior_period
+    columns:
+    - prior_period_id
+    - licence_id
+    - prior_period_end_date
+    ref: subscription_period
+    ref_columns:
+    - id
+    - licence_id
+    - period_end_date
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'P1 CHAIN_FK: MATCH SIMPLE skips the check on the first period (NULLs); ON UPDATE RESTRICT freezes the predecessor''s period_end_date while a successor exists.'
+  - name: fk_subscription_period_subscription_licence
+    columns:
+    - subscription_id
+    - licence_id
+    ref: subscription
+    ref_columns:
+    - id
+    - licence_id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Period's licence must equal its subscription's licence.
+- name: subscription_status_history
+  kind: event
+  delete_policy: append_only
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Append-only; kept 8 years with the subscription.
+  description: Every subscription status transition (who/when/why); the subscription row holds only the latest status.
+  columns:
+  - name: subscription_id
+    type: UUID
+    domain: identifier
+    desc: Subscription transitioned.
+    sens: Internal
+  - name: from_subscription_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Previous status.
+    sens: Internal
+    'null': true
+    null_why: NULL for the initial status row.
+  - name: to_subscription_status_id
+    type: UUID
+    domain: enum_ref
+    desc: New status.
+    sens: Internal
+  - name: changed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Transition instant.
+    sens: Internal
+  - name: actor_app_user_id
+    type: UUID
+    domain: identifier
+    desc: User who caused the change.
+    sens: Internal
+    'null': true
+    null_why: NULL = system job (renewal/dunning/expiry).
+  - name: change_reason
+    type: STRING(200)
+    domain: free_text
+    desc: Short reason (e.g. 'renewal payment failed').
+    sens: Internal
+    'null': true
+    null_why: NULL when no reason beyond the transition.
+  constraints: []
+  indexes:
+  - name: idx_subscription_status_history_subscription_id_changed_at
+    columns:
+    - subscription_id
+    - changed_at DESC
+    desc: History per subscription.
+  - name: idx_subscription_status_history_actor_app_user_id
+    columns:
+    - actor_app_user_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: actor_app_user_id IS NOT NULL
+  fks:
+  - name: fk_subscription_status_history_subscription_id
+    columns:
+    - subscription_id
+    ref: subscription
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_status_history_from_subscription_status_id
+    columns:
+    - from_subscription_status_id
+    ref: subscription_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_status_history_to_subscription_status_id
+    columns:
+    - to_subscription_status_id
+    ref: subscription_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_status_history_actor_app_user_id
+    columns:
+    - actor_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: subscription_cancellation
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: 8 years with the subscription; free-text feedback anonymised on organisation erasure.
+  description: 'Cancellation request: reason, mode, effective date; withdrawable before it takes effect.'
+  columns:
+  - name: subscription_id
+    type: UUID
+    domain: identifier
+    desc: Subscription being cancelled.
+    sens: Internal
+  - name: cancellation_reason_id
+    type: UUID
+    domain: enum_ref
+    desc: Reason selected.
+    sens: Internal
+  - name: cancellation_mode_id
+    type: UUID
+    domain: enum_ref
+    desc: Immediate or at period end.
+    sens: Internal
+  - name: requested_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Request instant.
+    sens: Internal
+  - name: effective_date
+    type: DATE
+    domain: date
+    desc: Date the cancellation takes effect.
+    sens: Internal
+  - name: requested_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: User who requested it.
+    sens: Internal
+  - name: feedback
+    type: STRING(1000)
+    domain: free_text
+    desc: Customer's free-text feedback.
+    sens: Personal
+    'null': true
+    null_why: NULL = none given.
+    pii: may contain names/contacts; access-controlled, anonymised on erasure
+  - name: withdrawn_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Instant the request was withdrawn.
+    sens: Internal
+    'null': true
+    null_why: NULL = not withdrawn (still pending/effective).
+  constraints: []
+  indexes:
+  - name: uq_subscription_cancellation_subscription_id_open
+    columns:
+    - subscription_id
+    desc: At most one non-withdrawn cancellation per subscription.
+    unique: true
+    where: withdrawn_at IS NULL AND deleted_at IS NULL
+  - name: idx_subscription_cancellation_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_subscription_cancellation_subscription_id
+    columns:
+    - subscription_id
+    ref: subscription
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_cancellation_cancellation_reason_id
+    columns:
+    - cancellation_reason_id
+    ref: cancellation_reason
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_cancellation_cancellation_mode_id
+    columns:
+    - cancellation_mode_id
+    ref: cancellation_mode
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_cancellation_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: subscription_renewal_attempt
+  kind: event
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Kept 2 years then summarised; the payment_order keeps the financial record 8 years.
+  description: 'Renewal / dunning attempt log: scheduled retries (day 1/3/5/7), outcome, payment order created.'
+  columns:
+  - name: subscription_id
+    type: UUID
+    domain: identifier
+    desc: Subscription being renewed.
+    sens: Internal
+  - name: target_sequence_no
+    type: INT4
+    domain: quantity
+    desc: sequence_no of the period being created by this renewal.
+    sens: Internal
+  - name: attempt_no
+    type: INT4
+    domain: quantity
+    desc: 1-based attempt counter for this renewal.
+    sens: Internal
+  - name: scheduled_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the attempt is due.
+    sens: Internal
+  - name: attempted_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When it was actually tried.
+    sens: Internal
+    'null': true
+    null_why: NULL = not yet tried.
+  - name: renewal_outcome_id
+    type: UUID
+    domain: enum_ref
+    desc: Result (scheduled until tried).
+    sens: Internal
+  - name: payment_order_id
+    type: UUID
+    domain: identifier
+    desc: Order raised for the renewal charge.
+    sens: Internal
+    'null': true
+    null_why: NULL if no charge was created (no instrument / skipped).
+  - name: next_retry_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Planned next dunning retry.
+    sens: Internal
+    'null': true
+    null_why: NULL = no further retry planned.
+  constraints:
+  - name: uq_subscription_renewal_attempt_subscription_target_attempt
+    type: unique
+    columns:
+    - subscription_id
+    - target_sequence_no
+    - attempt_no
+    desc: Idempotent per attempt.
+  - name: ck_subscription_renewal_attempt_attempt_pos
+    type: check
+    expr: attempt_no > 0 AND target_sequence_no > 0
+    desc: Positive counters.
+  indexes:
+  - name: idx_subscription_renewal_attempt_scheduled_at
+    columns:
+    - scheduled_at
+    desc: Due-attempt scan for the renewal worker.
+    where: attempted_at IS NULL
+  - name: idx_subscription_renewal_attempt_payment_order_id
+    columns:
+    - payment_order_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: payment_order_id IS NOT NULL
+  fks:
+  - name: fk_subscription_renewal_attempt_subscription_id
+    columns:
+    - subscription_id
+    ref: subscription
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_renewal_attempt_renewal_outcome_id
+    columns:
+    - renewal_outcome_id
+    ref: renewal_outcome
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_subscription_renewal_attempt_payment_order_id
+    columns:
+    - payment_order_id
+    ref: payment_order
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: plan_entitlement
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Kept with plan version; 8 years.
+  description: Feature limits included in a plan version (downloads/month, outreach messages, postings...).
+  columns:
+  - name: plan_version_id
+    type: UUID
+    domain: identifier
+    desc: Plan version.
+    sens: Internal
+  - name: entitlement_feature_id
+    type: UUID
+    domain: enum_ref
+    desc: Feature limited.
+    sens: Internal
+  - name: limit_value
+    type: INT8
+    domain: quantity
+    desc: Included quantity per reset interval.
+    sens: Internal
+    'null': true
+    null_why: NULL = unlimited (explicitly, not zero).
+  - name: entitlement_reset_interval_id
+    type: UUID
+    domain: enum_ref
+    desc: Counter reset cadence.
+    sens: Internal
+  - name: is_hard_limit
+    type: BOOL
+    domain: boolean
+    desc: True = block at limit; false = allow overage charged in credits.
+    sens: Internal
+    default: 'true'
+  constraints:
+  - name: uq_plan_entitlement_version_feature
+    type: unique
+    columns:
+    - plan_version_id
+    - entitlement_feature_id
+    desc: One limit per feature per version.
+  - name: ck_plan_entitlement_limit_nonneg
+    type: check
+    expr: limit_value IS NULL OR limit_value >= 0
+    desc: Non-negative.
+  indexes: []
+  fks:
+  - name: fk_plan_entitlement_plan_version_id
+    columns:
+    - plan_version_id
+    ref: plan_version
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_plan_entitlement_entitlement_feature_id
+    columns:
+    - entitlement_feature_id
+    ref: entitlement_feature
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_plan_entitlement_entitlement_reset_interval_id
+    columns:
+    - entitlement_reset_interval_id
+    ref: entitlement_reset_interval
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: subscription_entitlement
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  - B47
+  retention: Counters kept for the subscription life + 2 years; usage is also derivable from profile_download/ledger.
+  description: Per-subscription usage counter for a feature in the current window (free quota consumption).
+  columns:
+  - name: subscription_id
+    type: UUID
+    domain: identifier
+    desc: Subscription.
+    sens: Internal
+  - name: entitlement_feature_id
+    type: UUID
+    domain: enum_ref
+    desc: Feature counted.
+    sens: Internal
+  - name: limit_value
+    type: INT8
+    domain: quantity
+    desc: Snapshot of plan limit for the window.
+    sens: Internal
+    'null': true
+    null_why: NULL = unlimited.
+  - name: used_count
+    type: INT8
+    domain: quantity
+    desc: Units consumed in the window; increments under row lock.
+    sens: Internal
+    default: '0'
+  - name: usage_window_start_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Window start (UTC).
+    sens: Internal
+  - name: usage_window_end_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Window end (UTC).
+    sens: Internal
+  constraints:
+  - name: uq_subscription_entitlement_subscription_feature_window
+    type: unique
+    columns:
+    - subscription_id
+    - entitlement_feature_id
+    - usage_window_start_at
+    desc: One counter per window.
+  - name: ck_subscription_entitlement_window
+    type: check
+    expr: usage_window_end_at >= usage_window_start_at
+    desc: End not before start.
+  - name: ck_subscription_entitlement_used_bounds
+    type: check
+    expr: used_count >= 0 AND (limit_value IS NULL OR used_count <= limit_value)
+    desc: Counter never negative nor above the hard limit.
+  indexes:
+  - name: idx_subscription_entitlement_usage_window_end_at
+    columns:
+    - usage_window_end_at
+    desc: Window rollover job.
+  fks:
+  - name: fk_subscription_entitlement_subscription_id
+    columns:
+    - subscription_id
+    ref: subscription
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_subscription_entitlement_entitlement_feature_id
+    columns:
+    - entitlement_feature_id
+    ref: entitlement_feature
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: credit_rate_card
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Date-effective history kept 8 years (reprice audits).
+  description: Credits charged per billable action, optionally per plan version (NULL plan = platform default).
+  columns:
+  - name: plan_version_id
+    type: UUID
+    domain: identifier
+    desc: Plan version the rate applies to.
+    sens: Internal
+    'null': true
+    null_why: NULL = platform default rate card.
+  - name: billable_action_id
+    type: UUID
+    domain: enum_ref
+    desc: Action priced.
+    sens: Internal
+  - name: credits_per_unit
+    type: INT4
+    domain: quantity
+    desc: Credits deducted per unit of the action.
+    sens: Internal
+  - name: effective_from_date
+    type: DATE
+    domain: date
+    desc: Rate start date.
+    sens: Internal
+  - name: effective_to_date
+    type: DATE
+    domain: date
+    desc: Rate end date.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended.
+  constraints:
+  - name: uq_credit_rate_card_version_action_from
+    type: unique
+    columns:
+    - plan_version_id
+    - billable_action_id
+    - effective_from_date
+    desc: One rate per plan/action/start (plan-specific rows).
+  - name: ck_credit_rate_card_dates
+    type: check
+    expr: effective_to_date IS NULL OR effective_to_date >= effective_from_date
+    desc: End not before start.
+  - name: ck_credit_rate_card_credits_nonneg
+    type: check
+    expr: credits_per_unit >= 0
+    desc: 0 = free action.
+  indexes:
+  - name: uq_credit_rate_card_billable_action_id_default
+    columns:
+    - billable_action_id
+    - effective_from_date
+    desc: Platform default per action and start date (NULL plan).
+    unique: true
+    where: plan_version_id IS NULL
+  fks:
+  - name: fk_credit_rate_card_plan_version_id
+    columns:
+    - plan_version_id
+    ref: plan_version
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_credit_rate_card_billable_action_id
+    columns:
+    - billable_action_id
+    ref: billable_action
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: credit_pack
+  kind: config
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Retired via is_active; 8 years.
+  description: Sellable wallet recharge pack (credits + bonus + validity).
+  columns:
+  - name: pack_code
+    type: STRING(40)
+    domain: code
+    desc: Stable code.
+    sens: Internal
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    desc: Display name per language; must include 'en'.
+    sens: Public
+  - name: credits
+    type: INT8
+    domain: quantity
+    desc: Credits delivered.
+    sens: Internal
+  - name: bonus_credits
+    type: INT8
+    domain: quantity
+    desc: Extra promotional credits.
+    sens: Internal
+    default: '0'
+  - name: validity_days
+    type: INT4
+    domain: quantity
+    desc: Days until the granted credits expire (FIFO bucket).
+    sens: Internal
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    desc: False = not sold.
+    sens: Internal
+    default: 'true'
+  constraints:
+  - name: uq_credit_pack_pack_code
+    type: unique
+    columns:
+    - pack_code
+    desc: Natural key.
+  - name: ck_credit_pack_name_has_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  - name: ck_credit_pack_credits_pos
+    type: check
+    expr: credits > 0 AND bonus_credits >= 0 AND validity_days > 0
+    desc: Positive credits and validity.
+  indexes: []
+  fks: []
+- name: credit_pack_price
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Date-effective price history 8 years.
+  description: Price of a credit pack per currency with effective dates.
+  columns:
+  - name: credit_pack_id
+    type: UUID
+    domain: identifier
+    desc: Pack priced.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Price currency.
+    sens: Internal
+  - name: amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Tax-exclusive price.
+    sens: Internal
+  - name: effective_from_date
+    type: DATE
+    domain: date
+    desc: Price start date.
+    sens: Internal
+  - name: effective_to_date
+    type: DATE
+    domain: date
+    desc: Price end date.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended.
+  constraints:
+  - name: uq_credit_pack_price_pack_currency_from
+    type: unique
+    columns:
+    - credit_pack_id
+    - currency_id
+    - effective_from_date
+    desc: One price per pack/currency/start.
+  - name: ck_credit_pack_price_dates
+    type: check
+    expr: effective_to_date IS NULL OR effective_to_date >= effective_from_date
+    desc: End not before start.
+  - name: ck_credit_pack_price_amount_pos
+    type: check
+    expr: amount > 0
+    desc: Price positive.
+  indexes:
+  - name: idx_credit_pack_price_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_credit_pack_price_credit_pack_id
+    columns:
+    - credit_pack_id
+    ref: credit_pack
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_credit_pack_price_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: coupon
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: X
+  milestones:
+  - B38
+  - B44
+  retention: Kept 8 years after expiry (redemptions reference it).
+  description: 'Promotion code: percent/amount discount or bonus credits, validity, redemption caps.'
+  columns:
+  - name: coupon_code
+    type: STRING(40)
+    domain: code
+    desc: Redeemable code, stored uppercase.
+    sens: Internal
+  - name: discount_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Discount mechanic.
+    sens: Internal
+  - name: percent_off
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Percent discount.
+    sens: Internal
+    'null': true
+    null_why: NULL unless discount type is percent_off.
+  - name: amount_off
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Fixed discount (needs currency_id).
+    sens: Internal
+    'null': true
+    null_why: NULL unless discount type is amount_off.
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of amount_off.
+    sens: Internal
+    'null': true
+    null_why: NULL unless amount_off is set.
+  - name: bonus_credits
+    type: INT8
+    domain: quantity
+    desc: Credits granted.
+    sens: Internal
+    'null': true
+    null_why: NULL unless discount type is bonus_credits.
+  - name: valid_from
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Validity start.
+    sens: Internal
+  - name: valid_to
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Validity end.
+    sens: Internal
+    'null': true
+    null_why: NULL = no expiry.
+  - name: max_redemptions
+    type: INT4
+    domain: quantity
+    desc: Global redemption cap.
+    sens: Internal
+    'null': true
+    null_why: NULL = unlimited.
+  - name: redemption_count
+    type: INT4
+    domain: quantity
+    desc: Redemptions so far; incremented under row lock.
+    sens: Internal
+    default: '0'
+  - name: per_organisation_limit
+    type: INT4
+    domain: quantity
+    desc: Max redemptions per organisation.
+    sens: Internal
+    default: '1'
+  constraints:
+  - name: uq_coupon_coupon_code
+    type: unique
+    columns:
+    - coupon_code
+    desc: Natural key.
+  - name: ck_coupon_valid_range
+    type: check
+    expr: valid_to IS NULL OR valid_to >= valid_from
+    desc: End not before start.
+  - name: ck_coupon_percent_range
+    type: check
+    expr: percent_off IS NULL OR (percent_off >= 0 AND percent_off <= 100)
+    desc: 0..100.
+  - name: ck_coupon_cap
+    type: check
+    expr: max_redemptions IS NULL OR redemption_count <= max_redemptions
+    desc: Cap enforced.
+  - name: ck_coupon_amount_has_currency
+    type: check
+    expr: (amount_off IS NULL) = (currency_id IS NULL)
+    desc: Amount and currency together.
+  - name: ck_coupon_code_upper
+    type: check
+    expr: coupon_code = upper(coupon_code)
+    desc: Uppercase codes.
+  indexes:
+  - name: idx_coupon_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: currency_id IS NOT NULL
+  fks:
+  - name: fk_coupon_discount_type_id
+    columns:
+    - discount_type_id
+    ref: discount_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_coupon_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: coupon_redemption
+  kind: event
+  delete_policy: append_only
+  volume: medium
+  tier: X
+  milestones:
+  - B38
+  - B44
+  retention: Append-only; 8 years.
+  description: One redemption of a coupon by an organisation, tied to the order/invoice it discounted.
+  columns:
+  - name: coupon_id
+    type: UUID
+    domain: identifier
+    desc: Coupon used.
+    sens: Internal
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Redeeming organisation.
+    sens: Internal
+  - name: payment_order_id
+    type: UUID
+    domain: identifier
+    desc: Order discounted.
+    sens: Internal
+    'null': true
+    null_why: NULL when applied to a subscription/invoice without an order yet.
+  - name: invoice_id
+    type: UUID
+    domain: identifier
+    desc: Invoice discounted.
+    sens: Internal
+    'null': true
+    null_why: NULL when no invoice yet.
+  - name: discount_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Money discount actually given.
+    sens: Internal
+    'null': true
+    null_why: NULL for bonus-credit coupons.
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of discount_amount.
+    sens: Internal
+  - name: bonus_credits_granted
+    type: INT8
+    domain: quantity
+    desc: Credits granted.
+    sens: Internal
+    'null': true
+    null_why: NULL for money-discount coupons.
+  - name: redeemed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Instant of redemption.
+    sens: Internal
+  constraints:
+  - name: ck_coupon_redemption_payload
+    type: check
+    expr: (discount_amount IS NULL) <> (bonus_credits_granted IS NULL)
+    desc: Exactly one of money discount or bonus credits.
+  indexes:
+  - name: idx_coupon_redemption_coupon_id_organisation
+    columns:
+    - coupon_id
+    - organisation_id
+    desc: Per-organisation limit check.
+  - name: idx_coupon_redemption_organisation_id
+    columns:
+    - organisation_id
+    desc: Org redemption history.
+  - name: idx_coupon_redemption_payment_order_id
+    columns:
+    - payment_order_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: payment_order_id IS NOT NULL
+  - name: idx_coupon_redemption_invoice_id
+    columns:
+    - invoice_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: invoice_id IS NOT NULL
+  - name: idx_coupon_redemption_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_coupon_redemption_coupon_id
+    columns:
+    - coupon_id
+    ref: coupon
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_coupon_redemption_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_coupon_redemption_payment_order_id
+    columns:
+    - payment_order_id
+    ref: payment_order
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_coupon_redemption_invoice_id
+    columns:
+    - invoice_id
+    ref: invoice
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_coupon_redemption_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: wallet
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B44
+  - B47
+  retention: Never deleted while a ledger exists; closed wallets kept 8 years; balance reconciles to ledger.
+  description: Prepaid credit wallet per owner and currency; holds current balance and ledger_sequence (hot row, locked FOR UPDATE for every movement). Unit = CREDITS (see notes).
+  columns:
+  - name: owner_organisation_id
+    type: UUID
+    domain: identifier
+    desc: Owning organisation (employer wallets).
+    sens: Internal
+    'null': true
+    null_why: NULL when the wallet belongs to a user (exactly one owner).
+  - name: owner_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Owning user (individual consultant/gig requester wallets).
+    sens: Internal
+    'null': true
+    null_why: NULL when the wallet belongs to an organisation.
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency in which credits are purchased/refunded (credits are not fungible across currencies).
+    sens: Internal
+  - name: wallet_status_id
+    type: UUID
+    domain: enum_ref
+    desc: active/frozen/closed.
+    sens: Internal
+  - name: credit_balance
+    type: INT8
+    domain: quantity
+    desc: Current spendable credits (= sum of ledger deltas).
+    sens: Internal
+    default: '0'
+  - name: ledger_sequence
+    type: INT8
+    domain: quantity
+    desc: Sequence number of the last ledger entry (0 = none); incremented in the same txn.
+    sens: Internal
+    default: '0'
+  - name: low_balance_threshold
+    type: INT8
+    domain: quantity
+    desc: Credits below which a low-balance notification fires.
+    sens: Internal
+    'null': true
+    null_why: NULL = no alert configured.
+  - name: last_entry_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Time of the last ledger entry.
+    sens: Internal
+    'null': true
+    null_why: NULL = no entries yet.
+  constraints:
+  - name: ck_wallet_balance_nonneg
+    type: check
+    expr: credit_balance >= 0
+    desc: 'D-14: balance never negative.'
+  - name: ck_wallet_sequence_nonneg
+    type: check
+    expr: ledger_sequence >= 0
+    desc: Sequence non-negative.
+  - name: ck_wallet_one_owner
+    type: check
+    expr: num_nonnulls(owner_organisation_id, owner_app_user_id) = 1
+    desc: Exactly one owner.
+  indexes:
+  - name: uq_wallet_owner_organisation_id_currency
+    columns:
+    - owner_organisation_id
+    - currency_id
+    desc: One live wallet per organisation+currency.
+    unique: true
+    where: owner_organisation_id IS NOT NULL AND deleted_at IS NULL
+  - name: uq_wallet_owner_app_user_id_currency
+    columns:
+    - owner_app_user_id
+    - currency_id
+    desc: One live wallet per user+currency.
+    unique: true
+    where: owner_app_user_id IS NOT NULL AND deleted_at IS NULL
+  - name: idx_wallet_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_wallet_owner_organisation_id
+    columns:
+    - owner_organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_owner_app_user_id
+    columns:
+    - owner_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_wallet_status_id
+    columns:
+    - wallet_status_id
+    ref: wallet_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: wallet_ledger_entry
+  kind: ledger
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B44
+  - B47
+  - B76
+  retention: Append-only forever (8 years minimum, legal hold); never TTL'd; cold-archived after 2 years via changefeed, rows retained.
+  description: Single-entry signed credit movement of a wallet; hash-chained; gapless sequence per wallet; corrections via reversal entries only.
+  columns:
+  - name: wallet_id
+    type: UUID
+    domain: identifier
+    desc: Wallet moved.
+    sens: Internal
+  - name: sequence_no
+    type: INT8
+    domain: quantity
+    desc: Per-wallet gapless sequence (= wallet.ledger_sequence after the txn).
+    sens: Internal
+  - name: prev_sequence_no
+    type: INT8
+    domain: quantity
+    desc: Previous sequence_no (composite self-FK proves it exists, so no gaps).
+    sens: Internal
+    'null': true
+    null_why: NULL only for sequence_no = 1.
+  - name: ledger_entry_type_id
+    type: UUID
+    domain: enum_ref
+    desc: recharge/consumption_*/refund/adjustment/expiry/reversal/promo_grant.
+    sens: Internal
+  - name: credits_delta
+    type: INT8
+    domain: quantity
+    desc: 'Signed credits: positive credits the wallet, negative debits it.'
+    sens: Internal
+  - name: is_debit
+    type: BOOL
+    domain: boolean
+    desc: True when credits_delta < 0 (explicit so the sign is checkable against type rules).
+    sens: Internal
+    default: 'false'
+  - name: balance_after
+    type: INT8
+    domain: quantity
+    desc: Wallet balance after this entry (running balance).
+    sens: Internal
+  - name: idempotency_key
+    type: STRING(120)
+    domain: token
+    desc: Caller-supplied key (e.g. 'dl:{org}:{candidate}:{request}'); replays return the original row.
+    sens: Internal
+  - name: actor_app_user_id
+    type: UUID
+    domain: identifier
+    desc: User who triggered it (recruiter); drives spend limits.
+    sens: Internal
+    'null': true
+    null_why: NULL = system (gateway webhook, expiry job).
+  - name: reverses_wallet_ledger_entry_id
+    type: UUID
+    domain: identifier
+    desc: Entry this one reverses.
+    sens: Internal
+    'null': true
+    null_why: NULL unless this is a reversal.
+  - name: has_fk_reference
+    type: BOOL
+    domain: boolean
+    desc: True when exactly one explicit reference FK below is set; false for entries referenced from the other side (profile_download) or manual adjustments.
+    sens: Internal
+    default: 'true'
+  - name: payment_order_id
+    type: UUID
+    domain: identifier
+    desc: Recharge payment this credit came from.
+    sens: Internal
+    'null': true
+    null_why: NULL unless the reference is a payment order.
+  - name: refund_id
+    type: UUID
+    domain: identifier
+    desc: Refund this movement implements.
+    sens: Internal
+    'null': true
+    null_why: NULL unless the reference is a refund.
+  - name: outreach_batch_id
+    type: UUID
+    domain: identifier
+    desc: Outreach batch consuming credits.
+    sens: Internal
+    'null': true
+    null_why: NULL unless the reference is an outreach batch.
+  - name: job_requirement_id
+    type: UUID
+    domain: identifier
+    desc: Job posting consuming credits.
+    sens: Internal
+    'null': true
+    null_why: NULL unless the reference is a job posting.
+  - name: coupon_redemption_id
+    type: UUID
+    domain: identifier
+    desc: Coupon that granted bonus credits.
+    sens: Internal
+    'null': true
+    null_why: NULL unless the reference is a coupon.
+  - name: wallet_expiry_bucket_id
+    type: UUID
+    domain: identifier
+    desc: Bucket that expired.
+    sens: Internal
+    'null': true
+    null_why: NULL unless this is an expiry entry.
+  - name: adjustment_note
+    type: STRING(300)
+    domain: free_text
+    desc: Operator justification for a manual adjustment.
+    sens: Internal
+    'null': true
+    null_why: NULL except adjustment/promo entries.
+  - name: prev_hash
+    type: BYTES
+    domain: blob
+    desc: row_hash of the previous entry of this wallet (tamper-evident chain).
+    sens: Internal
+    'null': true
+    null_why: NULL only for sequence_no = 1.
+  - name: row_hash
+    type: BYTES
+    domain: blob
+    desc: SHA-256 over (prev_hash, wallet_id, sequence_no, type, credits_delta, balance_after, idempotency_key, created_at).
+    sens: Internal
+  constraints:
+  - name: uq_wallet_ledger_entry_wallet_id_sequence_no
+    type: unique
+    columns:
+    - wallet_id
+    - sequence_no
+    desc: D-14 per-wallet sequence; also composite FK target.
+  - name: uq_wallet_ledger_entry_idempotency_key
+    type: unique
+    columns:
+    - idempotency_key
+    desc: D-14 global idempotency.
+  - name: uq_wallet_ledger_entry_reverses_wallet_ledger_entry_id
+    type: unique
+    columns:
+    - reverses_wallet_ledger_entry_id
+    desc: An entry is reversed at most once (NULLs distinct).
+  - name: ck_wallet_ledger_entry_delta_nonzero
+    type: check
+    expr: credits_delta <> 0
+    desc: No empty movements.
+  - name: ck_wallet_ledger_entry_sign_flag
+    type: check
+    expr: (is_debit AND credits_delta < 0) OR ((NOT is_debit) AND credits_delta > 0)
+    desc: is_debit matches the sign.
+  - name: ck_wallet_ledger_entry_balance_nonneg
+    type: check
+    expr: balance_after >= 0
+    desc: Ledger can never record a negative balance.
+  - name: ck_wallet_ledger_entry_seq_pos
+    type: check
+    expr: sequence_no > 0 AND (sequence_no = 1) = (prev_sequence_no IS NULL) AND (prev_sequence_no IS NULL OR prev_sequence_no = sequence_no - 1)
+    desc: Gapless predecessor.
+  - name: ck_wallet_ledger_entry_hash_chain
+    type: check
+    expr: (sequence_no = 1) = (prev_hash IS NULL)
+    desc: Genesis entry has no prev_hash.
+  - name: ck_wallet_ledger_entry_single_reference
+    type: check
+    expr: num_nonnulls(payment_order_id, refund_id, outreach_batch_id, job_requirement_id, coupon_redemption_id, wallet_expiry_bucket_id, reverses_wallet_ledger_entry_id) = CASE WHEN has_fk_reference THEN
+      1 ELSE 0 END
+    desc: Exactly-one-of explicit reference (or none when referenced from the other side).
+  indexes:
+  - name: idx_wallet_ledger_entry_created_at
+    columns:
+    - created_at
+    desc: Time-ordered scans (reconciliation/export) without a hot range.
+    hash: true
+    bucket_count: 16
+  - name: idx_wallet_ledger_entry_actor_app_user_id_created_at
+    columns:
+    - actor_app_user_id
+    - created_at DESC
+    desc: Per-user spend-limit window sums and statements.
+    where: actor_app_user_id IS NOT NULL
+  - name: idx_wallet_ledger_entry_payment_order_id
+    columns:
+    - payment_order_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: payment_order_id IS NOT NULL
+  - name: idx_wallet_ledger_entry_refund_id
+    columns:
+    - refund_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: refund_id IS NOT NULL
+  - name: idx_wallet_ledger_entry_outreach_batch_id
+    columns:
+    - outreach_batch_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: outreach_batch_id IS NOT NULL
+  - name: idx_wallet_ledger_entry_job_requirement_id
+    columns:
+    - job_requirement_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: job_requirement_id IS NOT NULL
+  - name: idx_wallet_ledger_entry_coupon_redemption_id
+    columns:
+    - coupon_redemption_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: coupon_redemption_id IS NOT NULL
+  - name: idx_wallet_ledger_entry_wallet_expiry_bucket_id
+    columns:
+    - wallet_expiry_bucket_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: wallet_expiry_bucket_id IS NOT NULL
+  fks:
+  - name: fk_wallet_ledger_entry_wallet_id
+    columns:
+    - wallet_id
+    ref: wallet
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_ledger_entry_type_id
+    columns:
+    - ledger_entry_type_id
+    ref: ledger_entry_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_wallet_ledger_entry_actor_app_user_id
+    columns:
+    - actor_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_reverses_wallet_ledger_entry_id
+    columns:
+    - reverses_wallet_ledger_entry_id
+    ref: wallet_ledger_entry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_payment_order_id
+    columns:
+    - payment_order_id
+    ref: payment_order
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_refund_id
+    columns:
+    - refund_id
+    ref: refund
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_outreach_batch_id
+    columns:
+    - outreach_batch_id
+    ref: outreach_batch
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_job_requirement_id
+    columns:
+    - job_requirement_id
+    ref: job_requirement
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_coupon_redemption_id
+    columns:
+    - coupon_redemption_id
+    ref: coupon_redemption
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_wallet_expiry_bucket_id
+    columns:
+    - wallet_expiry_bucket_id
+    ref: wallet_expiry_bucket
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_ledger_entry_prev_entry
+    columns:
+    - wallet_id
+    - prev_sequence_no
+    ref: wallet_ledger_entry
+    ref_columns:
+    - wallet_id
+    - sequence_no
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'Composite self-FK: predecessor exists in the same wallet -> gapless chain.'
+- name: wallet_expiry_bucket
+  kind: entity
+  delete_policy: hard
+  volume: high
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Zero-remaining buckets purged 2 years after expiry (the ledger keeps the truth).
+  description: Credit grant lot with expiry; consumed FIFO by earliest expires_at; remaining credits mutate (derived state).
+  columns:
+  - name: wallet_id
+    type: UUID
+    domain: identifier
+    desc: Wallet holding the lot.
+    sens: Internal
+  - name: source_wallet_ledger_entry_id
+    type: UUID
+    domain: identifier
+    desc: Ledger credit entry that created the lot.
+    sens: Internal
+  - name: credits_granted
+    type: INT8
+    domain: quantity
+    desc: Credits in the lot.
+    sens: Internal
+  - name: credits_remaining
+    type: INT8
+    domain: quantity
+    desc: Unconsumed credits.
+    sens: Internal
+  - name: expires_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Expiry instant.
+    sens: Internal
+  - name: fully_consumed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When remaining reached 0.
+    sens: Internal
+    'null': true
+    null_why: NULL = still has remaining credits.
+  constraints:
+  - name: uq_wallet_expiry_bucket_source_wallet_ledger_entry_id
+    type: unique
+    columns:
+    - source_wallet_ledger_entry_id
+    desc: One lot per credit entry.
+  - name: ck_wallet_expiry_bucket_remaining_bounds
+    type: check
+    expr: credits_remaining >= 0 AND credits_remaining <= credits_granted AND credits_granted > 0
+    desc: Remaining within lot.
+  indexes:
+  - name: idx_wallet_expiry_bucket_wallet_id_expires_at
+    columns:
+    - wallet_id
+    - expires_at
+    desc: 'FIFO pick: earliest-expiring open lot.'
+    where: credits_remaining > 0
+  - name: idx_wallet_expiry_bucket_expires_at
+    columns:
+    - expires_at
+    desc: Expiry job scan.
+    hash: true
+    bucket_count: 8
+    where: credits_remaining > 0
+  fks:
+  - name: fk_wallet_expiry_bucket_wallet_id
+    columns:
+    - wallet_id
+    ref: wallet
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_expiry_bucket_source_wallet_ledger_entry_id
+    columns:
+    - source_wallet_ledger_entry_id
+    ref: wallet_ledger_entry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: wallet_bucket_consumption
+  kind: ledger
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Append-only; same retention as the ledger.
+  description: Which lots a consumption/expiry/reversal entry drew from or returned to (FIFO audit trail).
+  columns:
+  - name: wallet_ledger_entry_id
+    type: UUID
+    domain: identifier
+    desc: Ledger entry that consumed.
+    sens: Internal
+  - name: wallet_expiry_bucket_id
+    type: UUID
+    domain: identifier
+    desc: Lot drawn from.
+    sens: Internal
+  - name: credits
+    type: INT8
+    domain: quantity
+    desc: Signed credits taken from (-) or returned to (+) the lot.
+    sens: Internal
+  constraints:
+  - name: uq_wallet_bucket_consumption_entry_bucket
+    type: unique
+    columns:
+    - wallet_ledger_entry_id
+    - wallet_expiry_bucket_id
+    desc: One row per entry/lot.
+  - name: ck_wallet_bucket_consumption_credits_nonzero
+    type: check
+    expr: credits <> 0
+    desc: No empty rows.
+  indexes:
+  - name: idx_wallet_bucket_consumption_wallet_expiry_bucket_id
+    columns:
+    - wallet_expiry_bucket_id
+    desc: Lot usage drill-down.
+  - name: idx_wallet_bucket_consumption_created_at
+    columns:
+    - created_at
+    desc: Time scans.
+    hash: true
+    bucket_count: 16
+  fks:
+  - name: fk_wallet_bucket_consumption_wallet_ledger_entry_id
+    columns:
+    - wallet_ledger_entry_id
+    ref: wallet_ledger_entry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_wallet_bucket_consumption_wallet_expiry_bucket_id
+    columns:
+    - wallet_expiry_bucket_id
+    ref: wallet_expiry_bucket
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: spend_limit
+  kind: config
+  delete_policy: soft
+  volume: low
+  tier: X
+  milestones:
+  - B38
+  - B44
+  retention: While in force + 2 years.
+  description: 'Spend control: max credits/amount per window for an organisation, user or licence; checked in the debit txn.'
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation the limit belongs to.
+    sens: Internal
+  - name: spend_limit_scope_id
+    type: UUID
+    domain: enum_ref
+    desc: organisation / user / licence.
+    sens: Internal
+  - name: target_app_user_id
+    type: UUID
+    domain: identifier
+    desc: User limited.
+    sens: Internal
+    'null': true
+    null_why: NULL unless scope is user.
+  - name: licence_id
+    type: UUID
+    domain: identifier
+    desc: Licence limited.
+    sens: Internal
+    'null': true
+    null_why: NULL unless scope is licence.
+  - name: spend_limit_period_id
+    type: UUID
+    domain: enum_ref
+    desc: Window length.
+    sens: Internal
+  - name: max_credits
+    type: INT8
+    domain: quantity
+    desc: Credit cap per window.
+    sens: Internal
+    'null': true
+    null_why: NULL = no credit cap (money cap only).
+  - name: max_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Money cap per window.
+    sens: Internal
+    'null': true
+    null_why: NULL = no money cap.
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of max_amount.
+    sens: Internal
+  - name: is_hard_block
+    type: BOOL
+    domain: boolean
+    desc: True = refuse; false = warn and notify admins.
+    sens: Internal
+    default: 'true'
+  - name: effective_from_date
+    type: DATE
+    domain: date
+    desc: Limit start.
+    sens: Internal
+  - name: effective_to_date
+    type: DATE
+    domain: date
+    desc: Limit end.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended.
+  constraints:
+  - name: ck_spend_limit_dates
+    type: check
+    expr: effective_to_date IS NULL OR effective_to_date >= effective_from_date
+    desc: End not before start.
+  - name: ck_spend_limit_some_cap
+    type: check
+    expr: max_credits IS NOT NULL OR max_amount IS NOT NULL
+    desc: At least one cap.
+  - name: ck_spend_limit_caps_pos
+    type: check
+    expr: (max_credits IS NULL OR max_credits > 0) AND (max_amount IS NULL OR max_amount > 0)
+    desc: Positive caps.
+  indexes:
+  - name: idx_spend_limit_organisation_id_effective_from_date
+    columns:
+    - organisation_id
+    - effective_from_date DESC
+    desc: Limits in force for an org.
+  - name: idx_spend_limit_target_app_user_id
+    columns:
+    - target_app_user_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: target_app_user_id IS NOT NULL
+  - name: idx_spend_limit_licence_id
+    columns:
+    - licence_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: licence_id IS NOT NULL
+  - name: idx_spend_limit_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_spend_limit_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_spend_limit_spend_limit_scope_id
+    columns:
+    - spend_limit_scope_id
+    ref: spend_limit_scope
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_spend_limit_target_app_user_id
+    columns:
+    - target_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_spend_limit_licence_id
+    columns:
+    - licence_id
+    ref: licence
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_spend_limit_spend_limit_period_id
+    columns:
+    - spend_limit_period_id
+    ref: spend_limit_period
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_spend_limit_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: payment_order
+  kind: entity
+  delete_policy: soft
+  volume: high
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B44
+  - B47
+  - B76
+  retention: 'Financial: 8 years; gateway payload never stored here; erasure N/A (legal obligation), contact data lives elsewhere.'
+  description: 'Our record of an order for money at an external gateway: references, status, amount only - no card/bank data (integration boundary, docket sec. 6).'
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Paying organisation.
+    sens: Internal
+  - name: wallet_id
+    type: UUID
+    domain: identifier
+    desc: Wallet to credit on payment (recharge).
+    sens: Internal
+    'null': true
+    null_why: NULL unless purpose is wallet_recharge.
+  - name: subscription_id
+    type: UUID
+    domain: identifier
+    desc: Subscription being paid.
+    sens: Internal
+    'null': true
+    null_why: NULL unless purpose is subscription_fee.
+  - name: credit_pack_id
+    type: UUID
+    domain: identifier
+    desc: Pack purchased.
+    sens: Internal
+    'null': true
+    null_why: NULL unless a pack recharge.
+  - name: invoice_id
+    type: UUID
+    domain: identifier
+    desc: Invoice settled.
+    sens: Internal
+    'null': true
+    null_why: NULL until an invoice exists for the order.
+  - name: payment_purpose_id
+    type: UUID
+    domain: enum_ref
+    desc: Why the money is collected.
+    sens: Internal
+  - name: payment_gateway_id
+    type: UUID
+    domain: enum_ref
+    desc: Gateway used.
+    sens: Internal
+  - name: payment_order_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Current status (changes driven by verified webhooks).
+    sens: Internal
+  - name: amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Order amount, tax-inclusive, as sent to the gateway.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of the amount.
+    sens: Internal
+  - name: gateway_order_ref
+    type: STRING(100)
+    domain: token
+    desc: Gateway's order reference (e.g. order_xxx).
+    sens: Internal
+    'null': true
+    null_why: NULL until the gateway order is created (local row is written first).
+  - name: idempotency_key
+    type: STRING(120)
+    domain: token
+    desc: Client/server key making order creation replay-safe.
+    sens: Internal
+  - name: created_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: User who initiated checkout.
+    sens: Internal
+    'null': true
+    null_why: NULL = system (auto-renewal).
+  - name: expires_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Order expiry instant.
+    sens: Internal
+    'null': true
+    null_why: NULL = no expiry.
+  - name: paid_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Instant the gateway confirmed payment.
+    sens: Internal
+    'null': true
+    null_why: NULL = not paid.
+  - name: failure_code
+    type: STRING(64)
+    domain: code
+    desc: Gateway failure code (normalised).
+    sens: Internal
+    'null': true
+    null_why: NULL unless failed.
+  constraints:
+  - name: uq_payment_order_idempotency_key
+    type: unique
+    columns:
+    - idempotency_key
+    desc: Replay-safe order creation.
+  - name: uq_payment_order_gateway_order_ref
+    type: unique
+    columns:
+    - payment_gateway_id
+    - gateway_order_ref
+    desc: Gateway reference unique per gateway (NULLs distinct).
+  - name: ck_payment_order_amount_pos
+    type: check
+    expr: amount > 0
+    desc: Orders are positive.
+  - name: ck_payment_order_paid_after_created
+    type: check
+    expr: paid_at IS NULL OR paid_at >= created_at
+    desc: Payment cannot precede the order.
+  indexes:
+  - name: idx_payment_order_organisation_id_created_at
+    columns:
+    - organisation_id
+    - created_at DESC
+    desc: Org payment history.
+  - name: idx_payment_order_created_at
+    columns:
+    - created_at
+    desc: Time-ordered scans/reconciliation.
+    hash: true
+    bucket_count: 16
+  - name: idx_payment_order_payment_order_status_id_expires_at
+    columns:
+    - payment_order_status_id
+    - expires_at
+    desc: Expiry sweeper.
+    where: paid_at IS NULL
+  - name: idx_payment_order_wallet_id
+    columns:
+    - wallet_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: wallet_id IS NOT NULL
+  - name: idx_payment_order_subscription_id
+    columns:
+    - subscription_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: subscription_id IS NOT NULL
+  - name: idx_payment_order_credit_pack_id
+    columns:
+    - credit_pack_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: credit_pack_id IS NOT NULL
+  - name: idx_payment_order_invoice_id
+    columns:
+    - invoice_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: invoice_id IS NOT NULL
+  - name: idx_payment_order_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_payment_order_created_by_app_user_id
+    columns:
+    - created_by_app_user_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: created_by_app_user_id IS NOT NULL
+  fks:
+  - name: fk_payment_order_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_payment_order_wallet_id
+    columns:
+    - wallet_id
+    ref: wallet
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_payment_order_subscription_id
+    columns:
+    - subscription_id
+    ref: subscription
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_payment_order_credit_pack_id
+    columns:
+    - credit_pack_id
+    ref: credit_pack
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_payment_order_invoice_id
+    columns:
+    - invoice_id
+    ref: invoice
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_payment_order_payment_purpose_id
+    columns:
+    - payment_purpose_id
+    ref: payment_purpose
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_payment_order_payment_gateway_id
+    columns:
+    - payment_gateway_id
+    ref: payment_gateway
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_payment_order_payment_order_status_id
+    columns:
+    - payment_order_status_id
+    ref: payment_order_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_payment_order_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_payment_order_created_by_app_user_id
+    columns:
+    - created_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: payment_method_token
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  - B76
+  retention: Removed on customer request/expiry; token revoked at gateway; purged 90 days after soft delete.
+  description: 'Gateway-issued reusable instrument token (no PAN, no bank account): last4 and expiry for display only.'
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Owner of the instrument.
+    sens: Internal
+  - name: payment_gateway_id
+    type: UUID
+    domain: enum_ref
+    desc: Gateway that issued the token.
+    sens: Internal
+  - name: payment_method_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Instrument family.
+    sens: Internal
+  - name: token_ref
+    type: STRING(200)
+    domain: token
+    desc: Opaque gateway token / customer-source id.
+    sens: Sensitive
+    pii: vendor token only; AES-GCM app-layer encrypted at rest; never logged; useless outside our gateway account
+  - name: last4
+    type: STRING(4)
+    domain: code
+    desc: Last 4 digits for display.
+    sens: Personal
+    'null': true
+    null_why: NULL for UPI/netbanking (no digits).
+    pii: display-only masked data; access-controlled; shown to org billing admins only
+  - name: expiry_month
+    type: INT2
+    domain: quantity
+    desc: Card expiry month 1..12.
+    sens: Internal
+    'null': true
+    null_why: NULL for non-card instruments.
+  - name: expiry_year
+    type: INT2
+    domain: quantity
+    desc: Card expiry year.
+    sens: Internal
+    'null': true
+    null_why: NULL for non-card instruments.
+  - name: is_default
+    type: BOOL
+    domain: boolean
+    desc: Default instrument for auto-renewal.
+    sens: Internal
+    default: 'false'
+  - name: revoked_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Token revoked at gateway.
+    sens: Internal
+    'null': true
+    null_why: NULL = still valid.
+  constraints:
+  - name: uq_payment_method_token_gateway_token
+    type: unique
+    columns:
+    - payment_gateway_id
+    - token_ref
+    desc: A gateway token is stored once.
+  - name: ck_payment_method_token_expiry_range
+    type: check
+    expr: (expiry_month IS NULL OR (expiry_month BETWEEN 1 AND 12)) AND (expiry_month IS NULL) = (expiry_year IS NULL)
+    desc: Valid month; month/year together.
+  indexes:
+  - name: uq_payment_method_token_organisation_id_default
+    columns:
+    - organisation_id
+    desc: One default instrument per org.
+    unique: true
+    where: is_default AND deleted_at IS NULL
+  fks:
+  - name: fk_payment_method_token_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_payment_method_token_payment_gateway_id
+    columns:
+    - payment_gateway_id
+    ref: payment_gateway
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_payment_method_token_payment_method_kind_id
+    columns:
+    - payment_method_kind_id
+    ref: payment_method_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: payment_attempt
+  kind: entity
+  delete_policy: soft
+  volume: high
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: 8 years with the order.
+  description: One try at paying an order with an instrument; gateway payment reference and failure reason.
+  columns:
+  - name: payment_order_id
+    type: UUID
+    domain: identifier
+    desc: Order attempted.
+    sens: Internal
+  - name: attempt_no
+    type: INT4
+    domain: quantity
+    desc: 1-based attempt counter.
+    sens: Internal
+  - name: payment_attempt_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Attempt status.
+    sens: Internal
+  - name: payment_method_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Instrument family used.
+    sens: Internal
+  - name: payment_method_token_id
+    type: UUID
+    domain: identifier
+    desc: Stored instrument used.
+    sens: Internal
+    'null': true
+    null_why: NULL for one-off checkout without saving.
+  - name: gateway_payment_ref
+    type: STRING(100)
+    domain: token
+    desc: Gateway payment id (pay_xxx).
+    sens: Internal
+    'null': true
+    null_why: NULL until the gateway assigns it.
+  - name: error_code
+    type: STRING(64)
+    domain: code
+    desc: Normalised failure code.
+    sens: Internal
+    'null': true
+    null_why: NULL unless failed.
+  - name: error_message
+    type: STRING(300)
+    domain: free_text
+    desc: Gateway failure description (sanitised).
+    sens: Internal
+    'null': true
+    null_why: NULL unless failed.
+  - name: initiated_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Attempt start.
+    sens: Internal
+  - name: completed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Attempt end.
+    sens: Internal
+    'null': true
+    null_why: NULL = in flight.
+  constraints:
+  - name: uq_payment_attempt_payment_order_id_attempt_no
+    type: unique
+    columns:
+    - payment_order_id
+    - attempt_no
+    desc: Attempt number unique per order.
+  - name: ck_payment_attempt_attempt_pos
+    type: check
+    expr: attempt_no > 0 AND (completed_at IS NULL OR completed_at >= initiated_at)
+    desc: Sane counters/times.
+  indexes:
+  - name: uq_payment_attempt_gateway_payment_ref_set
+    columns:
+    - gateway_payment_ref
+    desc: Webhook correlation.
+    unique: true
+    where: gateway_payment_ref IS NOT NULL
+    where_why: gateway payment ids are never reused; soft-deleted attempts keep their reference reserved
+  - name: idx_payment_attempt_initiated_at
+    columns:
+    - initiated_at
+    desc: Time-ordered scans without hot range.
+    hash: true
+    bucket_count: 8
+  - name: idx_payment_attempt_payment_method_token_id
+    columns:
+    - payment_method_token_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: payment_method_token_id IS NOT NULL
+  fks:
+  - name: fk_payment_attempt_payment_order_id
+    columns:
+    - payment_order_id
+    ref: payment_order
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_payment_attempt_payment_attempt_status_id
+    columns:
+    - payment_attempt_status_id
+    ref: payment_attempt_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_payment_attempt_payment_method_kind_id
+    columns:
+    - payment_method_kind_id
+    ref: payment_method_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_payment_attempt_payment_method_token_id
+    columns:
+    - payment_method_token_id
+    ref: payment_method_token
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: payment_event
+  kind: event
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B44
+  - B47
+  - B76
+  retention: Sanitised payload kept 540 days by row TTL, then gone; processing metadata survives in payment_event_outcome and the order.
+  description: Inbound gateway webhook stored once (idempotent on gateway_event_ref); processing result recorded in payment_event_outcome.
+  columns:
+  - name: payment_gateway_id
+    type: UUID
+    domain: enum_ref
+    desc: Source gateway.
+    sens: Internal
+  - name: gateway_event_ref
+    type: STRING(120)
+    domain: token
+    desc: Gateway event id used for dedupe.
+    sens: Internal
+  - name: event_type
+    type: STRING(64)
+    domain: code
+    desc: Gateway event name (e.g. payment.captured).
+    sens: Internal
+  - name: payment_order_id
+    type: UUID
+    domain: identifier
+    desc: Matched order.
+    sens: Internal
+    'null': true
+    null_why: NULL when unmatched at receipt.
+  - name: payload
+    type: JSONB
+    domain: json
+    desc: Sanitised JSON body (card/bank/VPA fields stripped before insert).
+    sens: Sensitive
+    pii: allow-listed fields only; stripped of card/bank/VPA data at ingestion; encrypted at rest; TTL 540 days
+  - name: signature_valid
+    type: BOOL
+    domain: boolean
+    desc: HMAC signature verification result.
+    sens: Internal
+    default: 'false'
+  - name: received_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Receipt instant.
+    sens: Internal
+  constraints:
+  - name: uq_payment_event_gateway_event_ref
+    type: unique
+    columns:
+    - payment_gateway_id
+    - gateway_event_ref
+    desc: Idempotent webhook ingestion.
+  indexes:
+  - name: idx_payment_event_received_at
+    columns:
+    - received_at
+    desc: Time-ordered scans.
+    hash: true
+    bucket_count: 16
+  - name: idx_payment_event_payment_order_id_received_at
+    columns:
+    - payment_order_id
+    - received_at
+    desc: Events of an order.
+    where: payment_order_id IS NOT NULL
+  fks:
+  - name: fk_payment_event_payment_gateway_id
+    columns:
+    - payment_gateway_id
+    ref: payment_gateway
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_payment_event_payment_order_id
+    columns:
+    - payment_order_id
+    ref: payment_order
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  ttl:
+    expire_after: 540 days
+    column: received_at
+- name: payment_event_outcome
+  kind: event
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Append-only; 8 years (lean rows).
+  description: Result of processing a webhook event (one row per processing try); keeps payment_event immutable.
+  columns:
+  - name: payment_event_id
+    type: UUID
+    domain: identifier
+    desc: Event processed.
+    sens: Internal
+    'null': true
+    null_why: NULL = the raw payment_event row aged out of its 540-day TTL; the outcome row keeps provider reference and result.
+  - name: webhook_outcome_id
+    type: UUID
+    domain: enum_ref
+    desc: Processing result.
+    sens: Internal
+  - name: processed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Processing instant.
+    sens: Internal
+  - name: detail
+    type: STRING(300)
+    domain: free_text
+    desc: Short diagnostic.
+    sens: Internal
+    'null': true
+    null_why: NULL on clean success.
+  constraints: []
+  indexes:
+  - name: idx_payment_event_outcome_payment_event_id_processed_at
+    columns:
+    - payment_event_id
+    - processed_at
+    desc: Outcomes of an event.
+  - name: idx_payment_event_outcome_processed_at
+    columns:
+    - processed_at
+    desc: Time scans.
+    hash: true
+    bucket_count: 16
+  fks:
+  - name: fk_payment_event_outcome_payment_event_id
+    columns:
+    - payment_event_id
+    ref: payment_event
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+  - name: fk_payment_event_outcome_webhook_outcome_id
+    columns:
+    - webhook_outcome_id
+    ref: webhook_outcome
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: refund
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B44
+  - B47
+  retention: 'Financial: 8 years.'
+  description: Refund of a payment order (money back at gateway) and/or credit clawback via ledger entries.
+  columns:
+  - name: payment_order_id
+    type: UUID
+    domain: identifier
+    desc: Order refunded.
+    sens: Internal
+  - name: refund_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Workflow status.
+    sens: Internal
+  - name: refund_reason_id
+    type: UUID
+    domain: enum_ref
+    desc: Reason.
+    sens: Internal
+  - name: amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Money refunded (tax-inclusive).
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency (equals order currency).
+    sens: Internal
+  - name: credits_clawed_back
+    type: INT8
+    domain: quantity
+    desc: Credits removed from the wallet through a refund ledger entry.
+    sens: Internal
+    'null': true
+    null_why: NULL = refund of a non-wallet payment.
+  - name: gateway_refund_ref
+    type: STRING(100)
+    domain: token
+    desc: Gateway refund id.
+    sens: Internal
+    'null': true
+    null_why: NULL until the gateway accepts it.
+  - name: idempotency_key
+    type: STRING(120)
+    domain: token
+    desc: Replay-safe refund creation.
+    sens: Internal
+  - name: requested_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Requester.
+    sens: Internal
+  - name: approved_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Approver (four-eyes).
+    sens: Internal
+    'null': true
+    null_why: NULL until approved.
+  - name: processed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Gateway completion.
+    sens: Internal
+    'null': true
+    null_why: NULL = not completed.
+  constraints:
+  - name: uq_refund_idempotency_key
+    type: unique
+    columns:
+    - idempotency_key
+    desc: Replay safety.
+  - name: uq_refund_gateway_refund_ref
+    type: unique
+    columns:
+    - gateway_refund_ref
+    desc: Gateway ref unique when present.
+  - name: ck_refund_amount_pos
+    type: check
+    expr: amount > 0
+    desc: Positive.
+  - name: ck_refund_four_eyes
+    type: check
+    expr: approved_by_app_user_id IS NULL OR approved_by_app_user_id <> requested_by_app_user_id
+    desc: Approver differs from requester.
+  - name: ck_refund_credits_pos
+    type: check
+    expr: credits_clawed_back IS NULL OR credits_clawed_back > 0
+    desc: Positive credits.
+  indexes:
+  - name: idx_refund_payment_order_id
+    columns:
+    - payment_order_id
+    desc: Refunds per order (sum <= paid amount checked under order lock).
+  - name: idx_refund_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_refund_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_refund_approved_by_app_user_id
+    columns:
+    - approved_by_app_user_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: approved_by_app_user_id IS NOT NULL
+  fks:
+  - name: fk_refund_payment_order_id
+    columns:
+    - payment_order_id
+    ref: payment_order
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_refund_refund_status_id
+    columns:
+    - refund_status_id
+    ref: refund_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_refund_refund_reason_id
+    columns:
+    - refund_reason_id
+    ref: refund_reason
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_refund_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_refund_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_refund_approved_by_app_user_id
+    columns:
+    - approved_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: invoice_number_series
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  - B47
+  retention: Never deleted; closed series kept permanently (statutory numbering evidence).
+  description: Gapless numbering counter per seller country, document kind and fiscal year; next_number locked FOR UPDATE at issue.
+  columns:
+  - name: seller_country_id
+    type: UUID
+    domain: identifier
+    desc: Country whose tax law governs the series.
+    sens: Internal
+  - name: series_document_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Invoice or credit note series.
+    sens: Internal
+  - name: prefix
+    type: STRING(16)
+    domain: code
+    desc: Printed prefix (e.g. TLG/IN).
+    sens: Internal
+  - name: fiscal_year_label
+    type: STRING(9)
+    domain: code
+    desc: Fiscal year label (2026-27).
+    sens: Internal
+  - name: next_number
+    type: INT8
+    domain: quantity
+    desc: Next number to hand out; incremented in the issuing txn.
+    sens: Internal
+    default: '1'
+  - name: is_open
+    type: BOOL
+    domain: boolean
+    desc: False once the fiscal year is closed.
+    sens: Internal
+    default: 'true'
+  constraints:
+  - name: uq_invoice_number_series_country_kind_prefix_year
+    type: unique
+    columns:
+    - seller_country_id
+    - series_document_kind_id
+    - prefix
+    - fiscal_year_label
+    desc: One series per country/kind/prefix/year.
+  - name: ck_invoice_number_series_next_pos
+    type: check
+    expr: next_number >= 1
+    desc: Counter positive.
+  indexes: []
+  fks:
+  - name: fk_invoice_number_series_seller_country_id
+    columns:
+    - seller_country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_number_series_series_document_kind_id
+    columns:
+    - series_document_kind_id
+    ref: series_document_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: tax_rate
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Date-effective history 10 years (tax audits).
+  description: Tax rate per country (and state for GST place-of-supply) and component, date-effective.
+  columns:
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Taxing country.
+    sens: Internal
+  - name: state_region_id
+    type: UUID
+    domain: identifier
+    desc: State (GST intra-state components).
+    sens: Internal
+    'null': true
+    null_why: NULL = whole country.
+  - name: tax_component_id
+    type: UUID
+    domain: enum_ref
+    desc: CGST/SGST/IGST/VAT...
+    sens: Internal
+  - name: rate_percent
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Rate in percent.
+    sens: Internal
+  - name: hsn_sac_code
+    type: STRING(10)
+    domain: code
+    desc: HSN/SAC classification the rate applies to.
+    sens: Internal
+    'null': true
+    null_why: NULL = all services.
+  - name: effective_from_date
+    type: DATE
+    domain: date
+    desc: Rate start date.
+    sens: Internal
+  - name: effective_to_date
+    type: DATE
+    domain: date
+    desc: Rate end date.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended.
+  constraints:
+  - name: ck_tax_rate_rate_range
+    type: check
+    expr: rate_percent >= 0 AND rate_percent <= 100
+    desc: 0..100.
+  - name: ck_tax_rate_dates
+    type: check
+    expr: effective_to_date IS NULL OR effective_to_date >= effective_from_date
+    desc: End not before start.
+  indexes:
+  - name: uq_tax_rate_country_id_component_from_national
+    columns:
+    - country_id
+    - tax_component_id
+    - effective_from_date
+    desc: One national rate per component/start.
+    unique: true
+    where: state_region_id IS NULL AND hsn_sac_code IS NULL
+  - name: uq_tax_rate_state_region_id_component_from
+    columns:
+    - state_region_id
+    - tax_component_id
+    - effective_from_date
+    desc: One state rate per component/start.
+    unique: true
+    where: state_region_id IS NOT NULL AND hsn_sac_code IS NULL
+  fks:
+  - name: fk_tax_rate_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_tax_rate_state_region_id
+    columns:
+    - state_region_id
+    ref: state_region
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_tax_rate_tax_component_id
+    columns:
+    - tax_component_id
+    ref: tax_component
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: billing_address
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B44
+  - B76
+  retention: Kept while the organisation exists and 8 years for invoices (invoices snapshot the address); anonymised on erasure where no invoice depends.
+  description: Billing address of an organisation (invoice recipient).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Owner.
+    sens: Internal
+  - name: address_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Address type (billing/registered).
+    sens: Internal
+  - name: legal_name
+    type: STRING(200)
+    domain: free_text
+    desc: Name printed on invoices.
+    sens: Personal
+    pii: may be an individual's name; access-controlled; masked outside billing roles
+  - name: address_line1
+    type: STRING(200)
+    domain: free_text
+    desc: Street line 1.
+    sens: Personal
+    pii: access-controlled; encrypted at rest at storage layer
+  - name: address_line2
+    type: STRING(200)
+    domain: free_text
+    desc: Street line 2.
+    sens: Personal
+    'null': true
+    null_why: NULL = not applicable.
+    pii: access-controlled; encrypted at rest at storage layer
+  - name: city_id
+    type: UUID
+    domain: identifier
+    desc: City.
+    sens: Internal
+  - name: state_region_id
+    type: UUID
+    domain: identifier
+    desc: State (drives GST place of supply).
+    sens: Internal
+    'null': true
+    null_why: NULL for countries without states.
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Country.
+    sens: Internal
+  - name: postal_code
+    type: STRING(16)
+    domain: free_text
+    desc: PIN/ZIP.
+    sens: Personal
+    'null': true
+    null_why: NULL where the country has no postal code.
+    pii: access-controlled; shown only to billing roles
+  - name: is_default
+    type: BOOL
+    domain: boolean
+    desc: Default billing address.
+    sens: Internal
+    default: 'false'
+  constraints: []
+  indexes:
+  - name: uq_billing_address_organisation_id_default
+    columns:
+    - organisation_id
+    desc: One default billing address per org.
+    unique: true
+    where: is_default AND deleted_at IS NULL
+  - name: idx_billing_address_address_type_id
+    columns:
+    - address_type_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_billing_address_city_id
+    columns:
+    - city_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_billing_address_state_region_id
+    columns:
+    - state_region_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: state_region_id IS NOT NULL
+  - name: idx_billing_address_country_id
+    columns:
+    - country_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_billing_address_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_billing_address_address_type_id
+    columns:
+    - address_type_id
+    ref: address_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_billing_address_city_id
+    columns:
+    - city_id
+    ref: city
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_billing_address_state_region_id
+    columns:
+    - state_region_id
+    ref: state_region
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_billing_address_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: tax_registration
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B44
+  - B76
+  retention: While the organisation is a customer + 8 years; ciphertext purged on erasure after the statutory period.
+  description: Organisation's tax registration (GSTIN/VAT/PAN) - Sensitive, ciphertext + blind index only.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Owner.
+    sens: Internal
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Issuing country.
+    sens: Internal
+  - name: state_region_id
+    type: UUID
+    domain: identifier
+    desc: Registration state (GSTIN state).
+    sens: Internal
+    'null': true
+    null_why: NULL where registration is national.
+  - name: tax_id_type_id
+    type: UUID
+    domain: identifier
+    desc: Type (GSTIN, VAT, PAN...).
+    sens: Internal
+  - name: tax_number_encrypted
+    type: BYTES
+    domain: encrypted
+    desc: Tax number ciphertext.
+    sens: Sensitive
+    pii: AES-GCM envelope encryption (KMS data key); format/checksum validated (GSTIN regex + mod-36 checksum) before encryption
+  - name: tax_number_hmac
+    type: BYTES
+    domain: token
+    desc: HMAC-SHA256 blind index for duplicate detection/lookup.
+    sens: Sensitive
+    pii: keyed HMAC, not reversible without the key; equality lookups only
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Verified against the tax portal or not.
+    sens: Internal
+  - name: verified_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Verification instant.
+    sens: Internal
+    'null': true
+    null_why: NULL = not verified.
+  constraints: []
+  indexes:
+  - name: uq_tax_registration_country_id_type_hmac
+    columns:
+    - country_id
+    - tax_id_type_id
+    - tax_number_hmac
+    desc: A tax number registers once among live rows.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_tax_registration_organisation_id
+    columns:
+    - organisation_id
+    desc: Org registrations.
+  - name: idx_tax_registration_state_region_id
+    columns:
+    - state_region_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: state_region_id IS NOT NULL
+  - name: idx_tax_registration_tax_id_type_id
+    columns:
+    - tax_id_type_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_tax_registration_verification_status_id
+    columns:
+    - verification_status_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_tax_registration_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_tax_registration_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_tax_registration_state_region_id
+    columns:
+    - state_region_id
+    ref: state_region
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_tax_registration_tax_id_type_id
+    columns:
+    - tax_id_type_id
+    ref: tax_id_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_tax_registration_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: currency_exchange_rate
+  kind: config
+  delete_policy: append_only
+  volume: medium
+  tier: X
+  milestones:
+  - B38
+  - B44
+  retention: Append-only history kept 10 years (tax/finance audit); corrections are new rows with a later fetched_at.
+  description: Date-effective FX rate (owned here; invoicing and analytics read it).
+  columns:
+  - name: base_currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency being priced.
+    sens: Internal
+  - name: quote_currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency it is quoted in.
+    sens: Internal
+  - name: rate_date
+    type: DATE
+    domain: date
+    desc: Date the rate applies to.
+    sens: Internal
+  - name: rate
+    type: DECIMAL(18,8)
+    domain: measure
+    desc: Units of quote currency per 1 base unit.
+    sens: Internal
+  - name: exchange_rate_source_id
+    type: UUID
+    domain: enum_ref
+    desc: Provider.
+    sens: Internal
+  - name: fetched_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Instant the rate was fetched.
+    sens: Internal
+  constraints:
+  - name: uq_currency_exchange_rate_pair_date_source_fetched
+    type: unique
+    columns:
+    - base_currency_id
+    - quote_currency_id
+    - rate_date
+    - exchange_rate_source_id
+    - fetched_at
+    desc: Rate versions never collide.
+  - name: ck_currency_exchange_rate_rate_pos
+    type: check
+    expr: rate > 0 AND base_currency_id <> quote_currency_id
+    desc: Positive and a real pair.
+  indexes:
+  - name: idx_currency_exchange_rate_quote_currency_id
+    columns:
+    - quote_currency_id
+    desc: Reverse lookup.
+  fks:
+  - name: fk_currency_exchange_rate_base_currency_id
+    columns:
+    - base_currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_currency_exchange_rate_quote_currency_id
+    columns:
+    - quote_currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_currency_exchange_rate_exchange_rate_source_id
+    columns:
+    - exchange_rate_source_id
+    ref: exchange_rate_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: invoice
+  kind: entity
+  delete_policy: soft
+  volume: high
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B44
+  - B47
+  retention: 'Statutory: 8 years minimum; voided invoices keep their number.'
+  description: Tax invoice; number assigned at issue from invoice_number_series (gapless); totals; snapshot of buyer identity.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Customer.
+    sens: Internal
+  - name: subscription_id
+    type: UUID
+    domain: identifier
+    desc: Subscription billed.
+    sens: Internal
+    'null': true
+    null_why: NULL for pure wallet-recharge invoices.
+  - name: invoice_number_series_id
+    type: UUID
+    domain: identifier
+    desc: Series the number comes from.
+    sens: Internal
+  - name: invoice_number
+    type: INT8
+    domain: quantity
+    desc: Number within the series, assigned at issue.
+    sens: Internal
+    'null': true
+    null_why: NULL while draft (numbers are never reserved for drafts, keeping the series gapless).
+  - name: invoice_label
+    type: STRING(40)
+    domain: code
+    desc: Printed number prefix/FY/number, e.g. TLG/IN/2026-27/000123.
+    sens: Internal
+    'null': true
+    null_why: NULL while draft.
+  - name: invoice_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Lifecycle status.
+    sens: Internal
+  - name: billing_address_id
+    type: UUID
+    domain: identifier
+    desc: Buyer address (also snapshotted in address_snapshot).
+    sens: Internal
+  - name: buyer_tax_registration_id
+    type: UUID
+    domain: identifier
+    desc: Buyer tax registration used.
+    sens: Internal
+    'null': true
+    null_why: NULL = unregistered buyer (B2C).
+  - name: seller_tax_registration_id
+    type: UUID
+    domain: identifier
+    desc: Seller registration (our GSTIN).
+    sens: Internal
+  - name: place_of_supply_state_region_id
+    type: UUID
+    domain: identifier
+    desc: GST place of supply.
+    sens: Internal
+    'null': true
+    null_why: NULL for non-GST jurisdictions.
+  - name: address_snapshot
+    type: JSONB
+    domain: json
+    desc: Buyer name/address/tax text frozen at issue.
+    sens: Personal
+    pii: copied from billing_address; access-controlled; retained for the statutory period, anonymised only after it
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Invoice currency.
+    sens: Internal
+  - name: currency_exchange_rate_id
+    type: UUID
+    domain: identifier
+    desc: FX rate used for GST INR conversion / base-currency reporting.
+    sens: Internal
+    'null': true
+    null_why: NULL = invoice already in the reporting currency.
+  - name: subtotal_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Sum of line net amounts.
+    sens: Internal
+  - name: tax_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Sum of tax lines.
+    sens: Internal
+  - name: total_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: subtotal + tax.
+    sens: Internal
+  - name: amount_paid
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Settled so far.
+    sens: Internal
+    default: '0'
+  - name: issue_date
+    type: DATE
+    domain: date
+    desc: Issue date.
+    sens: Internal
+    'null': true
+    null_why: NULL while draft.
+  - name: due_date
+    type: DATE
+    domain: date
+    desc: Payment due date.
+    sens: Internal
+    'null': true
+    null_why: NULL while draft or for prepaid invoices.
+  - name: issued_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Issue instant.
+    sens: Internal
+    'null': true
+    null_why: NULL while draft.
+  - name: voided_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Void instant.
+    sens: Internal
+    'null': true
+    null_why: NULL = not voided.
+  constraints:
+  - name: uq_invoice_series_number
+    type: unique
+    columns:
+    - invoice_number_series_id
+    - invoice_number
+    desc: Gapless-per-series uniqueness (NULL drafts distinct).
+  - name: uq_invoice_invoice_label
+    type: unique
+    columns:
+    - invoice_label
+    desc: Printed label unique.
+  - name: ck_invoice_totals
+    type: check
+    expr: total_amount = subtotal_amount + tax_amount AND subtotal_amount >= 0 AND tax_amount >= 0
+    desc: Arithmetic integrity.
+  - name: ck_invoice_paid_bounds
+    type: check
+    expr: amount_paid >= 0 AND amount_paid <= total_amount
+    desc: Cannot overpay an invoice (overpayment goes to wallet/credit note).
+  - name: ck_invoice_number_issued
+    type: check
+    expr: (invoice_number IS NULL) = (issued_at IS NULL) AND (invoice_number IS NULL) = (invoice_label IS NULL) AND (invoice_number IS NULL) = (issue_date IS NULL)
+    desc: Number, label, issue date and instant appear together at issue.
+  - name: ck_invoice_due_after_issue
+    type: check
+    expr: due_date IS NULL OR issue_date IS NULL OR due_date >= issue_date
+    desc: Due not before issue.
+  indexes:
+  - name: idx_invoice_organisation_id_created_at
+    columns:
+    - organisation_id
+    - created_at DESC
+    desc: Customer invoice list.
+  - name: idx_invoice_due_date_open
+    columns:
+    - due_date
+    desc: Overdue/dunning scan.
+    where: voided_at IS NULL AND due_date IS NOT NULL
+  - name: idx_invoice_created_at
+    columns:
+    - created_at
+    desc: Time scans.
+    hash: true
+    bucket_count: 8
+  - name: idx_invoice_subscription_id
+    columns:
+    - subscription_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: subscription_id IS NOT NULL
+  - name: idx_invoice_billing_address_id
+    columns:
+    - billing_address_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_invoice_buyer_tax_registration_id
+    columns:
+    - buyer_tax_registration_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: buyer_tax_registration_id IS NOT NULL
+  - name: idx_invoice_seller_tax_registration_id
+    columns:
+    - seller_tax_registration_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_invoice_place_of_supply_state_region_id
+    columns:
+    - place_of_supply_state_region_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: place_of_supply_state_region_id IS NOT NULL
+  - name: idx_invoice_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_invoice_currency_exchange_rate_id
+    columns:
+    - currency_exchange_rate_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: currency_exchange_rate_id IS NOT NULL
+  fks:
+  - name: fk_invoice_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_subscription_id
+    columns:
+    - subscription_id
+    ref: subscription
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_invoice_number_series_id
+    columns:
+    - invoice_number_series_id
+    ref: invoice_number_series
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_invoice_status_id
+    columns:
+    - invoice_status_id
+    ref: invoice_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_invoice_billing_address_id
+    columns:
+    - billing_address_id
+    ref: billing_address
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_buyer_tax_registration_id
+    columns:
+    - buyer_tax_registration_id
+    ref: tax_registration
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_seller_tax_registration_id
+    columns:
+    - seller_tax_registration_id
+    ref: tax_registration
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_place_of_supply_state_region_id
+    columns:
+    - place_of_supply_state_region_id
+    ref: state_region
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_currency_exchange_rate_id
+    columns:
+    - currency_exchange_rate_id
+    ref: currency_exchange_rate
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: invoice_line
+  kind: entity
+  delete_policy: hard
+  volume: high
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Deleted only with a draft invoice; issued lines 8 years.
+  description: 'Invoice line: item, quantity, unit price, net amount.'
+  columns:
+  - name: invoice_id
+    type: UUID
+    domain: identifier
+    desc: Parent invoice.
+    sens: Internal
+  - name: line_no
+    type: INT4
+    domain: quantity
+    desc: 1-based line number.
+    sens: Internal
+  - name: invoice_line_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Line kind.
+    sens: Internal
+  - name: description
+    type: STRING(300)
+    domain: free_text
+    desc: Printed description.
+    sens: Internal
+  - name: hsn_sac_code
+    type: STRING(10)
+    domain: code
+    desc: HSN/SAC code.
+    sens: Internal
+    'null': true
+    null_why: NULL where not required.
+  - name: quantity
+    type: INT4
+    domain: quantity
+    desc: Units.
+    sens: Internal
+  - name: unit_price
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Price per unit (negative allowed for discount lines).
+    sens: Internal
+  - name: net_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: quantity x unit_price.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Line currency (equals invoice).
+    sens: Internal
+  - name: subscription_period_id
+    type: UUID
+    domain: identifier
+    desc: Period billed by this line.
+    sens: Internal
+    'null': true
+    null_why: NULL for non-period lines.
+  - name: credit_pack_id
+    type: UUID
+    domain: identifier
+    desc: Pack sold by this line.
+    sens: Internal
+    'null': true
+    null_why: NULL for non-pack lines.
+  constraints:
+  - name: uq_invoice_line_invoice_id_line_no
+    type: unique
+    columns:
+    - invoice_id
+    - line_no
+    desc: Line numbering.
+  - name: ck_invoice_line_qty_pos
+    type: check
+    expr: quantity > 0
+    desc: Positive quantity.
+  - name: ck_invoice_line_net_math
+    type: check
+    expr: net_amount = quantity * unit_price
+    desc: Arithmetic integrity.
+  indexes:
+  - name: idx_invoice_line_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_invoice_line_subscription_period_id
+    columns:
+    - subscription_period_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: subscription_period_id IS NOT NULL
+  - name: idx_invoice_line_credit_pack_id
+    columns:
+    - credit_pack_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: credit_pack_id IS NOT NULL
+  fks:
+  - name: fk_invoice_line_invoice_id
+    columns:
+    - invoice_id
+    ref: invoice
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: draft lines go with the draft; issued invoices are soft-only so never cascade in practice
+  - name: fk_invoice_line_invoice_line_kind_id
+    columns:
+    - invoice_line_kind_id
+    ref: invoice_line_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_invoice_line_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_line_subscription_period_id
+    columns:
+    - subscription_period_id
+    ref: subscription_period
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_line_credit_pack_id
+    columns:
+    - credit_pack_id
+    ref: credit_pack
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  no_hash_why: always accessed by invoice_id (random UUID spreads writes); no time-ordered index exists
+- name: invoice_tax_line
+  kind: entity
+  delete_policy: hard
+  volume: high
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: Same as the invoice line.
+  description: Tax per invoice line and component (CGST+SGST or IGST or VAT) with the rate applied.
+  columns:
+  - name: invoice_line_id
+    type: UUID
+    domain: identifier
+    desc: Line taxed.
+    sens: Internal
+  - name: tax_component_id
+    type: UUID
+    domain: enum_ref
+    desc: Component.
+    sens: Internal
+  - name: tax_rate_id
+    type: UUID
+    domain: identifier
+    desc: Rate row applied (traceability).
+    sens: Internal
+  - name: rate_percent
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Rate snapshot.
+    sens: Internal
+  - name: taxable_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Base the tax is computed on.
+    sens: Internal
+  - name: tax_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Tax charged.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency (equals invoice).
+    sens: Internal
+  constraints:
+  - name: uq_invoice_tax_line_line_component
+    type: unique
+    columns:
+    - invoice_line_id
+    - tax_component_id
+    desc: One row per component per line.
+  - name: ck_invoice_tax_line_rate_range
+    type: check
+    expr: rate_percent >= 0 AND rate_percent <= 100
+    desc: 0..100.
+  - name: ck_invoice_tax_line_tax_math
+    type: check
+    expr: abs(tax_amount - taxable_amount * rate_percent / 100) <= 0.01
+    desc: Tax equals base x rate within one minor unit.
+  indexes:
+  - name: idx_invoice_tax_line_tax_rate_id
+    columns:
+    - tax_rate_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_invoice_tax_line_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_invoice_tax_line_invoice_line_id
+    columns:
+    - invoice_line_id
+    ref: invoice_line
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: tax lines have no life outside their line
+  - name: fk_invoice_tax_line_tax_component_id
+    columns:
+    - tax_component_id
+    ref: tax_component
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_invoice_tax_line_tax_rate_id
+    columns:
+    - tax_rate_id
+    ref: tax_rate
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_invoice_tax_line_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  no_hash_why: accessed by invoice_line_id only; no time-ordered index
+- name: credit_note
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B38
+  - B44
+  retention: 'Statutory: 8 years.'
+  description: Credit note against an invoice (correction/refund); numbered from its own gapless series.
+  columns:
+  - name: invoice_id
+    type: UUID
+    domain: identifier
+    desc: Invoice corrected.
+    sens: Internal
+  - name: invoice_number_series_id
+    type: UUID
+    domain: identifier
+    desc: Credit-note series.
+    sens: Internal
+  - name: credit_note_number
+    type: INT8
+    domain: quantity
+    desc: Number in series.
+    sens: Internal
+  - name: credit_note_label
+    type: STRING(40)
+    domain: code
+    desc: Printed number.
+    sens: Internal
+  - name: credit_note_reason_id
+    type: UUID
+    domain: enum_ref
+    desc: Why issued.
+    sens: Internal
+  - name: refund_id
+    type: UUID
+    domain: identifier
+    desc: Refund that repays it.
+    sens: Internal
+    'null': true
+    null_why: NULL = credit-only (applied to future invoices/wallet).
+  - name: subtotal_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Net credited.
+    sens: Internal
+  - name: tax_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Tax credited.
+    sens: Internal
+  - name: total_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Total credited.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency.
+    sens: Internal
+  - name: issue_date
+    type: DATE
+    domain: date
+    desc: Issue date.
+    sens: Internal
+  constraints:
+  - name: uq_credit_note_series_number
+    type: unique
+    columns:
+    - invoice_number_series_id
+    - credit_note_number
+    desc: Gapless per series.
+  - name: uq_credit_note_credit_note_label
+    type: unique
+    columns:
+    - credit_note_label
+    desc: Printed label unique.
+  - name: ck_credit_note_totals
+    type: check
+    expr: total_amount = subtotal_amount + tax_amount AND total_amount > 0 AND subtotal_amount >= 0 AND tax_amount >= 0
+    desc: Arithmetic integrity.
+  indexes:
+  - name: idx_credit_note_invoice_id
+    columns:
+    - invoice_id
+    desc: Credit notes per invoice (sum <= invoice total checked under invoice lock).
+  - name: idx_credit_note_refund_id
+    columns:
+    - refund_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: refund_id IS NOT NULL
+  - name: idx_credit_note_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_credit_note_invoice_id
+    columns:
+    - invoice_id
+    ref: invoice
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_credit_note_invoice_number_series_id
+    columns:
+    - invoice_number_series_id
+    ref: invoice_number_series
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_credit_note_credit_note_reason_id
+    columns:
+    - credit_note_reason_id
+    ref: credit_note_reason
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_credit_note_refund_id
+    columns:
+    - refund_id
+    ref: refund
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_credit_note_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: profile_download
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B38
+  - B41
+  - B44
+  - B47
+  - B76
+  retention: Append-only, 7 years (employer dispute window); candidate erasure anonymises candidate_profile, rows stay as a record of what was disclosed.
+  description: 'Profile download history (Tier-1): which recruiter downloaded which candidate profile, when, and under which credit deduction or free quota.'
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Tenant that downloaded.
+    sens: Internal
+  - name: actor_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Recruiter performing the download.
+    sens: Internal
+  - name: candidate_profile_id
+    type: UUID
+    domain: identifier
+    desc: Candidate downloaded.
+    sens: Internal
+  - name: resume_id
+    type: UUID
+    domain: identifier
+    desc: Resume file downloaded.
+    sens: Internal
+    'null': true
+    null_why: NULL when profile data/contact was downloaded without a resume file.
+  - name: download_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: What was downloaded.
+    sens: Internal
+  - name: download_source_id
+    type: UUID
+    domain: enum_ref
+    desc: Where the download started.
+    sens: Internal
+  - name: device_session_id
+    type: UUID
+    domain: identifier
+    desc: Session/device used.
+    sens: Internal
+    'null': true
+    null_why: NULL for API/system downloads without an interactive session.
+  - name: wallet_ledger_entry_id
+    type: UUID
+    domain: identifier
+    desc: Credit deduction paying for this download.
+    sens: Internal
+    'null': true
+    null_why: NULL when free (quota entitlement or repeat of a paid download).
+  - name: subscription_entitlement_id
+    type: UUID
+    domain: identifier
+    desc: Free-quota counter consumed.
+    sens: Internal
+    'null': true
+    null_why: NULL when paid by credits or a free repeat.
+  - name: prior_profile_download_id
+    type: UUID
+    domain: identifier
+    desc: Earlier paid download this one repeats at no charge.
+    sens: Internal
+    'null': true
+    null_why: NULL unless this is a free repeat.
+  - name: credits_charged
+    type: INT4
+    domain: quantity
+    desc: Credits deducted (0 if free).
+    sens: Internal
+  - name: downloaded_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Download instant.
+    sens: Internal
+  - name: idempotency_key
+    type: STRING(120)
+    domain: token
+    desc: Client request key; replay returns the existing row.
+    sens: Internal
+  constraints:
+  - name: uq_profile_download_idempotency_key
+    type: unique
+    columns:
+    - idempotency_key
+    desc: Replay safe.
+  - name: uq_profile_download_wallet_ledger_entry_id
+    type: unique
+    columns:
+    - wallet_ledger_entry_id
+    desc: A deduction pays for at most one download (NULLs distinct).
+  - name: ck_profile_download_payer_exactly_one
+    type: check
+    expr: num_nonnulls(wallet_ledger_entry_id, subscription_entitlement_id, prior_profile_download_id) = 1
+    desc: Exactly one of paid / free quota / free repeat.
+  - name: ck_profile_download_credits_consistent
+    type: check
+    expr: (credits_charged > 0) = (wallet_ledger_entry_id IS NOT NULL) AND credits_charged >= 0
+    desc: Credits charged iff a ledger deduction exists.
+  indexes:
+  - name: idx_profile_download_organisation_id_candidate_profile_id_downloaded_at
+    columns:
+    - organisation_id
+    - candidate_profile_id
+    - downloaded_at DESC
+    desc: '''Already downloaded?'' check and per-candidate history.'
+  - name: idx_profile_download_actor_app_user_id_downloaded_at
+    columns:
+    - actor_app_user_id
+    - downloaded_at DESC
+    desc: Recruiter activity/spend report.
+  - name: idx_profile_download_downloaded_at
+    columns:
+    - downloaded_at
+    desc: Time-ordered scans without a hot range.
+    hash: true
+    bucket_count: 16
+  - name: idx_profile_download_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    desc: Candidate access report (who downloaded me).
+  - name: idx_profile_download_resume_id
+    columns:
+    - resume_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: resume_id IS NOT NULL
+  - name: idx_profile_download_device_session_id
+    columns:
+    - device_session_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: device_session_id IS NOT NULL
+  - name: idx_profile_download_subscription_entitlement_id
+    columns:
+    - subscription_entitlement_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: subscription_entitlement_id IS NOT NULL
+  - name: idx_profile_download_prior_profile_download_id
+    columns:
+    - prior_profile_download_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: prior_profile_download_id IS NOT NULL
+  fks:
+  - name: fk_profile_download_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_profile_download_actor_app_user_id
+    columns:
+    - actor_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_profile_download_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_profile_download_resume_id
+    columns:
+    - resume_id
+    ref: resume
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_profile_download_download_kind_id
+    columns:
+    - download_kind_id
+    ref: download_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_profile_download_download_source_id
+    columns:
+    - download_source_id
+    ref: download_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_profile_download_device_session_id
+    columns:
+    - device_session_id
+    ref: device_session
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+  - name: fk_profile_download_wallet_ledger_entry_id
+    columns:
+    - wallet_ledger_entry_id
+    ref: wallet_ledger_entry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_profile_download_subscription_entitlement_id
+    columns:
+    - subscription_entitlement_id
+    ref: subscription_entitlement
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_profile_download_prior_profile_download_id
+    columns:
+    - prior_profile_download_id
+    ref: profile_download
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: consultant_payout
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: X
+  milestones:
+  - B38
+  - B44
+  - B76
+  retention: 8 years (TDS/tax); bank reference tokenised.
+  description: 'Commission payout to a sourcing consultant: basis, rate, TDS, payout reference (reference only; the transfer happens outside).'
+  columns:
+  - name: payee_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Consultant paid.
+    sens: Internal
+  - name: sourcing_request_id
+    type: UUID
+    domain: identifier
+    desc: Request the commission is for.
+    sens: Internal
+    'null': true
+    null_why: NULL for bonuses/adjustments not tied to one request.
+  - name: commission_basis_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Amount commission is computed on.
+    sens: Internal
+  - name: commission_rate
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Commission percent.
+    sens: Internal
+  - name: commission_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Gross commission.
+    sens: Internal
+  - name: tds_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Tax deducted at source.
+    sens: Internal
+    default: '0'
+  - name: net_payout_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Amount paid out.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency.
+    sens: Internal
+  - name: payout_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Status.
+    sens: Internal
+  - name: payout_ref
+    type: STRING(100)
+    domain: token
+    desc: Bank/UPI transfer reference from the payout provider.
+    sens: Sensitive
+    'null': true
+    null_why: NULL until paid.
+    pii: provider transaction reference only (no account number); encrypted at rest; masked in UI
+  - name: scheduled_for_date
+    type: DATE
+    domain: date
+    desc: Planned payout date.
+    sens: Internal
+  - name: paid_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Payout completion.
+    sens: Internal
+    'null': true
+    null_why: NULL = not paid.
+  constraints:
+  - name: ck_consultant_payout_math
+    type: check
+    expr: net_payout_amount = commission_amount - tds_amount AND tds_amount >= 0 AND commission_amount >= 0
+    desc: Net = gross - TDS.
+  - name: ck_consultant_payout_rate_range
+    type: check
+    expr: commission_rate >= 0 AND commission_rate <= 100
+    desc: 0..100.
+  indexes:
+  - name: idx_consultant_payout_payee_app_user_id_scheduled_for_date
+    columns:
+    - payee_app_user_id
+    - scheduled_for_date DESC
+    desc: Consultant statement.
+  - name: idx_consultant_payout_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: sourcing_request_id IS NOT NULL
+  - name: idx_consultant_payout_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_consultant_payout_payee_app_user_id
+    columns:
+    - payee_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_consultant_payout_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    ref: sourcing_request
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_consultant_payout_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_consultant_payout_payout_status_id
+    columns:
+    - payout_status_id
+    ref: payout_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+- name: reconciliation_run
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: X
+  milestones:
+  - B38
+  - B44
+  retention: 8 years.
+  description: Settlement reconciliation of a gateway day against orders/ledger.
+  columns:
+  - name: payment_gateway_id
+    type: UUID
+    domain: enum_ref
+    desc: Gateway reconciled.
+    sens: Internal
+  - name: settlement_date
+    type: DATE
+    domain: date
+    desc: Gateway settlement date.
+    sens: Internal
+  - name: reconciliation_run_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Run state.
+    sens: Internal
+  - name: gateway_total_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Total per gateway settlement file.
+    sens: Internal
+  - name: ledger_total_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Total per our paid orders.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency.
+    sens: Internal
+  - name: item_count
+    type: INT4
+    domain: quantity
+    desc: Items compared.
+    sens: Internal
+    default: '0'
+  - name: exception_count
+    type: INT4
+    domain: quantity
+    desc: Unmatched/mismatched items.
+    sens: Internal
+    default: '0'
+  - name: started_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Run start.
+    sens: Internal
+  - name: completed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Run end.
+    sens: Internal
+    'null': true
+    null_why: NULL = still running.
+  - name: settlement_file_ref
+    type: STRING(300)
+    domain: url
+    desc: Object-storage key of the settlement report.
+    sens: Internal
+    'null': true
+    null_why: NULL for API-pulled settlements.
+  constraints:
+  - name: uq_reconciliation_run_gateway_date_started
+    type: unique
+    columns:
+    - payment_gateway_id
+    - settlement_date
+    - started_at
+    desc: A rerun is a new row.
+  - name: ck_reconciliation_run_times
+    type: check
+    expr: completed_at IS NULL OR completed_at >= started_at
+    desc: Order of times.
+  indexes:
+  - name: idx_reconciliation_run_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  fks:
+  - name: fk_reconciliation_run_payment_gateway_id
+    columns:
+    - payment_gateway_id
+    ref: payment_gateway
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_reconciliation_run_reconciliation_run_status_id
+    columns:
+    - reconciliation_run_status_id
+    ref: reconciliation_run_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_reconciliation_run_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+- name: reconciliation_item
+  kind: entity
+  delete_policy: hard
+  volume: high
+  tier: X
+  milestones:
+  - B38
+  - B44
+  retention: 8 years with the run.
+  description: 'One compared line: gateway amount vs our amount and match state.'
+  columns:
+  - name: reconciliation_run_id
+    type: UUID
+    domain: identifier
+    desc: Run.
+    sens: Internal
+  - name: payment_order_id
+    type: UUID
+    domain: identifier
+    desc: Our order.
+    sens: Internal
+    'null': true
+    null_why: NULL when missing_in_ledger.
+  - name: gateway_payment_ref
+    type: STRING(100)
+    domain: token
+    desc: Gateway payment reference.
+    sens: Internal
+    'null': true
+    null_why: NULL when missing_at_gateway.
+  - name: gateway_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Amount per gateway.
+    sens: Internal
+    'null': true
+    null_why: NULL when missing_at_gateway.
+  - name: ledger_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Amount per our order.
+    sens: Internal
+    'null': true
+    null_why: NULL when missing_in_ledger.
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency.
+    sens: Internal
+  - name: match_state_id
+    type: UUID
+    domain: enum_ref
+    desc: Result.
+    sens: Internal
+  - name: resolved_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Instant an operator resolved the exception.
+    sens: Internal
+    'null': true
+    null_why: NULL = unresolved or matched.
+  - name: resolved_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Resolver.
+    sens: Internal
+    'null': true
+    null_why: NULL = unresolved or matched.
+  - name: resolution_note
+    type: STRING(300)
+    domain: free_text
+    desc: Operator note.
+    sens: Internal
+    'null': true
+    null_why: NULL = none.
+  constraints:
+  - name: ck_reconciliation_item_resolved_pair
+    type: check
+    expr: (resolved_at IS NULL) = (resolved_by_app_user_id IS NULL)
+    desc: Resolution fields together.
+  indexes:
+  - name: idx_reconciliation_item_reconciliation_run_id_match_state
+    columns:
+    - reconciliation_run_id
+    - match_state_id
+    desc: Exceptions of a run.
+  - name: idx_reconciliation_item_payment_order_id
+    columns:
+    - payment_order_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: payment_order_id IS NOT NULL
+  - name: idx_reconciliation_item_currency_id
+    columns:
+    - currency_id
+    desc: FK leading index (parent lookups / delete checks)
+  - name: idx_reconciliation_item_resolved_by_app_user_id
+    columns:
+    - resolved_by_app_user_id
+    desc: FK leading index (parent lookups / delete checks)
+    where: resolved_by_app_user_id IS NOT NULL
+  fks:
+  - name: fk_reconciliation_item_reconciliation_run_id
+    columns:
+    - reconciliation_run_id
+    ref: reconciliation_run
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: items belong to a run
+  - name: fk_reconciliation_item_payment_order_id
+    columns:
+    - payment_order_id
+    ref: payment_order
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_reconciliation_item_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  - name: fk_reconciliation_item_match_state_id
+    columns:
+    - match_state_id
+    ref: match_state
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: lookup values are retired via is_active, never deleted
+    index_exempt: low-cardinality lookup; never filtered alone; lookup rows are never deleted
+  - name: fk_reconciliation_item_resolved_by_app_user_id
+    columns:
+    - resolved_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: financial/history row must block deletion of its parent
+  no_hash_why: accessed by reconciliation_run_id; no time-ordered index
+views:
+- name: vw_subscription_period_overlap
+  kind: view
+  tables:
+  - subscription_period
+  purpose: 'Validation query for BR-SUB-03: must return 0 rows.'
+  security: Internal; finance/ops read-only role.
+  sql_sketch: SELECT a.licence_id, a.id AS period_a, b.id AS period_b FROM subscription_period a JOIN subscription_period b ON a.licence_id=b.licence_id AND a.id < b.id AND a.period_start_date < b.period_end_date
+    AND b.period_start_date < a.period_end_date WHERE a.period_start_date < a.period_end_date AND b.period_start_date < b.period_end_date
+- name: vw_wallet_balance_drift
+  kind: view
+  tables:
+  - wallet
+  - wallet_ledger_entry
+  purpose: Wallets whose stored balance/sequence differ from the ledger (expect 0 rows).
+  security: Internal; finance read-only.
+  sql_sketch: SELECT w.id, w.credit_balance, SUM(l.credits_delta) AS ledger_sum, w.ledger_sequence, MAX(l.sequence_no) AS max_seq FROM wallet w LEFT JOIN wallet_ledger_entry l ON l.wallet_id=w.id GROUP
+    BY w.id, w.credit_balance, w.ledger_sequence HAVING w.credit_balance <> COALESCE(SUM(l.credits_delta),0) OR w.ledger_sequence <> COALESCE(MAX(l.sequence_no),0)
+- name: vw_invoice_number_gap
+  kind: view
+  tables:
+  - invoice
+  - invoice_number_series
+  purpose: Gaps in issued invoice numbers per series (expect 0 rows).
+  security: Internal; finance read-only.
+  sql_sketch: SELECT invoice_number_series_id, MAX(invoice_number) - COUNT(*) AS missing FROM invoice WHERE invoice_number IS NOT NULL GROUP BY invoice_number_series_id HAVING MAX(invoice_number) <> COUNT(*)
+- name: vw_organisation_download_spend
+  kind: view
+  tables:
+  - profile_download
+  - wallet_ledger_entry
+  purpose: Credits spent per organisation/day on profile downloads (B68 module query).
+  security: Internal; org admins see own tenant only.
+  sql_sketch: SELECT organisation_id, date_trunc('day', downloaded_at) AS day, COUNT(*) AS downloads, SUM(credits_charged) AS credits FROM profile_download GROUP BY 1,2
+business_rules:
+- id: BR-SUB-01
+  rule: One live subscription per licence.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: UNIQUE INDEX uq_subscription_licence_id_live ON subscription(licence_id) WHERE ended_at IS NULL AND deleted_at IS NULL.
+  tables:
+  - subscription
+  milestone: B47
+- id: BR-SUB-02
+  rule: A subscription's periods carry the same licence as the subscription.
+  mechanism_type: FK
+  mechanism: Composite FK (subscription_id, licence_id) -> subscription(id, licence_id) backed by UNIQUE uq_subscription_id_licence.
+  tables:
+  - subscription
+  - subscription_period
+  milestone: B47
+- id: BR-SUB-03
+  rule: Subscription periods of a licence never overlap.
+  mechanism_type: CHAIN_FK
+  mechanism: 'P1: sequence_no, prior_period_id UNIQUE, prior_period_end_date, composite FK (prior_period_id, licence_id, prior_period_end_date) -> subscription_period(id, licence_id, period_end_date) ON
+    UPDATE RESTRICT (+ UNIQUE(id, period_end_date) and UNIQUE(id, licence_id, period_end_date)); CHECK period_start_date >= prior_period_end_date; CHECK start <= end; partial UNIQUE (licence_id) WHERE prior_period_id
+    IS NULL; UNIQUE(licence_id, sequence_no); prior_period_id excluded from UPDATE grants.'
+  tables:
+  - subscription_period
+  milestone: B47
+- id: BR-SUB-04
+  rule: Only the last period of a licence may be shortened on early cancellation; the shortening is recorded.
+  mechanism_type: CHAIN_FK
+  mechanism: ON UPDATE RESTRICT on the composite FK blocks changing period_end_date of any period that has a successor; CHECK ck_subscription_period_shorten_pair requires original_period_end_date/shortened_at
+    together and original >= new end. Scheduled uninvoiced tail periods are hard-deleted first.
+  tables:
+  - subscription_period
+  milestone: B47
+- id: BR-SUB-05
+  rule: Renewal creates the next period, the payment order and the status history row in one transaction.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Txn: SELECT subscription FOR UPDATE; INSERT subscription_period(prior = tail); INSERT payment_order; INSERT subscription_status_history; UNIQUE(prior_period_id) and UNIQUE(licence_id, sequence_no)
+    make concurrent renewals fail with 23505.'
+  tables:
+  - subscription_period
+  - payment_order
+  - subscription_status_history
+  milestone: B47
+- id: BR-SUB-06
+  rule: Wallet balance can never be negative; one wallet per owner and currency; exactly one owner.
+  mechanism_type: CHECK
+  mechanism: CHECK credit_balance >= 0; CHECK num_nonnulls(owner_organisation_id, owner_app_user_id) = 1; partial UNIQUE (owner_organisation_id, currency_id) / (owner_app_user_id, currency_id) WHERE deleted_at
+    IS NULL.
+  tables:
+  - wallet
+  milestone: B47
+- id: BR-SUB-07
+  rule: The wallet ledger is append-only; corrections are reversal rows referencing the original; a row is reversed at most once.
+  mechanism_type: PRIVILEGE
+  mechanism: 'App roles: GRANT INSERT, SELECT only (no UPDATE/DELETE) on wallet_ledger_entry; UNIQUE(reverses_wallet_ledger_entry_id); self FK reverses_wallet_ledger_entry_id RESTRICT; CHECK single_reference.'
+  tables:
+  - wallet_ledger_entry
+  milestone: B47
+- id: BR-SUB-08
+  rule: Every wallet movement is serialised per wallet, sequenced gaplessly, idempotent and balance-checked.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Debit txn: replay check by idempotency_key; SELECT wallet FOR UPDATE; check balance/spend limits; seq=ledger_sequence+1; INSERT ledger (balance_after, hashes); FIFO lots FOR UPDATE; UPDATE
+    wallet; COMMIT; retry on 40001. Backstops: UNIQUE(wallet_id, sequence_no), UNIQUE(idempotency_key), CHECK credit_balance >= 0, composite self-FK (wallet_id, prev_sequence_no) -> (wallet_id, sequence_no).'
+  tables:
+  - wallet
+  - wallet_ledger_entry
+  - wallet_expiry_bucket
+  - wallet_bucket_consumption
+  milestone: B47
+- id: BR-SUB-09
+  rule: Ledger sign matches the entry; no empty movement; ledger balance never negative.
+  mechanism_type: CHECK
+  mechanism: ck_wallet_ledger_entry_sign_flag, delta_nonzero, balance_nonneg.
+  tables:
+  - wallet_ledger_entry
+  milestone: B47
+- id: BR-SUB-10
+  rule: 'Ledger tamper evidence: hash chain per wallet.'
+  mechanism_type: APP_LAYER
+  mechanism: row_hash = SHA-256(prev_hash || canonical row); CHECK genesis has NULL prev_hash; nightly verifier job recomputes chains; changefeed to immutable sink (P5).
+  tables:
+  - wallet_ledger_entry
+  milestone: B47
+- id: BR-SUB-11
+  rule: Wallet credit lots are consumed first-expiring-first and never over-consumed.
+  mechanism_type: CHECK
+  mechanism: CHECK credits_remaining BETWEEN 0 AND credits_granted; FIFO via index (wallet_id, expires_at) WHERE credits_remaining > 0 with FOR UPDATE in the debit txn; expiry job writes `expiry` ledger
+    rows referencing the bucket.
+  tables:
+  - wallet_expiry_bucket
+  - wallet_bucket_consumption
+  milestone: B47
+- id: BR-SUB-12
+  rule: Invoice numbers are unique and gapless per series; drafts have no number.
+  mechanism_type: TXN_LOCK
+  mechanism: Issue txn locks invoice_number_series row FOR UPDATE, increments next_number, sets invoice_number; UNIQUE(invoice_number_series_id, invoice_number); CHECK number/label/issued_at/issue_date
+    all NULL or all set.
+  tables:
+  - invoice
+  - invoice_number_series
+  - credit_note
+  milestone: B47
+- id: BR-SUB-13
+  rule: Invoice arithmetic and settlement bounds are enforced.
+  mechanism_type: CHECK
+  mechanism: total = subtotal + tax; 0 <= amount_paid <= total; line net = quantity*unit_price; tax line within 0.01 of base*rate; rate 0..100.
+  tables:
+  - invoice
+  - invoice_line
+  - invoice_tax_line
+  milestone: B47
+- id: BR-SUB-14
+  rule: Payment orders and refunds are idempotent; webhooks are deduplicated.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE(idempotency_key) on payment_order and refund; UNIQUE(payment_gateway_id, gateway_order_ref); UNIQUE(payment_gateway_id, gateway_event_ref) on payment_event.
+  tables:
+  - payment_order
+  - refund
+  - payment_event
+  milestone: B47
+- id: BR-SUB-15
+  rule: Total refunds of an order never exceed the amount paid; refund approver differs from requester.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Refund txn: SELECT payment_order FOR UPDATE; SUM(refund.amount) + new <= order.amount; CHECK approved_by <> requested_by; credit clawback writes a `refund` ledger row under the wallet lock.'
+  tables:
+  - refund
+  - payment_order
+  - wallet_ledger_entry
+  milestone: B47
+- id: BR-SUB-16
+  rule: No card, bank or VPA data is stored; only gateway tokens and masked display data.
+  mechanism_type: APP_LAYER
+  mechanism: Schema has no PAN/CVV/account columns; payment_method_token.token_ref encrypted (Sensitive); payment_event.payload allow-list sanitised, encrypted, TTL 540 days; code review and a column-name
+    lint block additions.
+  tables:
+  - payment_method_token
+  - payment_event
+  - payment_order
+  milestone: B76
+- id: BR-SUB-17
+  rule: At most one default payment instrument per organisation.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: UNIQUE INDEX uq_payment_method_token_organisation_id_default (organisation_id) WHERE is_default AND deleted_at IS NULL.
+  tables:
+  - payment_method_token
+  milestone: B47
+- id: BR-SUB-18
+  rule: 'Each profile download is paid by exactly one of: ledger deduction, free quota, or free repeat of a paid download; credits charged iff a ledger row exists.'
+  mechanism_type: CHECK
+  mechanism: ck_profile_download_payer_exactly_one (num_nonnulls = 1) and credits_consistent; UNIQUE(wallet_ledger_entry_id) and UNIQUE(idempotency_key).
+  tables:
+  - profile_download
+  milestone: B47
+- id: BR-SUB-19
+  rule: Profile download history is append-only and carries actor, subject, time and credit deduction.
+  mechanism_type: PRIVILEGE
+  mechanism: INSERT/SELECT grants only; NOT NULL actor_app_user_id, candidate_profile_id, downloaded_at; hash-sharded time index.
+  tables:
+  - profile_download
+  milestone: B47
+- id: BR-SUB-20
+  rule: Free-quota usage never exceeds the entitlement limit.
+  mechanism_type: TXN_LOCK
+  mechanism: SELECT subscription_entitlement FOR UPDATE then UPDATE used_count+1; CHECK used_count >= 0 AND (limit_value IS NULL OR used_count <= limit_value) as backstop.
+  tables:
+  - subscription_entitlement
+  - plan_entitlement
+  milestone: B47
+- id: BR-SUB-21
+  rule: Coupons honour validity, caps and per-organisation limits.
+  mechanism_type: TXN_LOCK
+  mechanism: Redemption txn locks coupon row FOR UPDATE; checks valid_from/valid_to, per_organisation_limit via coupon_id+organisation_id index; CHECK redemption_count <= max_redemptions.
+  tables:
+  - coupon
+  - coupon_redemption
+  milestone: B47
+- id: BR-SUB-22
+  rule: Spend limits are enforced at debit time.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Inside the debit txn: SUM(credits_delta) of the actor/licence/org in the window via idx_wallet_ledger_entry_actor_app_user_id_created_at compared with spend_limit.max_credits; hard block aborts
+    the txn.'
+  tables:
+  - spend_limit
+  - wallet_ledger_entry
+  milestone: B47
+- id: BR-SUB-23
+  rule: Price/rate/tax histories do not overlap ambiguously.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: UNIQUE (plan_version_id, currency_id, billing_interval_id); UNIQUE (credit_pack_id, currency_id, effective_from_date); partial UNIQUE default rate card per action; tax_rate partial uniques
+    per component/start; end >= start CHECKs.
+  tables:
+  - plan_price
+  - credit_pack_price
+  - credit_rate_card
+  - tax_rate
+  milestone: B47
+- id: BR-SUB-24
+  rule: Only one non-withdrawn cancellation per subscription.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: UNIQUE INDEX uq_subscription_cancellation_subscription_id_open (subscription_id) WHERE withdrawn_at IS NULL AND deleted_at IS NULL.
+  tables:
+  - subscription_cancellation
+  milestone: B47
+- id: BR-SUB-25
+  rule: Subscription status changes are recorded.
+  mechanism_type: APP_LAYER
+  mechanism: Status update and INSERT subscription_status_history happen in one txn (service layer); nightly job asserts latest history.to_status = subscription.status.
+  tables:
+  - subscription
+  - subscription_status_history
+  milestone: B47
+- id: BR-SUB-26
+  rule: Tax registration numbers are stored encrypted with a blind index and validated before storage.
+  mechanism_type: APP_LAYER
+  mechanism: tax_number_encrypted (AES-GCM, KMS) + tax_number_hmac; partial UNIQUE (country_id, tax_id_type_id, tax_number_hmac) WHERE deleted_at IS NULL; GSTIN regex+checksum validated in the service.
+  tables:
+  - tax_registration
+  milestone: B76
+- id: BR-SUB-27
+  rule: 'Reconciliation: settled gateway totals must match paid orders; exceptions must be resolved by a named user.'
+  mechanism_type: JOB
+  mechanism: Daily reconciliation_run per gateway; reconciliation_item per payment with match_state; CHECK resolved_at/resolved_by together; alert if exception_count > 0 for > 2 days.
+  tables:
+  - reconciliation_run
+  - reconciliation_item
+  milestone: B47
+- id: BR-SUB-28
+  rule: FX rates are append-only history; invoices cite the rate used.
+  mechanism_type: PRIVILEGE
+  mechanism: INSERT/SELECT only on currency_exchange_rate; invoice.currency_exchange_rate_id FK; CHECK rate > 0 and base <> quote.
+  tables:
+  - currency_exchange_rate
+  - invoice
+  milestone: B47
+- id: BR-SUB-29
+  rule: Row-level TTL purges raw webhook payloads after 540 days only.
+  mechanism_type: TTL
+  mechanism: ttl_expiration_expression on payment_event.received_at (540 days); payment_event_outcome and orders keep the audit trail.
+  tables:
+  - payment_event
+  milestone: B76
+- id: BR-SUB-30
+  rule: Consultant payout net equals commission minus TDS.
+  mechanism_type: CHECK
+  mechanism: ck_consultant_payout_math; rate 0..100; payout_ref tokenised (Sensitive).
+  tables:
+  - consultant_payout
+  milestone: B47

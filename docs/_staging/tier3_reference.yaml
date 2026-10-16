@@ -1,0 +1,2097 @@
+module: tier3_reference
+notes: |
+  ## Tier 3 reference domains: OPTIONAL module (stretch coverage, scored as additional coverage)
+
+  **Label and decision (for 07_schema_justification).** The docket (Section 4 Tier 3 and Section 7 "Optional stretch coverage") says Tier 3 is optional, unassigned, and must be a separate, clearly labelled module with the decision recorded. Decision: TAKEN ON as module `tier3_reference`, kept physically separate: nothing in Tier 1/2 or analytics depends on it (only FKs point out of it), so it can be dropped as a unit. Justification: it is cheap on a CockroachDB schema that already has the analytics layer, it shows the integration boundary "Company review and salary data: reference only", and it demonstrates feature-flag design (audit via audit_event). Risk: reference data goes stale and can mislead; mitigated by attribution, refresh dates and `max_staleness_days`. No table here uses dim_/fact_/agg_ prefixes (Rule 8); they are ordinary reference tables.
+
+  **Domains covered (docket Tier 3):** salary benchmarks (salary_benchmark, salary_benchmark_source), company ratings (company_rating_snapshot), trending job snapshots (trending_job_snapshot, skill_demand_snapshot, industry_growth_snapshot, location_cost_index), dashboard aggregates (dashboard_aggregate), feature flags (feature_flag, feature_flag_rule, feature_flag_override, feature_flag_audit) plus the provider registry and refresh log (reference_data_source, reference_data_refresh).
+
+  **Integration boundary row "Company review and salary data" (Section 6 table):**
+  | Item | Decision |
+  |---|---|
+  | Data ownership | The external provider owns the data; Talentra owns only the snapshot and the blended benchmark it computes |
+  | Stored vs referenced | Stored: ratings, counts, percentile bands, source record ref, source URL. Referenced only: review text and raw salary submissions (never stored). Always shown with attribution_text and refreshed_at |
+  | Failure behaviour | Last good snapshot stays; the UI hides a row once age exceeds `reference_data_source.max_staleness_days`; refresh failure is logged in reference_data_refresh, status failed or skipped_stale_source |
+  | Idempotency | `reference_data_refresh.run_key`; `salary_benchmark_source (reference_data_source_id, source_record_ref)` unique; snapshot grain unique keys make re-imports upserts |
+  | Audit | reference_data_refresh (append-only run log); audit columns on every row; flag changes via audit_event |
+
+  **Design decisions.**
+  * Benchmarks keep percentile bands (p10..p90) as money with a currency (D-06) and a sample size; a CHECK keeps bands non-decreasing and `is_publishable` hides rows below 30 observations. Blended rows point to per-source contributions, so any displayed number can be traced to attribution.
+  * Optional dimensions (industry, state, city) are nullable "all/whole" scopes; the natural key is a loader-built text `benchmark_key` because unique constraints over nullable columns do not de-duplicate NULLs in CockroachDB.
+  * Trending and demand snapshots can be produced from the analytics layer (reference_data_source `internal_analytics`, `is_internal`) or imported; `trending_job_snapshot` uses a single-subject CHECK instead of four tables.
+  * `dashboard_aggregate` stores pre-computed tile JSON per scope with `as_of_at` (the AS OF SYSTEM TIME instant) and the analytics run that produced it; row-level TTL (30 days) removes abandoned tiles.
+  * Feature flags: flag -> ordered rules (first match wins) -> manual overrides (user XOR organisation, partial unique per live row) -> `feature_flag_audit`, which links to the platform `audit_event` (single append-only trail) instead of duplicating who/when. Evaluation is application-side from a cache refreshed from `feature_flag` (active, not deleted); kill switches use `feature_flag_type = operational`.
+  * No personal data is stored (salary and rating data are aggregate). `dashboard_aggregate` scope keys may name a recruiter or candidate id: payloads are limited to aggregate counts of that person's own workspace and expire in 30 days.
+  * Deviation: `job_role`, `industry`, `country`, `state_region`, `city`, `skill`, `organisation`, `app_user`, `audit_event` are referenced by FK as defined in the registry; if master data models any of them as a lookup, the column domain must change to enum_ref (open question for integration).
+
+  **Extension points.** Experiment assignment (variant table and exposure fact in analytics); per-organisation salary benchmarks from our own offers once enough data exists; multi-currency conversion table.
+
+  ## TTL versus foreign keys (decision F-01)
+  CockroachDB row-level TTL deletes fail while a RESTRICT/NO ACTION child references the expiring row, so every foreign key that points at a TTL table now states
+  what happens when the parent expires:
+  * `feature_flag_audit.audit_event_id` -> `audit_event`: ON DELETE SET NULL (column now nullable)
+  * Foreign-key actions are executed by the engine, not by an application role, so the INSERT/SELECT-only grants of append-only children stay intact; the nulled column is
+    excluded from any row_hash/prev_hash computation (hash only immutable business columns).
+  * Rule applied everywhere: evidence rows outlive the row they point at (SET NULL); high-volume samples that are only meaningful with the parent follow it (CASCADE).
+    A TTL table must never be the target of a RESTRICT/NO ACTION foreign key (checked by rule check A09 in 08_rule_compliance).
+lookups:
+- name: reference_data_source_kind
+  description: Kind of external reference data a source provides.
+  tier: '3'
+  milestones: []
+  values:
+  - code: salary
+    en: Salary data
+    hi: वेतन डेटा
+    sort: 10
+  - code: company_rating
+    en: Company ratings and reviews
+    hi: कंपनी रेटिंग
+    sort: 20
+  - code: market_trend
+    en: Market trends
+    hi: बाज़ार रुझान
+    sort: 30
+  - code: industry
+    en: Industry statistics
+    hi: उद्योग आँकड़े
+    sort: 40
+  - code: cost_index
+    en: Cost-of-living index
+    hi: जीवन-यापन लागत सूचकांक
+    sort: 50
+- name: reference_refresh_status
+  description: Outcome of a reference-data refresh run.
+  tier: '3'
+  milestones: []
+  values:
+  - code: running
+    en: Running
+    hi: चालू
+    sort: 10
+  - code: succeeded
+    en: Succeeded
+    hi: सफल
+    sort: 20
+  - code: failed
+    en: Failed
+    hi: विफल
+    sort: 30
+  - code: partial
+    en: Partially loaded
+    hi: आंशिक
+    sort: 40
+  - code: skipped_stale_source
+    en: Skipped (source unavailable)
+    hi: छोड़ा गया
+    sort: 50
+- name: salary_experience_band
+  description: Experience band used by salary benchmarks.
+  tier: '3'
+  milestones: []
+  values:
+  - code: fresher
+    en: Fresher (0-1 years)
+    hi: फ्रेशर
+    sort: 10
+  - code: junior
+    en: 1-3 years
+    hi: 1-3 वर्ष
+    sort: 20
+  - code: mid
+    en: 3-5 years
+    hi: 3-5 वर्ष
+    sort: 30
+  - code: senior
+    en: 5-10 years
+    hi: 5-10 वर्ष
+    sort: 40
+  - code: lead
+    en: 10+ years
+    hi: 10+ वर्ष
+    sort: 50
+- name: trending_scope
+  description: Subject of a trending snapshot row.
+  tier: '3'
+  milestones: []
+  values:
+  - code: job_role
+    en: Job role
+    hi: नौकरी की भूमिका
+    sort: 10
+  - code: skill
+    en: Skill
+    hi: कौशल
+    sort: 20
+  - code: location
+    en: Location
+    hi: स्थान
+    sort: 30
+  - code: industry
+    en: Industry
+    hi: उद्योग
+    sort: 40
+- name: dashboard_scope
+  description: Audience scope of a pre-computed dashboard tile.
+  tier: '3'
+  milestones: []
+  values:
+  - code: platform
+    en: Whole platform
+    hi: पूरा प्लेटफ़ॉर्म
+    sort: 10
+  - code: organisation
+    en: One organisation
+    hi: एक संगठन
+    sort: 20
+  - code: recruiter
+    en: One recruiter
+    hi: एक रिक्रूटर
+    sort: 30
+  - code: candidate
+    en: One candidate
+    hi: एक उम्मीदवार
+    sort: 40
+- name: feature_flag_type
+  description: Purpose of a feature flag.
+  tier: '3'
+  milestones: []
+  values:
+  - code: release
+    en: Release toggle
+    hi: रिलीज़ टॉगल
+    sort: 10
+  - code: operational
+    en: Operational / kill switch
+    hi: संचालन स्विच
+    sort: 20
+  - code: experiment
+    en: Experiment
+    hi: प्रयोग
+    sort: 30
+  - code: permission
+    en: Entitlement toggle
+    hi: अधिकार टॉगल
+    sort: 40
+- name: feature_flag_status
+  description: Lifecycle state of a feature flag.
+  tier: '3'
+  milestones: []
+  values:
+  - code: draft
+    en: Draft
+    hi: मसौदा
+    sort: 10
+  - code: active
+    en: Active
+    hi: सक्रिय
+    sort: 20
+  - code: paused
+    en: Paused
+    hi: रुका हुआ
+    sort: 30
+  - code: archived
+    en: Archived
+    hi: संग्रहीत
+    sort: 40
+- name: feature_flag_operator
+  description: Comparison operator of a flag targeting rule.
+  tier: '3'
+  milestones: []
+  values:
+  - code: equals
+    en: Equals
+    hi: बराबर
+    sort: 10
+  - code: not_equals
+    en: Not equals
+    hi: बराबर नहीं
+    sort: 20
+  - code: in_list
+    en: In list
+    hi: सूची में
+    sort: 30
+  - code: percentage_bucket
+    en: Hash bucket below percentage
+    hi: प्रतिशत बकेट
+    sort: 40
+- name: feature_flag_attribute
+  description: Subject attribute a flag rule evaluates.
+  tier: '3'
+  milestones: []
+  values:
+  - code: organisation
+    en: Organisation
+    hi: संगठन
+    sort: 10
+  - code: user_role
+    en: User role
+    hi: उपयोगकर्ता भूमिका
+    sort: 20
+  - code: country
+    en: Country
+    hi: देश
+    sort: 30
+  - code: plan_tier
+    en: Plan tier
+    hi: योजना स्तर
+    sort: 40
+  - code: user_cohort
+    en: User cohort
+    hi: उपयोगकर्ता समूह
+    sort: 50
+- name: feature_flag_change_kind
+  description: Kind of change recorded in a flag audit entry.
+  tier: '3'
+  milestones: []
+  values:
+  - code: created
+    en: Created
+    hi: बनाया गया
+    sort: 10
+  - code: rule_changed
+    en: Rule changed
+    hi: नियम बदला
+    sort: 20
+  - code: override_set
+    en: Override set
+    hi: ओवरराइड सेट
+    sort: 30
+  - code: status_changed
+    en: Status changed
+    hi: स्थिति बदली
+    sort: 40
+  - code: kill_switch
+    en: Kill switch used
+    hi: किल स्विच
+    sort: 50
+tables:
+- name: reference_data_source
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '3'
+  milestones: []
+  retention: Soft-deleted when a provider contract ends; rows kept for the life of any snapshot that cites them (7 years).
+  description: 'OPTIONAL Tier 3. Grain: one row per external or internal provider of reference data (salary, company ratings, trends, cost index). Holds licence, attribution text and refresh cadence so
+    every reference row can show source attribution and a refresh date (docket Section 6: ''Company review and salary data: reference only'').'
+  columns:
+  - name: source_code
+    type: STRING(64)
+    domain: code
+    desc: Natural key, for example 'govt_labour_survey' or 'internal_analytics'.
+    sens: Internal
+  - name: source_name
+    type: STRING(200)
+    domain: free_text
+    desc: Display name of the provider.
+    sens: Public
+  - name: reference_data_source_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Kind of data the provider supplies.
+    sens: Internal
+  - name: publisher_name
+    type: STRING(200)
+    domain: free_text
+    desc: Legal name of the publisher.
+    sens: Public
+  - name: source_url
+    type: STRING(500)
+    domain: url
+    desc: Provider landing page or API documentation.
+    sens: Public
+    'null': true
+    null_why: NULL = internal source with no public page
+  - name: licence_name
+    type: STRING(150)
+    domain: free_text
+    desc: Licence or terms under which the data is used.
+    sens: Internal
+  - name: licence_url
+    type: STRING(500)
+    domain: url
+    desc: Link to the licence text.
+    sens: Internal
+    'null': true
+    null_why: NULL = bilateral contract with no public text
+  - name: attribution_text
+    type: STRING(500)
+    domain: free_text
+    desc: Text that MUST be shown next to the data in the UI.
+    sens: Public
+  - name: requires_attribution
+    type: BOOL
+    domain: boolean
+    desc: Attribution must be displayed.
+    sens: Internal
+    default: 'true'
+  - name: is_commercial_use_allowed
+    type: BOOL
+    domain: boolean
+    desc: Licence permits commercial use.
+    sens: Internal
+    default: 'false'
+  - name: is_internal
+    type: BOOL
+    domain: boolean
+    desc: Computed from Talentra's own analytics (no third party).
+    sens: Internal
+    default: 'false'
+  - name: refresh_cadence_days
+    type: INT4
+    domain: duration
+    desc: Planned days between refreshes.
+    sens: Internal
+  - name: max_staleness_days
+    type: INT4
+    domain: duration
+    desc: Beyond this age the UI hides the data instead of showing stale values (failure behaviour when the provider is unavailable).
+    sens: Internal
+  - name: last_refreshed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Last successful refresh.
+    sens: Internal
+    'null': true
+    null_why: NULL = never refreshed yet
+  - name: contract_end_date
+    type: DATE
+    domain: date
+    desc: End of the licence/contract.
+    sens: Internal
+    'null': true
+    null_why: NULL = perpetual or internal source
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    desc: Source is in use.
+    sens: Internal
+    default: 'true'
+  constraints:
+  - name: ck_reference_data_source_cadence_positive
+    type: check
+    expr: refresh_cadence_days >= 1 AND max_staleness_days >= refresh_cadence_days
+    desc: Staleness limit must cover at least one refresh cycle
+  indexes:
+  - name: uq_reference_data_source_source_code
+    columns:
+    - source_code
+    desc: Natural key among live rows.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_reference_data_source_reference_data_source_kind_id_is_active
+    columns:
+    - reference_data_source_kind_id
+    - is_active
+    desc: Active sources by kind.
+  fks:
+  - name: fk_reference_data_source_reference_data_source_kind_id
+    columns:
+    - reference_data_source_kind_id
+    ref: reference_data_source_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+- name: reference_data_refresh
+  kind: event
+  delete_policy: append_only
+  volume: low
+  tier: '3'
+  milestones: []
+  retention: Kept 2 years then deleted.
+  description: 'OPTIONAL Tier 3. Grain: one row per refresh run of one reference source. Gives idempotency (run_key), failure behaviour (status, error) and audit of the integration boundary.'
+  columns:
+  - name: reference_data_source_id
+    type: UUID
+    domain: identifier
+    desc: Source refreshed.
+    sens: Internal
+  - name: run_key
+    type: STRING(150)
+    domain: code
+    desc: 'Idempotency key: source_code|retrieval window; a repeated delivery finds the same run.'
+    sens: Internal
+  - name: reference_refresh_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Outcome of the run.
+    sens: Internal
+  - name: started_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Run start.
+    sens: Internal
+    default: now()
+  - name: finished_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Run end.
+    sens: Internal
+    'null': true
+    null_why: NULL while running
+  - name: rows_loaded
+    type: INT8
+    domain: quantity
+    desc: Rows inserted or updated.
+    sens: Internal
+    default: '0'
+  - name: rows_rejected
+    type: INT8
+    domain: quantity
+    desc: Rows rejected by validation (negative salaries, ratings out of range).
+    sens: Internal
+    default: '0'
+  - name: error_message
+    type: STRING(1000)
+    domain: free_text
+    desc: Failure reason, no payloads.
+    sens: Internal
+    'null': true
+    null_why: NULL when the run did not fail
+  constraints:
+  - name: ck_reference_data_refresh_finished_range
+    type: check
+    expr: finished_at IS NULL OR finished_at >= started_at
+    desc: Run cannot finish before it starts
+  - name: uq_reference_data_refresh_run_key
+    type: unique
+    columns:
+    - run_key
+    desc: Idempotent registration of a run.
+  - name: ck_reference_data_refresh_counts_nonneg
+    type: check
+    expr: rows_loaded >= 0 AND rows_rejected >= 0
+    desc: Counters are never negative
+  indexes:
+  - name: idx_reference_data_refresh_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    desc: 'Foreign-key leading index: parent-to-children lookups for this star key.'
+  fks:
+  - name: fk_reference_data_refresh_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    ref: reference_data_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+  - name: fk_reference_data_refresh_reference_refresh_status_id
+    columns:
+    - reference_refresh_status_id
+    ref: reference_refresh_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+- name: salary_benchmark
+  kind: snapshot
+  delete_policy: hard
+  volume: medium
+  tier: '3'
+  milestones: []
+  retention: Reference snapshots kept 3 years for trend analysis, then deleted by the monthly purge job; contain no personal data.
+  description: 'OPTIONAL Tier 3. Grain: one row per job role x place (city, state or country) x experience band x industry x reference period. Blended percentile bands of annual salary; reference data only
+    (never a promise of pay). Sources are listed in salary_benchmark_source.'
+  columns:
+  - name: benchmark_key
+    type: STRING(200)
+    domain: code
+    desc: 'Natural key: role|industry|country|state|city|experience band|period start, built by the loader; NULL parts are written as ''-''.'
+    sens: Internal
+  - name: job_role_id
+    type: UUID
+    domain: identifier
+    desc: Job role benchmarked.
+    sens: Internal
+  - name: industry_id
+    type: UUID
+    domain: identifier
+    desc: Industry filter.
+    sens: Internal
+    'null': true
+    null_why: NULL = all industries
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Country of the salary market.
+    sens: Internal
+  - name: state_region_id
+    type: UUID
+    domain: identifier
+    desc: State or region.
+    sens: Internal
+    'null': true
+    null_why: NULL = whole country
+  - name: city_id
+    type: UUID
+    domain: identifier
+    desc: City.
+    sens: Internal
+    'null': true
+    null_why: NULL = state or country level
+  - name: salary_experience_band_id
+    type: UUID
+    domain: enum_ref
+    desc: Experience band.
+    sens: Internal
+  - name: reference_period_start_date
+    type: DATE
+    domain: date
+    desc: Start of the period the data describes.
+    sens: Internal
+  - name: reference_period_end_date
+    type: DATE
+    domain: date
+    desc: End of the period the data describes.
+    sens: Internal
+  - name: p10_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: 10th percentile of annual pay.
+    sens: Internal
+  - name: p25_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: 25th percentile.
+    sens: Internal
+  - name: p50_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Median annual pay.
+    sens: Internal
+  - name: p75_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: 75th percentile.
+    sens: Internal
+  - name: p90_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: 90th percentile.
+    sens: Internal
+  - name: sample_size
+    type: INT4
+    domain: quantity
+    desc: Observations behind the bands (minimum 30 enforced for publication).
+    sens: Internal
+    default: '0'
+  - name: confidence_ratio
+    type: DECIMAL(9,6)
+    domain: ratio
+    desc: Share of weight from sources with a sample size above 30 (0..1).
+    sens: Internal
+    'null': true
+    null_why: NULL = confidence not computed
+  - name: is_publishable
+    type: BOOL
+    domain: boolean
+    desc: Meets minimum sample size and licence conditions; unpublishable rows are never shown.
+    sens: Internal
+    default: 'false'
+  - name: refreshed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When this blended row was last recomputed from its sources.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of every money column in this row (FK currency).
+    sens: Internal
+  constraints:
+  - name: ck_salary_benchmark_confidence_ratio_range
+    type: check
+    expr: confidence_ratio IS NULL OR (confidence_ratio >= 0 AND confidence_ratio <= 1)
+    desc: confidence_ratio within 0..1
+  - name: ck_salary_benchmark_period_range
+    type: check
+    expr: reference_period_end_date >= reference_period_start_date
+    desc: Period cannot end before it starts
+  - name: ck_salary_benchmark_percentile_order
+    type: check
+    expr: p10_amount <= p25_amount AND p25_amount <= p50_amount AND p50_amount <= p75_amount AND p75_amount <= p90_amount
+    desc: Percentile bands must be non-decreasing
+  - name: ck_salary_benchmark_sample_nonneg
+    type: check
+    expr: sample_size >= 0
+    desc: Sample size cannot be negative
+  - name: uq_salary_benchmark_benchmark_key
+    type: unique
+    columns:
+    - benchmark_key
+    desc: One benchmark per dimensional key and period.
+  - name: ck_salary_benchmark_counts_nonneg
+    type: check
+    expr: sample_size >= 0
+    desc: Counters are never negative
+  indexes:
+  - name: idx_salary_benchmark_job_role_id_country_id_reference_period_start_date
+    columns:
+    - job_role_id
+    - country_id
+    - reference_period_start_date DESC
+    desc: Salary lookup for a role in a market, newest first.
+    storing:
+    - p25_amount
+    - p50_amount
+    - p75_amount
+    - is_publishable
+    where: is_publishable
+  - name: idx_salary_benchmark_country_id
+    columns:
+    - country_id
+    desc: 'Foreign-key leading index: parent-to-children lookups for this star key.'
+  fks:
+  - name: fk_salary_benchmark_job_role_id
+    columns:
+    - job_role_id
+    ref: job_role
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+  - name: fk_salary_benchmark_industry_id
+    columns:
+    - industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: industry roll-ups use the benchmark_key; no reverse lookup
+  - name: fk_salary_benchmark_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+  - name: fk_salary_benchmark_state_region_id
+    columns:
+    - state_region_id
+    ref: state_region
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: optional geographic filter; covered by benchmark_key
+  - name: fk_salary_benchmark_city_id
+    columns:
+    - city_id
+    ref: city
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: optional geographic filter; covered by benchmark_key
+  - name: fk_salary_benchmark_salary_experience_band_id
+    columns:
+    - salary_experience_band_id
+    ref: salary_experience_band
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+  - name: fk_salary_benchmark_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: currencies are never deleted'
+    index_exempt: currency has ~20 rows; no reverse lookup needed
+- name: salary_benchmark_source
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '3'
+  milestones: []
+  retention: Reference snapshots kept 3 years for trend analysis, then deleted by the monthly purge job; contain no personal data.
+  description: 'OPTIONAL Tier 3. Grain: one row per salary benchmark x contributing source. Gives per-source attribution, sample size, median and retrieval time behind each blended row.'
+  columns:
+  - name: salary_benchmark_id
+    type: UUID
+    domain: identifier
+    desc: Blended benchmark the contribution belongs to.
+    sens: Internal
+  - name: reference_data_source_id
+    type: UUID
+    domain: identifier
+    desc: Contributing source.
+    sens: Internal
+  - name: source_record_ref
+    type: STRING(120)
+    domain: code
+    desc: Source's own record identifier (idempotency and traceability).
+    sens: Internal
+  - name: source_sample_size
+    type: INT4
+    domain: quantity
+    desc: Observations from this source.
+    sens: Internal
+    default: '0'
+  - name: source_p50_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Median reported by this source.
+    sens: Internal
+    'null': true
+    null_why: NULL = source gave no median
+  - name: blend_weight
+    type: DECIMAL(9,6)
+    domain: ratio
+    desc: Weight of the source in the blended bands (0..1).
+    sens: Internal
+  - name: retrieved_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the data was fetched from the source.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of every money column in this row (FK currency).
+    sens: Internal
+  constraints:
+  - name: ck_salary_benchmark_source_blend_weight_range
+    type: check
+    expr: blend_weight IS NULL OR (blend_weight >= 0 AND blend_weight <= 1)
+    desc: blend_weight within 0..1
+  - name: uq_salary_benchmark_source_benchmark_source
+    type: unique
+    columns:
+    - salary_benchmark_id
+    - reference_data_source_id
+    desc: A source contributes once per benchmark.
+  - name: uq_salary_benchmark_source_source_record_ref
+    type: unique
+    columns:
+    - reference_data_source_id
+    - source_record_ref
+    desc: Idempotent ingestion of a source record.
+  - name: ck_salary_benchmark_source_counts_nonneg
+    type: check
+    expr: source_sample_size >= 0
+    desc: Counters are never negative
+  fks:
+  - name: fk_salary_benchmark_source_salary_benchmark_id
+    columns:
+    - salary_benchmark_id
+    ref: salary_benchmark
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: 'CASCADE: child configuration rows have no meaning without the parent'
+  - name: fk_salary_benchmark_source_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    ref: reference_data_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the unique key or a composite index that leads with another column; reverse lookups by this column are rare
+  - name: fk_salary_benchmark_source_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: currencies are never deleted'
+    index_exempt: currency has ~20 rows; no reverse lookup needed
+- name: company_rating_snapshot
+  kind: snapshot
+  delete_policy: hard
+  volume: medium
+  tier: '3'
+  milestones: []
+  retention: Reference snapshots kept 3 years for trend analysis, then deleted by the monthly purge job; contain no personal data.
+  description: 'OPTIONAL Tier 3. Grain: one row per organisation x source x snapshot date. Ratings and review counts imported from external review sites as REFERENCE data with source attribution and refresh
+    time; review text is not stored.'
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation rated.
+    sens: Internal
+  - name: reference_data_source_id
+    type: UUID
+    domain: identifier
+    desc: Review source.
+    sens: Internal
+  - name: snapshot_date
+    type: DATE
+    domain: date
+    desc: Date of the snapshot.
+    sens: Internal
+  - name: source_company_ref
+    type: STRING(120)
+    domain: code
+    desc: Source's identifier of the company (match key, not an FK).
+    sens: Internal
+  - name: source_page_url
+    type: STRING(500)
+    domain: url
+    desc: Public page on the source that the UI links back to.
+    sens: Internal
+    'null': true
+    null_why: NULL = source has no public page
+  - name: overall_rating
+    type: DECIMAL(3,2)
+    domain: measure
+    desc: Overall rating on a 1.00..5.00 scale.
+    sens: Internal
+  - name: work_life_balance_rating
+    type: DECIMAL(3,2)
+    domain: measure
+    desc: Sub-rating 1..5.
+    sens: Internal
+    'null': true
+    null_why: NULL = source does not publish it
+  - name: compensation_rating
+    type: DECIMAL(3,2)
+    domain: measure
+    desc: Sub-rating 1..5.
+    sens: Internal
+    'null': true
+    null_why: NULL = source does not publish it
+  - name: culture_rating
+    type: DECIMAL(3,2)
+    domain: measure
+    desc: Sub-rating 1..5.
+    sens: Internal
+    'null': true
+    null_why: NULL = source does not publish it
+  - name: career_growth_rating
+    type: DECIMAL(3,2)
+    domain: measure
+    desc: Sub-rating 1..5.
+    sens: Internal
+    'null': true
+    null_why: NULL = source does not publish it
+  - name: recommend_percent
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Share of reviewers recommending the employer.
+    sens: Internal
+    'null': true
+    null_why: NULL = source does not publish it
+  - name: review_count
+    type: INT4
+    domain: quantity
+    desc: Reviews behind the rating.
+    sens: Internal
+    default: '0'
+  - name: match_confidence
+    type: DECIMAL(9,6)
+    domain: ratio
+    desc: Confidence 0..1 that the source company is this organisation (entity resolution).
+    sens: Internal
+  - name: refreshed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the snapshot was fetched.
+    sens: Internal
+  - name: is_displayable
+    type: BOOL
+    domain: boolean
+    desc: Passed the match-confidence and staleness thresholds; only displayable rows reach the UI.
+    sens: Internal
+    default: 'false'
+  constraints:
+  - name: ck_company_rating_snapshot_recommend_percent_range
+    type: check
+    expr: recommend_percent IS NULL OR (recommend_percent >= 0 AND recommend_percent <= 100)
+    desc: recommend_percent within 0..100
+  - name: ck_company_rating_snapshot_match_confidence_range
+    type: check
+    expr: match_confidence IS NULL OR (match_confidence >= 0 AND match_confidence <= 1)
+    desc: match_confidence within 0..1
+  - name: ck_company_rating_snapshot_rating_range
+    type: check
+    expr: overall_rating >= 1 AND overall_rating <= 5
+    desc: Rating 1..5
+  - name: ck_company_rating_snapshot_sub_rating_range
+    type: check
+    expr: (work_life_balance_rating IS NULL OR (work_life_balance_rating >= 1 AND work_life_balance_rating <= 5)) AND (compensation_rating IS NULL OR (compensation_rating >= 1 AND compensation_rating <=
+      5)) AND (culture_rating IS NULL OR (culture_rating >= 1 AND culture_rating <= 5)) AND (career_growth_rating IS NULL OR (career_growth_rating >= 1 AND career_growth_rating <= 5))
+    desc: Sub-ratings 1..5
+  - name: uq_company_rating_snapshot_grain
+    type: unique
+    columns:
+    - organisation_id
+    - reference_data_source_id
+    - snapshot_date
+    desc: One snapshot per organisation, source and date.
+  - name: ck_company_rating_snapshot_counts_nonneg
+    type: check
+    expr: review_count >= 0
+    desc: Counters are never negative
+  indexes:
+  - name: idx_company_rating_snapshot_organisation_id_snapshot_date
+    columns:
+    - organisation_id
+    - snapshot_date DESC
+    desc: Latest rating of an organisation.
+    where: is_displayable
+    storing:
+    - overall_rating
+    - review_count
+  fks:
+  - name: fk_company_rating_snapshot_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+  - name: fk_company_rating_snapshot_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    ref: reference_data_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the unique key or a composite index that leads with another column; reverse lookups by this column are rare
+- name: trending_job_snapshot
+  kind: snapshot
+  delete_policy: hard
+  volume: medium
+  tier: '3'
+  milestones: []
+  retention: Reference snapshots kept 3 years for trend analysis, then deleted by the monthly purge job; contain no personal data.
+  description: 'OPTIONAL Tier 3. Grain: one row per snapshot date x scope (role, skill, location or industry) x subject: ranked list of what is trending. Computed from Talentra analytics (reference_data_source
+    ''internal_analytics'') or imported from an external trend feed.'
+  columns:
+  - name: snapshot_date
+    type: DATE
+    domain: date
+    desc: Date of the ranking.
+    sens: Internal
+  - name: trending_scope_id
+    type: UUID
+    domain: enum_ref
+    desc: What kind of subject is ranked.
+    sens: Internal
+  - name: subject_key
+    type: STRING(120)
+    domain: code
+    desc: Natural key of the subject inside the scope (id text), used for the unique key.
+    sens: Internal
+  - name: job_role_id
+    type: UUID
+    domain: identifier
+    desc: Ranked role.
+    sens: Internal
+    'null': true
+    null_why: NULL unless scope is job_role
+  - name: skill_id
+    type: UUID
+    domain: identifier
+    desc: Ranked skill.
+    sens: Internal
+    'null': true
+    null_why: NULL unless scope is skill
+  - name: city_id
+    type: UUID
+    domain: identifier
+    desc: Ranked location.
+    sens: Internal
+    'null': true
+    null_why: NULL unless scope is location
+  - name: industry_id
+    type: UUID
+    domain: identifier
+    desc: Ranked industry.
+    sens: Internal
+    'null': true
+    null_why: NULL unless scope is industry
+  - name: reference_data_source_id
+    type: UUID
+    domain: identifier
+    desc: Provider of the ranking.
+    sens: Internal
+  - name: rank_position
+    type: INT4
+    domain: quantity
+    desc: Rank, 1 = hottest.
+    sens: Internal
+    default: '0'
+  - name: previous_rank_position
+    type: INT4
+    domain: quantity
+    desc: Rank in the previous snapshot.
+    sens: Internal
+    'null': true
+    null_why: NULL = not ranked previously (new entrant)
+  - name: postings_count
+    type: INT4
+    domain: quantity
+    desc: Open postings supporting the rank.
+    sens: Internal
+    default: '0'
+  - name: applications_count
+    type: INT4
+    domain: quantity
+    desc: Applications supporting the rank.
+    sens: Internal
+    default: '0'
+  - name: growth_ratio
+    type: DECIMAL(9,4)
+    domain: measure
+    desc: Relative growth of postings versus the prior window (can be negative).
+    sens: Internal
+    'null': true
+    null_why: NULL = no prior window to compare
+  - name: window_days
+    type: INT4
+    domain: duration
+    desc: Length of the measured window in days.
+    sens: Internal
+    default: '30'
+  constraints:
+  - name: ck_trending_job_snapshot_rank_positive
+    type: check
+    expr: rank_position >= 1 AND (previous_rank_position IS NULL OR previous_rank_position >= 1)
+    desc: Ranks start at 1
+  - name: ck_trending_job_snapshot_one_subject
+    type: check
+    expr: (CASE WHEN job_role_id IS NULL THEN 0 ELSE 1 END) + (CASE WHEN skill_id IS NULL THEN 0 ELSE 1 END) + (CASE WHEN city_id IS NULL THEN 0 ELSE 1 END) + (CASE WHEN industry_id IS NULL THEN 0 ELSE
+      1 END) = 1
+    desc: Exactly one subject reference is set
+  - name: ck_trending_job_snapshot_window_positive
+    type: check
+    expr: window_days >= 1
+    desc: Window of at least one day
+  - name: uq_trending_job_snapshot_grain
+    type: unique
+    columns:
+    - snapshot_date
+    - trending_scope_id
+    - subject_key
+    desc: One row per date, scope and subject.
+  - name: ck_trending_job_snapshot_counts_nonneg
+    type: check
+    expr: rank_position >= 0 AND postings_count >= 0 AND applications_count >= 0
+    desc: Counters are never negative
+  indexes:
+  - name: idx_trending_job_snapshot_trending_scope_id_snapshot_date_rank_position
+    columns:
+    - trending_scope_id
+    - snapshot_date DESC
+    - rank_position
+    desc: Top-N list of a scope for the latest date.
+  - name: idx_trending_job_snapshot_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    desc: 'Foreign-key leading index: parent-to-children lookups for this star key.'
+  fks:
+  - name: fk_trending_job_snapshot_trending_scope_id
+    columns:
+    - trending_scope_id
+    ref: trending_scope
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+  - name: fk_trending_job_snapshot_job_role_id
+    columns:
+    - job_role_id
+    ref: job_role
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: subject lookups go through subject_key
+  - name: fk_trending_job_snapshot_skill_id
+    columns:
+    - skill_id
+    ref: skill
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: subject lookups go through subject_key
+  - name: fk_trending_job_snapshot_city_id
+    columns:
+    - city_id
+    ref: city
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: subject lookups go through subject_key
+  - name: fk_trending_job_snapshot_industry_id
+    columns:
+    - industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: subject lookups go through subject_key
+  - name: fk_trending_job_snapshot_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    ref: reference_data_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+- name: skill_demand_snapshot
+  kind: snapshot
+  delete_policy: hard
+  volume: medium
+  tier: '3'
+  milestones: []
+  retention: Reference snapshots kept 3 years for trend analysis, then deleted by the monthly purge job; contain no personal data.
+  description: 'OPTIONAL Tier 3. Grain: one row per skill x country x snapshot date: open demand vs candidate supply. Derived from analytics (fact_job_posting_daily, bridge_candidate_skill) as a reference
+    table the product can serve without joining the analytics star.'
+  columns:
+  - name: skill_id
+    type: UUID
+    domain: identifier
+    desc: Skill measured.
+    sens: Internal
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Market.
+    sens: Internal
+  - name: snapshot_date
+    type: DATE
+    domain: date
+    desc: Date of the measurement.
+    sens: Internal
+  - name: open_postings_count
+    type: INT4
+    domain: quantity
+    desc: Open job and gig postings requiring the skill.
+    sens: Internal
+    default: '0'
+  - name: candidate_supply_count
+    type: INT4
+    domain: quantity
+    desc: Active candidates holding the skill.
+    sens: Internal
+    default: '0'
+  - name: demand_supply_ratio
+    type: DECIMAL(9,4)
+    domain: measure
+    desc: open_postings_count / candidate_supply_count.
+    sens: Internal
+    'null': true
+    null_why: NULL = zero supply (ratio undefined, not zero)
+  - name: median_posted_salary_amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Median posted annual salary of postings requiring the skill.
+    sens: Internal
+    'null': true
+    null_why: NULL = no postings disclose salary
+  - name: year_on_year_growth_ratio
+    type: DECIMAL(9,4)
+    domain: measure
+    desc: Change in open postings versus the same date last year (can be negative).
+    sens: Internal
+    'null': true
+    null_why: NULL = no data a year ago
+  - name: reference_data_source_id
+    type: UUID
+    domain: identifier
+    desc: Source (internal analytics for computed rows).
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of every money column in this row (FK currency).
+    sens: Internal
+  constraints:
+  - name: uq_skill_demand_snapshot_grain
+    type: unique
+    columns:
+    - skill_id
+    - country_id
+    - snapshot_date
+    desc: One row per skill, country and date.
+  - name: ck_skill_demand_snapshot_counts_nonneg
+    type: check
+    expr: open_postings_count >= 0 AND candidate_supply_count >= 0
+    desc: Counters are never negative
+  indexes:
+  - name: idx_skill_demand_snapshot_country_id_snapshot_date_open_postings_count
+    columns:
+    - country_id
+    - snapshot_date DESC
+    - open_postings_count DESC
+    desc: Most demanded skills in a country.
+  fks:
+  - name: fk_skill_demand_snapshot_skill_id
+    columns:
+    - skill_id
+    ref: skill
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+  - name: fk_skill_demand_snapshot_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the unique key or a composite index that leads with another column; reverse lookups by this column are rare
+  - name: fk_skill_demand_snapshot_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    ref: reference_data_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the unique key or a composite index that leads with another column; reverse lookups by this column are rare
+  - name: fk_skill_demand_snapshot_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: currencies are never deleted'
+    index_exempt: currency has ~20 rows; no reverse lookup needed
+- name: industry_growth_snapshot
+  kind: snapshot
+  delete_policy: hard
+  volume: low
+  tier: '3'
+  milestones: []
+  retention: Reference snapshots kept 3 years for trend analysis, then deleted by the monthly purge job; contain no personal data.
+  description: 'OPTIONAL Tier 3. Grain: one row per industry x country x reference period: hiring growth and headcount index, from internal analytics or an external statistics source.'
+  columns:
+  - name: industry_id
+    type: UUID
+    domain: identifier
+    desc: Industry measured.
+    sens: Internal
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Market.
+    sens: Internal
+  - name: reference_data_source_id
+    type: UUID
+    domain: identifier
+    desc: Source of the figures.
+    sens: Internal
+  - name: reference_period_start_date
+    type: DATE
+    domain: date
+    desc: Start of the period.
+    sens: Internal
+  - name: reference_period_end_date
+    type: DATE
+    domain: date
+    desc: End of the period.
+    sens: Internal
+  - name: hiring_growth_ratio
+    type: DECIMAL(9,4)
+    domain: measure
+    desc: Growth in hires versus the previous period (can be negative).
+    sens: Internal
+    'null': true
+    null_why: NULL = no previous period
+  - name: headcount_index
+    type: DECIMAL(12,2)
+    domain: measure
+    desc: Headcount index with base period = 100.
+    sens: Internal
+    'null': true
+    null_why: NULL = source does not publish an index
+  - name: postings_count
+    type: INT4
+    domain: quantity
+    desc: Postings in the period.
+    sens: Internal
+    default: '0'
+  - name: refreshed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the row was fetched or computed.
+    sens: Internal
+  constraints:
+  - name: ck_industry_growth_snapshot_period_range
+    type: check
+    expr: reference_period_end_date >= reference_period_start_date
+    desc: Period cannot end before it starts
+  - name: uq_industry_growth_snapshot_grain
+    type: unique
+    columns:
+    - industry_id
+    - country_id
+    - reference_data_source_id
+    - reference_period_start_date
+    desc: One row per industry, market, source and period.
+  - name: ck_industry_growth_snapshot_counts_nonneg
+    type: check
+    expr: postings_count >= 0
+    desc: Counters are never negative
+  fks:
+  - name: fk_industry_growth_snapshot_industry_id
+    columns:
+    - industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+  - name: fk_industry_growth_snapshot_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the unique key or a composite index that leads with another column; reverse lookups by this column are rare
+  - name: fk_industry_growth_snapshot_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    ref: reference_data_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the unique key or a composite index that leads with another column; reverse lookups by this column are rare
+- name: location_cost_index
+  kind: snapshot
+  delete_policy: hard
+  volume: low
+  tier: '3'
+  milestones: []
+  retention: Reference snapshots kept 3 years for trend analysis, then deleted by the monthly purge job; contain no personal data.
+  description: 'OPTIONAL Tier 3. Grain: one row per city x source x reference date: cost-of-living indices used to compare offers across cities. Reference data with attribution.'
+  columns:
+  - name: city_id
+    type: UUID
+    domain: identifier
+    desc: City measured.
+    sens: Internal
+  - name: base_city_id
+    type: UUID
+    domain: identifier
+    desc: City whose index is fixed at 100.
+    sens: Internal
+    'null': true
+    null_why: NULL = the source index has no named base city
+  - name: reference_data_source_id
+    type: UUID
+    domain: identifier
+    desc: Source of the index.
+    sens: Internal
+  - name: reference_date
+    type: DATE
+    domain: date
+    desc: Date the index describes.
+    sens: Internal
+  - name: cost_of_living_index
+    type: DECIMAL(12,2)
+    domain: measure
+    desc: Overall cost-of-living index (base = 100).
+    sens: Internal
+  - name: rent_index
+    type: DECIMAL(12,2)
+    domain: measure
+    desc: Rent index (base = 100).
+    sens: Internal
+    'null': true
+    null_why: NULL = source does not publish it
+  - name: purchasing_power_index
+    type: DECIMAL(12,2)
+    domain: measure
+    desc: Local purchasing power index.
+    sens: Internal
+    'null': true
+    null_why: NULL = source does not publish it
+  - name: refreshed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the row was fetched.
+    sens: Internal
+  constraints:
+  - name: ck_location_cost_index_index_positive
+    type: check
+    expr: cost_of_living_index > 0
+    desc: Index must be positive
+  - name: uq_location_cost_index_grain
+    type: unique
+    columns:
+    - city_id
+    - reference_data_source_id
+    - reference_date
+    desc: One index per city, source and date.
+  fks:
+  - name: fk_location_cost_index_city_id
+    columns:
+    - city_id
+    ref: city
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+  - name: fk_location_cost_index_base_city_id
+    columns:
+    - base_city_id
+    ref: city
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: rare base-city lookups
+  - name: fk_location_cost_index_reference_data_source_id
+    columns:
+    - reference_data_source_id
+    ref: reference_data_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the unique key or a composite index that leads with another column; reverse lookups by this column are rare
+- name: dashboard_aggregate
+  kind: snapshot
+  delete_policy: hard
+  volume: medium
+  tier: '3'
+  milestones: []
+  retention: Tiles are overwritten on refresh and expire 30 days after as_of_at (row-level TTL); no personal data beyond the scope key.
+  description: 'OPTIONAL Tier 3. Grain: one row per dashboard tile x audience scope (platform, one organisation, one recruiter, one candidate). Pre-computed tile payload with as_of time so dashboards load
+    without running aggregates; fed from the analytics layer by a scheduled job.'
+  ttl:
+    expire_after: 30 days
+    column: as_of_at
+  columns:
+  - name: tile_code
+    type: STRING(64)
+    domain: code
+    desc: Tile identifier, for example 'funnel_90d' or 'wallet_cover'.
+    sens: Internal
+  - name: dashboard_scope_id
+    type: UUID
+    domain: enum_ref
+    desc: Audience scope of the tile.
+    sens: Internal
+  - name: scope_key
+    type: STRING(80)
+    domain: code
+    desc: '''platform'' or ''<scope>:<uuid>'' of the organisation/recruiter/candidate; part of the natural key.'
+    sens: Internal
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation the tile belongs to.
+    sens: Internal
+    'null': true
+    null_why: NULL unless the scope is organisation
+  - name: tile_payload
+    type: JSONB
+    domain: json
+    desc: Pre-computed tile content (series, totals, labels).
+    sens: Internal
+  - name: as_of_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Instant as of which the payload was computed (AS OF SYSTEM TIME instant of the source read).
+    sens: Internal
+  - name: source_dim_etl_run_id
+    type: UUID
+    domain: identifier
+    desc: Analytics run that produced the data.
+    sens: Internal
+    'null': true
+    null_why: NULL = tile computed outside the analytics pipeline
+  - name: schema_version
+    type: INT4
+    domain: quantity
+    desc: Payload schema version for front-end compatibility.
+    sens: Internal
+    default: '1'
+  constraints:
+  - name: uq_dashboard_aggregate_tile_scope
+    type: unique
+    columns:
+    - tile_code
+    - scope_key
+    desc: One current tile per code and audience.
+  indexes:
+  - name: idx_dashboard_aggregate_source_dim_etl_run_id
+    columns:
+    - source_dim_etl_run_id
+    desc: 'Foreign-key leading index: parent-to-children lookups for this star key.'
+  fks:
+  - name: fk_dashboard_aggregate_dashboard_scope_id
+    columns:
+    - dashboard_scope_id
+    ref: dashboard_scope
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+  - name: fk_dashboard_aggregate_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: tile reads go through the unique (tile_code, scope_key)
+  - name: fk_dashboard_aggregate_source_dim_etl_run_id
+    columns:
+    - source_dim_etl_run_id
+    ref: dim_etl_run
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: dimension members are retained for the life of the facts that reference them'
+- name: feature_flag
+  kind: config
+  delete_policy: soft
+  volume: low
+  tier: '3'
+  milestones: []
+  retention: Soft-deleted when archived; kept 7 years for audit.
+  description: 'OPTIONAL Tier 3. Grain: one row per feature flag (release toggle, kill switch, experiment, entitlement toggle). Evaluated by the application; rules, overrides and every change are in the
+    child tables.'
+  columns:
+  - name: flag_key
+    type: STRING(80)
+    domain: code
+    desc: Natural key used in code, for example 'gig_marketplace_v2'.
+    sens: Internal
+  - name: flag_name
+    type: STRING(150)
+    domain: free_text
+    desc: Human name.
+    sens: Public
+  - name: description
+    type: STRING(1000)
+    domain: free_text
+    desc: What the flag controls and the rollback plan.
+    sens: Internal
+  - name: feature_flag_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Purpose of the flag.
+    sens: Internal
+  - name: feature_flag_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Lifecycle state.
+    sens: Internal
+  - name: default_enabled
+    type: BOOL
+    domain: boolean
+    desc: Value when no rule or override matches.
+    sens: Internal
+    default: 'false'
+  - name: rollout_percent
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Share of the audience that gets the flag when percentage rules apply.
+    sens: Internal
+  - name: owner_team
+    type: STRING(100)
+    domain: free_text
+    desc: Team accountable for removing the flag.
+    sens: Internal
+  - name: review_by_date
+    type: DATE
+    domain: date
+    desc: Date by which a release flag must be removed or re-justified.
+    sens: Internal
+    'null': true
+    null_why: NULL = permanent operational flag
+  constraints:
+  - name: ck_feature_flag_rollout_percent_range
+    type: check
+    expr: rollout_percent IS NULL OR (rollout_percent >= 0 AND rollout_percent <= 100)
+    desc: rollout_percent within 0..100
+  indexes:
+  - name: uq_feature_flag_flag_key
+    columns:
+    - flag_key
+    desc: Natural key among live flags.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_feature_flag_feature_flag_status_id
+    columns:
+    - feature_flag_status_id
+    desc: Active flags for the evaluation cache.
+    where: deleted_at IS NULL
+  fks:
+  - name: fk_feature_flag_feature_flag_type_id
+    columns:
+    - feature_flag_type_id
+    ref: feature_flag_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+  - name: fk_feature_flag_feature_flag_status_id
+    columns:
+    - feature_flag_status_id
+    ref: feature_flag_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+- name: feature_flag_rule
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '3'
+  milestones: []
+  retention: Deleted with the flag's retirement after 7 years via the archive job.
+  description: 'OPTIONAL Tier 3. Grain: one row per ordered targeting rule of a feature flag (attribute operator value). First matching rule by rule_order wins.'
+  columns:
+  - name: feature_flag_id
+    type: UUID
+    domain: identifier
+    desc: Flag the rule belongs to.
+    sens: Internal
+  - name: rule_order
+    type: INT4
+    domain: quantity
+    desc: Evaluation order, 1 = first.
+    sens: Internal
+  - name: feature_flag_attribute_id
+    type: UUID
+    domain: enum_ref
+    desc: Attribute evaluated.
+    sens: Internal
+  - name: feature_flag_operator_id
+    type: UUID
+    domain: enum_ref
+    desc: Comparison operator.
+    sens: Internal
+  - name: match_value
+    type: JSONB
+    domain: json
+    desc: Value or list compared with (for percentage_bucket the percentage).
+    sens: Internal
+  - name: result_enabled
+    type: BOOL
+    domain: boolean
+    desc: Flag value when the rule matches.
+    sens: Internal
+    default: 'true'
+  - name: effective_from
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Rule active from.
+    sens: Internal
+    default: now()
+  - name: effective_to
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Rule active until.
+    sens: Internal
+    'null': true
+    null_why: NULL = open-ended
+  constraints:
+  - name: ck_feature_flag_rule_effective_range
+    type: check
+    expr: effective_to IS NULL OR effective_to >= effective_from
+    desc: Rule window cannot be inverted
+  - name: ck_feature_flag_rule_order_positive
+    type: check
+    expr: rule_order >= 1
+    desc: Order starts at 1
+  - name: uq_feature_flag_rule_order
+    type: unique
+    columns:
+    - feature_flag_id
+    - rule_order
+    desc: Rule order is unique inside a flag.
+  fks:
+  - name: fk_feature_flag_rule_feature_flag_id
+    columns:
+    - feature_flag_id
+    ref: feature_flag
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: 'CASCADE: child configuration rows have no meaning without the parent'
+  - name: fk_feature_flag_rule_feature_flag_attribute_id
+    columns:
+    - feature_flag_attribute_id
+    ref: feature_flag_attribute
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+  - name: fk_feature_flag_rule_feature_flag_operator_id
+    columns:
+    - feature_flag_operator_id
+    ref: feature_flag_operator
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+- name: feature_flag_override
+  kind: config
+  delete_policy: soft
+  volume: low
+  tier: '3'
+  milestones: []
+  retention: Soft-deleted when revoked or expired; kept 2 years.
+  description: 'OPTIONAL Tier 3. Grain: one row per manual override of a flag for one user or one organisation (support, canary, opt-out).'
+  columns:
+  - name: feature_flag_id
+    type: UUID
+    domain: identifier
+    desc: Flag overridden.
+    sens: Internal
+  - name: app_user_id
+    type: UUID
+    domain: identifier
+    desc: User the override applies to.
+    sens: Internal
+    'null': true
+    null_why: NULL when the override targets an organisation
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Organisation the override applies to.
+    sens: Internal
+    'null': true
+    null_why: NULL when the override targets a user
+  - name: is_enabled
+    type: BOOL
+    domain: boolean
+    desc: Forced flag value.
+    sens: Internal
+    default: 'true'
+  - name: reason
+    type: STRING(500)
+    domain: free_text
+    desc: Why the override was set (ticket reference).
+    sens: Internal
+  - name: expires_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Override end.
+    sens: Internal
+    'null': true
+    null_why: NULL = until revoked
+  constraints:
+  - name: ck_feature_flag_override_one_target
+    type: check
+    expr: (app_user_id IS NULL) <> (organisation_id IS NULL)
+    desc: Exactly one of user or organisation
+  indexes:
+  - name: uq_feature_flag_override_feature_flag_id_app_user_id
+    columns:
+    - feature_flag_id
+    - app_user_id
+    desc: One live override per flag and user.
+    unique: true
+    where: app_user_id IS NOT NULL AND deleted_at IS NULL
+  - name: uq_feature_flag_override_feature_flag_id_organisation_id
+    columns:
+    - feature_flag_id
+    - organisation_id
+    desc: One live override per flag and organisation.
+    unique: true
+    where: organisation_id IS NOT NULL AND deleted_at IS NULL
+  fks:
+  - name: fk_feature_flag_override_feature_flag_id
+    columns:
+    - feature_flag_id
+    ref: feature_flag
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: 'CASCADE: child configuration rows have no meaning without the parent'
+  - name: fk_feature_flag_override_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the partial unique index (feature_flag_id, app_user_id)
+  - name: fk_feature_flag_override_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+    index_exempt: covered by the partial unique index (feature_flag_id, organisation_id)
+- name: feature_flag_audit
+  kind: audit
+  delete_policy: append_only
+  volume: low
+  tier: '3'
+  milestones: []
+  retention: Append-only; kept 7 years with the audit trail.
+  description: 'OPTIONAL Tier 3. Grain: one row per change to a feature flag, linking the flag to the platform-wide audit_event row (the single append-only audit trail) with the before and after value.'
+  columns:
+  - name: feature_flag_id
+    type: UUID
+    domain: identifier
+    desc: Flag changed.
+    sens: Internal
+  - name: audit_event_id
+    type: UUID
+    domain: identifier
+    desc: Entry in the platform audit trail that records who did it.
+    sens: Internal
+    'null': true
+    null_why: NULL = the audit_event row aged out of its 400-day TTL; the flag change record is self-describing.
+  - name: feature_flag_change_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Kind of change.
+    sens: Internal
+  - name: before_value
+    type: JSONB
+    domain: json
+    desc: Flag definition before the change.
+    sens: Internal
+    'null': true
+    null_why: NULL = creation
+  - name: after_value
+    type: JSONB
+    domain: json
+    desc: Flag definition after the change.
+    sens: Internal
+  constraints:
+  - name: uq_feature_flag_audit_audit_event
+    type: unique
+    columns:
+    - audit_event_id
+    desc: An audit event describes at most one flag change.
+  indexes:
+  - name: idx_feature_flag_audit_feature_flag_id
+    columns:
+    - feature_flag_id
+    desc: 'Foreign-key leading index: parent-to-children lookups for this star key.'
+  fks:
+  - name: fk_feature_flag_audit_feature_flag_id
+    columns:
+    - feature_flag_id
+    ref: feature_flag
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: reference snapshots must not silently lose the entity they describe'
+  - name: fk_feature_flag_audit_audit_event_id
+    columns:
+    - audit_event_id
+    ref: audit_event
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: the parent is removed by its row-level TTL (CockroachDB TTL jobs fail while a RESTRICT child exists); the child row survives with the reference cleared (decision F-01).'
+    index_exempt: covered by the unique key or a composite index that leads with another column; reverse lookups by this column are rare
+  - name: fk_feature_flag_audit_feature_flag_change_kind_id
+    columns:
+    - feature_flag_change_kind_id
+    ref: feature_flag_change_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'RESTRICT: lookup values are retired, never deleted'
+    index_exempt: lookup with a handful of values; no reverse lookup needed
+views:
+- name: vw_salary_benchmark_published
+  kind: view
+  tables:
+  - salary_benchmark
+  - reference_data_source
+  purpose: Publishable salary benchmarks with attribution text and age, for the candidate and recruiter UI.
+  security: readable by all authenticated roles; no personal data
+  sql_sketch: SELECT b.*, s.attribution_text FROM salary_benchmark b JOIN salary_benchmark_source x ON x.salary_benchmark_id = b.id JOIN reference_data_source s ON s.id = x.reference_data_source_id WHERE
+    b.is_publishable AND now() - b.refreshed_at <= make_interval(days => s.max_staleness_days)
+- name: vw_company_rating_latest
+  kind: view
+  tables:
+  - company_rating_snapshot
+  - reference_data_source
+  purpose: Latest displayable rating per organisation and source with attribution.
+  security: authenticated roles
+  sql_sketch: SELECT DISTINCT ON (organisation_id, reference_data_source_id) * FROM company_rating_snapshot WHERE is_displayable ORDER BY organisation_id, reference_data_source_id, snapshot_date DESC
+- name: vw_feature_flag_effective
+  kind: view
+  tables:
+  - feature_flag
+  - feature_flag_rule
+  - feature_flag_override
+  purpose: Flag definitions with their live rules and overrides, read by the evaluation cache.
+  security: application service role only
+  sql_sketch: SELECT f.flag_key, f.default_enabled, r.* FROM feature_flag f LEFT JOIN feature_flag_rule r ON r.feature_flag_id = f.id WHERE f.deleted_at IS NULL
+business_rules:
+- id: BR-T3-01
+  rule: Tier 3 is an optional module; nothing outside it depends on it.
+  mechanism_type: FK
+  mechanism: FKs point only from tier3_reference tables to other modules; no other module references a tier3_reference table; dropping the module requires no change elsewhere.
+  tables:
+  - salary_benchmark
+  - feature_flag
+  milestone: B49
+- id: BR-T3-02
+  rule: Every reference row shows source attribution and a refresh date.
+  mechanism_type: FK
+  mechanism: NOT NULL reference_data_source_id FK (RESTRICT) and NOT NULL refreshed_at/retrieved_at on benchmarks, ratings, trends, indexes.
+  tables:
+  - salary_benchmark_source
+  - company_rating_snapshot
+  - location_cost_index
+  - industry_growth_snapshot
+  milestone: B49
+- id: BR-T3-03
+  rule: Salary percentile bands are ordered and unpublished below the minimum sample.
+  mechanism_type: CHECK
+  mechanism: CHECK (p10_amount <= p25_amount AND ... <= p90_amount); loader sets is_publishable = (sample_size >= 30 AND source licence allows); views read is_publishable only.
+  tables:
+  - salary_benchmark
+  milestone: B49
+- id: BR-T3-04
+  rule: Ratings stay in 1..5 and review counts are non-negative.
+  mechanism_type: CHECK
+  mechanism: CHECK (overall_rating >= 1 AND overall_rating <= 5) and sub-rating range check; recommend_percent 0..100.
+  tables:
+  - company_rating_snapshot
+  milestone: B49
+- id: BR-T3-05
+  rule: One snapshot per organisation, source and date; one benchmark per key.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE (organisation_id, reference_data_source_id, snapshot_date); UNIQUE (benchmark_key); makes re-import an upsert.
+  tables:
+  - company_rating_snapshot
+  - salary_benchmark
+  milestone: B49
+- id: BR-T3-06
+  rule: A refresh run is registered once per source window.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE (run_key) on reference_data_refresh; INSERT ... ON CONFLICT DO NOTHING returns the existing run.
+  tables:
+  - reference_data_refresh
+  milestone: B49
+- id: BR-T3-07
+  rule: Stale reference data is hidden, not shown.
+  mechanism_type: VIEW
+  mechanism: Views filter on now() - refreshed_at <= max_staleness_days; reference_data_source.max_staleness_days >= refresh_cadence_days by CHECK.
+  tables:
+  - reference_data_source
+  - salary_benchmark
+  milestone: B49
+- id: BR-T3-08
+  rule: A trending row ranks exactly one subject.
+  mechanism_type: CHECK
+  mechanism: CHECK that exactly one of job_role_id, skill_id, city_id, industry_id is non-NULL; unique (snapshot_date, trending_scope_id, subject_key).
+  tables:
+  - trending_job_snapshot
+  milestone: B49
+- id: BR-T3-09
+  rule: Dashboard tiles are unique per code and audience and expire.
+  mechanism_type: TTL
+  mechanism: UNIQUE (tile_code, scope_key); ttl_expiration_expression on as_of_at + 30 days.
+  tables:
+  - dashboard_aggregate
+  milestone: B49
+- id: BR-T3-10
+  rule: Feature flag keys are unique among live flags.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: CREATE UNIQUE INDEX uq_feature_flag_flag_key ON feature_flag (flag_key) WHERE deleted_at IS NULL.
+  tables:
+  - feature_flag
+  milestone: B49
+- id: BR-T3-11
+  rule: Rule order is unique within a flag and rule windows are valid.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE (feature_flag_id, rule_order); CHECK (effective_to IS NULL OR effective_to >= effective_from).
+  tables:
+  - feature_flag_rule
+  milestone: B49
+- id: BR-T3-12
+  rule: An override targets exactly one user or one organisation, one live override each.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: CHECK ((app_user_id IS NULL) <> (organisation_id IS NULL)); partial unique indexes (feature_flag_id, app_user_id) and (feature_flag_id, organisation_id) WHERE deleted_at IS NULL.
+  tables:
+  - feature_flag_override
+  milestone: B49
+- id: BR-T3-13
+  rule: Every feature flag change is audited in the platform audit trail.
+  mechanism_type: FK
+  mechanism: feature_flag_audit.audit_event_id NOT NULL FK to audit_event (UNIQUE); the app writes both rows in one transaction; feature_flag_audit is INSERT-only.
+  tables:
+  - feature_flag_audit
+  milestone: B49

@@ -1,0 +1,13 @@
+# Contract: these table names MUST exist exactly (defined by the owning module file) and may be referenced by FKs from any module.
+# Lint (partial mode) accepts FK refs to these names even if the owning file is not present yet.
+master_data: [country, state_region, city, language, currency, skill, skill_category, qualification, industry, job_role, job_category, employment_type, work_type, ui_label, ui_label_translation, geo_source, tax_id_type, document_type, gender, proficiency_level, salary_period, verification_status, visibility_level, notification_channel, address_type]
+administration: [app_user, app_role, permission, app_role_permission, app_user_role, user_credential, user_consent, consent_type, identity_session, audit_event, user_block, organisation_block]
+profile: [candidate_profile, resume, resume_template, candidate_education, candidate_experience, candidate_skill, candidate_project, candidate_shortlist_item]
+jobs_applications: [job_requirement, job_position, job_application, application_status, job_shortlist, interview, offer, questionnaire]
+organisation_account: [organisation, organisation_location, account, account_admin, recruiter_organisation_mapping]
+gig_marketplace: [gig_worker_profile, gig_request, gig_application, gig_assignment, gig_slot]
+licences_devices: [licence, licence_seat, device, device_session, device_slot]
+sourcing_consultant: [sourcing_request, outreach_batch, outreach_recipient]
+subscriptions_payments: [subscription_plan, subscription, subscription_period, wallet, wallet_ledger_entry, payment_order, invoice, refund, profile_download]
+notifications_community: [notification, notification_delivery, community_post, support_ticket]
+analytics: [dim_date]

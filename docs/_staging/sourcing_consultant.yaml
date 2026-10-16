@@ -1,0 +1,3690 @@
+module: sourcing_consultant
+notes: |2
+
+  **Scope.** Consultant (freelance recruiter) workflow and recruiter-side sourcing tooling: openness of jobs to consultants, sourcing requests and decisions, candidate sourcing shortlists/submissions, commission, bulk outreach (batches, recipients, templates, messages, replies, credit usage), saved searches, talent pools, notes/tags/ratings and contact tracking. Depth modelled on LinkedIn Recruiter (projects, saved searches with alerts, InMail credits with reply refund, notes/tags, templates), Naukri RESDEX (search history, mailers/bulk email credits, folders) and Monster (talent pools).
+
+  **Rule: a consultant may act only on requirements open to consultants (docket section 3).** Mechanism (no cross-table CHECK exists in CRDB):
+  1. `consultant_job_openness` rows exist only while a requirement is open. They are created by a txn that first runs `SELECT is_open_to_consultants FROM job_requirement WHERE id=$1 FOR UPDATE` and aborts when false; closing the flag (jobs module txn) must set `closed_at` on all openness rows and move live `sourcing_request` rows to `closed` in the same txn (BR-SRC-02).
+  2. `sourcing_request` carries `consultant_job_openness_id` and the composite FK `(job_requirement_id, consultant_job_openness_id) -> consultant_job_openness(job_requirement_id, id)`, so a request can only reference an openness row of its own requirement; CHECK/partial unique (`uq_sourcing_request_job_requirement_id_consultant_profile_id` live) allows one live request per consultant per requirement.
+  3. The consultant identity is bound by composite FK `(consultant_profile_id, consultant_app_user_id) -> consultant_profile(id, app_user_id)`.
+  4. Every consultant-facing child (shortlist, submission, outreach_batch with `is_consultant_sender`) requires a live `sourcing_request` (CHECK `ck_outreach_batch_consultant_needs_request`), and the access layer (RLS-style views `vw_consultant_open_requirement`) filters by `closed_at IS NULL AND valid window`.
+  Residual risk: the openness-row-exists-iff-flag-true link is transactional/app-enforced (documented in BR-SRC-02); an optional hardening is a trigger or CRDB row-level policy.
+
+  **Blocks.** Candidate blocks (administration `user_block`, `organisation_block`) bind outreach: recipients are inserted only through `INSERT ... SELECT ... WHERE NOT EXISTS (blocks)`; excluded candidates are logged in `outreach_exclusion`; the dispatcher re-checks before send (BR-SRC-06); `candidate_contact_attempt` records suppressed contacts. Recruiters cannot register candidates: no table here creates candidate_profile; outreach_recipient only references existing profiles.
+
+  **Money and credits.** Commission/fees use DECIMAL(18,4) + currency_id. Outreach credits are integers; the wallet and ledger live in subscriptions_payments: `outreach_credit_usage.wallet_ledger_entry_id` is a nullable FK (NULL while a free-quota use or before the ledger posting). Credit lifecycle reserve -> consume -> refund-on-reply (LinkedIn InMail style; refund window documented by vendors varies, 7-90 days, so it is a configurable job parameter, not hard-coded).
+
+  **Volume decisions.** `outreach_recipient`, `outreach_message`, `candidate_search_history`, `candidate_contact_attempt` are high/very_high with hash-sharded time indexes. `outreach_message` bodies are retained 90 days (TTL; integration boundary: message bodies only as long as audit needs); `outreach_reply` bodies 180 days; `candidate_search_history` 24 months. Search itself is an integration boundary (D-16): `saved_search.filters` JSONB (inverted index) feeds the search service; this module stores the query log, not results.
+
+  **Deviations / extension.** Sub-roles in an employer organisation are out of scope; a future `organisation_member_role` can gate `talent_pool`/`outreach_batch` actions. Commission is entity-level (status updates) with ledger posting in the subscriptions module; `invoice_id` is nullable until invoicing exists. Registry tables relied on: job_requirement, job_shortlist, candidate_profile, app_user, organisation, notification_channel, currency, language, job_category, skill, country, verification_status, visibility_level, wallet_ledger_entry, invoice, user_consent, job_application, audit_event.
+lookups:
+- name: sourcing_request_status
+  description: Lifecycle of a sourcing request.
+  values:
+  - code: requested
+    en: Requested
+    sort: 10
+  - code: accepted
+    en: Accepted
+    sort: 20
+    hi: स्वीकृत
+  - code: declined
+    en: Declined
+    sort: 30
+    hi: अस्वीकृत
+  - code: in_progress
+    en: In progress
+    sort: 40
+  - code: candidates_submitted
+    en: Candidates submitted
+    sort: 50
+  - code: closed
+    en: Closed
+    sort: 60
+  - code: expired
+    en: Expired
+    sort: 70
+  - code: cancelled
+    en: Cancelled
+    sort: 80
+  milestones:
+  - B37
+- name: decision_party
+  description: Party that took a decision on a sourcing request.
+  values:
+  - code: employer
+    en: Employer
+    sort: 10
+  - code: consultant
+    en: Consultant
+    sort: 20
+  milestones:
+  - B37
+- name: sourcing_decision_type
+  description: Type of decision.
+  values:
+  - code: accepted
+    en: Accepted
+    sort: 10
+  - code: declined
+    en: Declined
+    sort: 20
+  - code: withdrawn
+    en: Withdrawn
+    sort: 30
+  - code: counter_proposed
+    en: Counter-proposed terms
+    sort: 40
+  milestones:
+  - B37
+- name: sourcing_decision_reason
+  description: Reason for a decline/withdrawal.
+  values:
+  - code: fee_too_low
+    en: Fee too low
+    sort: 10
+  - code: no_capacity
+    en: No capacity
+    sort: 20
+  - code: not_my_domain
+    en: Outside specialisation
+    sort: 30
+  - code: conflict_of_interest
+    en: Conflict of interest
+    sort: 40
+  - code: job_closed
+    en: Job closed
+    sort: 50
+  - code: terms_not_agreed
+    en: Terms not agreed
+    sort: 60
+  - code: other
+    en: Other
+    sort: 70
+  milestones:
+  - B37
+- name: commission_model
+  description: How a consultant is paid.
+  values:
+  - code: percentage_of_ctc
+    en: Percentage of annual CTC
+    sort: 10
+  - code: fixed_fee
+    en: Fixed fee per hire
+    sort: 20
+  - code: retainer
+    en: Retainer
+    sort: 30
+  - code: hybrid
+    en: Retainer plus success fee
+    sort: 40
+  milestones:
+  - B40
+- name: commission_status
+  description: State of a commission/placement fee.
+  values:
+  - code: accrued
+    en: Accrued
+    sort: 10
+  - code: invoiced
+    en: Invoiced
+    sort: 20
+  - code: paid
+    en: Paid
+    sort: 30
+  - code: clawed_back
+    en: Clawed back
+    sort: 40
+  - code: void
+    en: Void
+    sort: 50
+  milestones:
+  - B40
+- name: submission_status
+  description: State of a consultant submission to an employer.
+  values:
+  - code: submitted
+    en: Submitted
+    sort: 10
+  - code: viewed
+    en: Viewed by employer
+    sort: 20
+  - code: shortlisted
+    en: Shortlisted
+    sort: 30
+  - code: rejected
+    en: Rejected
+    sort: 40
+  - code: hired
+    en: Hired
+    sort: 50
+  - code: withdrawn
+    en: Withdrawn
+    sort: 60
+  milestones:
+  - B40
+- name: outreach_batch_status
+  description: State of a bulk outreach batch.
+  values:
+  - code: draft
+    en: Draft
+    sort: 10
+  - code: scheduled
+    en: Scheduled
+    sort: 20
+  - code: sending
+    en: Sending
+    sort: 30
+  - code: completed
+    en: Completed
+    sort: 40
+  - code: cancelled
+    en: Cancelled
+    sort: 50
+  - code: failed
+    en: Failed
+    sort: 60
+  milestones:
+  - B37
+- name: outreach_delivery_status
+  description: Delivery state of one outreach recipient.
+  values:
+  - code: queued
+    en: Queued
+    sort: 10
+  - code: sent
+    en: Sent
+    sort: 20
+  - code: delivered
+    en: Delivered
+    sort: 30
+  - code: opened
+    en: Opened
+    sort: 40
+  - code: replied
+    en: Replied
+    sort: 50
+  - code: bounced
+    en: Bounced
+    sort: 60
+  - code: failed
+    en: Failed
+    sort: 70
+  - code: suppressed
+    en: Suppressed
+    sort: 80
+  milestones:
+  - B37
+  - B40
+- name: outreach_exclusion_reason
+  description: Why a candidate was excluded from a batch.
+  values:
+  - code: blocked
+    en: Candidate blocked sender
+    sort: 10
+  - code: opted_out
+    en: Opted out of outreach
+    sort: 20
+  - code: no_consent
+    en: No contact consent
+    sort: 30
+  - code: contacted_recently
+    en: Contacted recently
+    sort: 40
+  - code: duplicate
+    en: Duplicate
+    sort: 50
+  - code: no_channel_address
+    en: No reachable address
+    sort: 60
+  milestones:
+  - B37
+- name: outreach_template_status
+  description: Template state.
+  values:
+  - code: draft
+    en: Draft
+    sort: 10
+  - code: active
+    en: Active
+    sort: 20
+  - code: archived
+    en: Archived
+    sort: 30
+  milestones:
+  - B43
+- name: reply_intent
+  description: Classified intent of a reply.
+  values:
+  - code: interested
+    en: Interested
+    sort: 10
+  - code: not_interested
+    en: Not interested
+    sort: 20
+  - code: later
+    en: Maybe later
+    sort: 30
+  - code: wrong_contact
+    en: Wrong contact
+    sort: 40
+  - code: stop
+    en: Stop contacting me
+    sort: 50
+  milestones:
+  - B43
+- name: outreach_credit_event
+  description: Credit movement kind for outreach.
+  values:
+  - code: reserve
+    en: Reserve
+    sort: 10
+  - code: consume
+    en: Consume
+    sort: 20
+  - code: release_unused
+    en: Release unused
+    sort: 30
+  - code: refund_on_reply
+    en: Refund on reply
+    sort: 40
+  milestones:
+  - B43
+- name: saved_search_frequency
+  description: Alert frequency of a saved search.
+  values:
+  - code: realtime
+    en: Real time
+    sort: 10
+  - code: daily
+    en: Daily
+    sort: 20
+  - code: weekly
+    en: Weekly
+    sort: 30
+  - code: none
+    en: No alerts
+    sort: 40
+  milestones:
+  - B43
+- name: contact_attempt_outcome
+  description: Outcome of a contact attempt on a candidate.
+  values:
+  - code: sent
+    en: Sent
+    sort: 10
+  - code: suppressed_blocked
+    en: Suppressed (blocked)
+    sort: 20
+  - code: suppressed_opt_out
+    en: Suppressed (opt-out)
+    sort: 30
+  - code: no_response
+    en: No response
+    sort: 40
+  - code: responded
+    en: Responded
+    sort: 50
+  milestones:
+  - B46
+tables:
+- name: consultant_profile
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B37
+  - B40
+  - B76
+  retention: Soft-deleted on deactivation; anonymised (display_name, headline) on erasure request.
+  description: Freelance recruiter (consultant) profile; one per user.
+  columns:
+  - name: app_user_id
+    desc: The consultant user account.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Agency organisation, if the consultant works for one.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = independent freelancer.
+  - name: display_name
+    desc: Public display name.
+    sens: Personal
+    type: STRING(150)
+    domain: person_name
+    pii: shown to employers after a request is accepted
+  - name: headline
+    desc: One-line pitch.
+    sens: Internal
+    type: STRING(200)
+    domain: free_text
+    'null': true
+    null_why: NULL = not provided.
+  - name: years_experience
+    desc: Years of recruiting experience.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    'null': true
+    null_why: NULL = not disclosed.
+  - name: commission_model_id
+    desc: Preferred commission model.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: default_commission_percentage
+    desc: Default commission % of annual CTC.
+    sens: Internal
+    type: DECIMAL(5,2)
+    domain: percentage
+    'null': true
+    null_why: NULL = model is not percentage-based.
+  - name: default_fixed_fee
+    desc: Default fixed fee per hire.
+    sens: Internal
+    type: DECIMAL(18,4)
+    domain: money
+    'null': true
+    null_why: NULL = model is not fixed-fee.
+  - name: currency_id
+    desc: Currency of the fixed fee.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: verification_status_id
+    desc: Platform verification of the consultant.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: verified_at
+    desc: When verified.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = not verified.
+  - name: is_accepting_requests
+    desc: Open to new sourcing requests.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'true'
+  - name: rating_average
+    desc: Average of consultant_rating scores (0..5, derived).
+    sens: Internal
+    type: DECIMAL(9,2)
+    domain: measure
+    'null': true
+    null_why: NULL = no ratings yet.
+  - name: rating_count
+    desc: Number of ratings (derived).
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '0'
+  constraints:
+  - name: uq_consultant_profile_id_app_user_id
+    type: unique
+    columns:
+    - id
+    - app_user_id
+    desc: Target of composite FK from sourcing_request.
+  - name: ck_consultant_profile_commission_pct_range
+    type: check
+    expr: default_commission_percentage IS NULL OR (default_commission_percentage >= 0 AND default_commission_percentage <= 100)
+    desc: Percentage 0..100.
+  - name: ck_consultant_profile_rating_range
+    type: check
+    expr: rating_average IS NULL OR (rating_average >= 0 AND rating_average <= 5)
+    desc: Rating 0..5.
+  - name: ck_consultant_profile_fee_nonneg
+    type: check
+    expr: default_fixed_fee IS NULL OR default_fixed_fee >= 0
+    desc: Non-negative fee.
+  indexes:
+  - name: uq_consultant_profile_app_user_id
+    columns:
+    - app_user_id
+    unique: true
+    where: deleted_at IS NULL
+    desc: One live consultant profile per user.
+  - name: idx_consultant_profile_verification_status_id_is_accepting_requests
+    columns:
+    - verification_status_id
+    - is_accepting_requests
+    desc: Directory of verifiable, available consultants.
+    where: deleted_at IS NULL
+  - name: idx_consultant_profile_organisation_id
+    columns:
+    - organisation_id
+    desc: Agency roster.
+    where: organisation_id IS NOT NULL
+  - name: idx_consultant_profile_currency_id
+    columns:
+    - currency_id
+    desc: FK index.
+  - name: idx_consultant_profile_commission_model_id
+    columns:
+    - commission_model_id
+    desc: Leading index for FK fk_consultant_profile_commission_model_id (child lookup / FK check).
+  fks:
+  - name: fk_consultant_profile_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_consultant_profile_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_consultant_profile_commission_model_id
+    columns:
+    - commission_model_id
+    ref: commission_model
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: commission_model_id -> commission_model; delete rule RESTRICT (see table description)
+  - name: fk_consultant_profile_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: currency_id -> currency; delete rule RESTRICT (see table description)
+  - name: fk_consultant_profile_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: verification_status_id -> verification_status; delete rule RESTRICT (see table description)
+- name: consultant_specialisation
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B37
+  retention: Deleted with the consultant profile.
+  description: Job categories and industries a consultant specialises in.
+  columns:
+  - name: consultant_profile_id
+    desc: Consultant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: job_category_id
+    desc: Category.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: industry_id
+    desc: Industry focus.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = any industry within the category.
+  - name: years_in_domain
+    desc: Years in the domain.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    'null': true
+    null_why: NULL = not stated.
+  constraints:
+  - name: uq_consultant_specialisation_consultant_profile_id_job_category_id_industry_id
+    type: unique
+    columns:
+    - consultant_profile_id
+    - job_category_id
+    - industry_id
+    desc: No duplicate specialisation.
+  indexes:
+  - name: idx_consultant_specialisation_job_category_id
+    columns:
+    - job_category_id
+    desc: Find consultants by category.
+  - name: idx_consultant_specialisation_industry_id
+    columns:
+    - industry_id
+    desc: Find consultants by industry.
+    where: industry_id IS NOT NULL
+  fks:
+  - name: fk_consultant_specialisation_consultant_profile_id
+    columns:
+    - consultant_profile_id
+    ref: consultant_profile
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: consultant_profile_id -> consultant_profile; delete rule CASCADE (see table description)
+  - name: fk_consultant_specialisation_job_category_id
+    columns:
+    - job_category_id
+    ref: job_category
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: job_category_id -> job_category; delete rule RESTRICT (see table description)
+  - name: fk_consultant_specialisation_industry_id
+    columns:
+    - industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: industry_id -> industry; delete rule RESTRICT (see table description)
+- name: consultant_desk
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B37
+  retention: Soft-deleted; purged with profile.
+  description: A recruiting desk (geography + domain) a consultant operates.
+  columns:
+  - name: consultant_profile_id
+    desc: Consultant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: desk_name
+    desc: Desk name, e.g. Pune IT contract.
+    sens: Internal
+    type: STRING(120)
+    domain: free_text
+  - name: country_id
+    desc: Country covered.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: job_category_id
+    desc: Category covered.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = all categories.
+  constraints: []
+  indexes:
+  - name: uq_consultant_desk_consultant_profile_id_desk_name
+    columns:
+    - consultant_profile_id
+    - desk_name
+    unique: true
+    where: deleted_at IS NULL
+    desc: Unique desk name per consultant.
+  - name: idx_consultant_desk_country_id
+    columns:
+    - country_id
+    desc: Desks by country.
+  - name: idx_consultant_desk_job_category_id
+    columns:
+    - job_category_id
+    desc: Desks by category.
+    where: job_category_id IS NOT NULL
+  fks:
+  - name: fk_consultant_desk_consultant_profile_id
+    columns:
+    - consultant_profile_id
+    ref: consultant_profile
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: consultant_profile_id -> consultant_profile; delete rule CASCADE (see table description)
+  - name: fk_consultant_desk_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: country_id -> country; delete rule RESTRICT (see table description)
+  - name: fk_consultant_desk_job_category_id
+    columns:
+    - job_category_id
+    ref: job_category
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: job_category_id -> job_category; delete rule RESTRICT (see table description)
+- name: consultant_job_openness
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B37
+  - B46
+  - B76
+  retention: Soft-deleted; kept 7 years for fee dispute evidence.
+  description: A job requirement opened to consultants for a time window (all verified consultants or one named consultant).
+  columns:
+  - name: job_requirement_id
+    desc: Requirement made available to consultants.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Tenant owning the requirement.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: consultant_profile_id
+    desc: Specific consultant invited.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = open to all verified consultants.
+  - name: opened_by_app_user_id
+    desc: Employer/recruiter who opened it.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: valid_from
+    desc: Window start.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: valid_to
+    desc: Window end.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = open-ended/ongoing until closed.
+  - name: closed_at
+    desc: When closed (flag turned off or job closed).
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = still open.
+  - name: max_consultants
+    desc: Max concurrent consultants.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    'null': true
+    null_why: NULL = unlimited.
+  - name: offered_commission_percentage
+    desc: Fee offered as % of CTC.
+    sens: Internal
+    type: DECIMAL(5,2)
+    domain: percentage
+    'null': true
+    null_why: NULL = not percentage-based.
+  - name: offered_fixed_fee
+    desc: Fixed fee offered.
+    sens: Internal
+    type: DECIMAL(18,4)
+    domain: money
+    'null': true
+    null_why: NULL = not fixed-fee.
+  - name: currency_id
+    desc: Currency of the fixed fee.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  constraints:
+  - name: uq_consultant_job_openness_job_requirement_id_id
+    type: unique
+    columns:
+    - job_requirement_id
+    - id
+    desc: Target of composite FK from sourcing_request (request must reference openness of the same requirement).
+  - name: ck_consultant_job_openness_valid_range
+    type: check
+    expr: valid_to IS NULL OR valid_to >= valid_from
+    desc: Window order.
+  - name: ck_consultant_job_openness_closed_range
+    type: check
+    expr: closed_at IS NULL OR closed_at >= valid_from
+    desc: Close after open.
+  - name: ck_consultant_job_openness_commission_pct_range
+    type: check
+    expr: offered_commission_percentage IS NULL OR (offered_commission_percentage >= 0 AND offered_commission_percentage <= 100)
+    desc: Percentage 0..100.
+  - name: ck_consultant_job_openness_max_consultants_positive
+    type: check
+    expr: max_consultants IS NULL OR max_consultants > 0
+    desc: Positive when set.
+  indexes:
+  - name: uq_consultant_job_openness_job_requirement_id
+    columns:
+    - job_requirement_id
+    unique: true
+    where: consultant_profile_id IS NULL AND closed_at IS NULL AND deleted_at IS NULL
+    desc: At most one open all-consultants window per requirement.
+  - name: uq_consultant_job_openness_job_requirement_id_consultant_profile_id
+    columns:
+    - job_requirement_id
+    - consultant_profile_id
+    unique: true
+    where: consultant_profile_id IS NOT NULL AND closed_at IS NULL AND deleted_at IS NULL
+    desc: At most one open invitation per consultant per requirement.
+  - name: idx_consultant_job_openness_organisation_id_closed_at
+    columns:
+    - organisation_id
+    - closed_at
+    desc: Tenant listing.
+  - name: idx_consultant_job_openness_consultant_profile_id
+    columns:
+    - consultant_profile_id
+    desc: Invitations of a consultant.
+    where: consultant_profile_id IS NOT NULL
+  - name: idx_consultant_job_openness_opened_by_app_user_id
+    columns:
+    - opened_by_app_user_id
+    desc: By opener.
+  - name: idx_consultant_job_openness_currency_id
+    columns:
+    - currency_id
+    desc: FK index.
+  fks:
+  - name: fk_consultant_job_openness_job_requirement_id
+    columns:
+    - job_requirement_id
+    ref: job_requirement
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: job_requirement_id -> job_requirement; delete rule RESTRICT (see table description)
+  - name: fk_consultant_job_openness_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_consultant_job_openness_consultant_profile_id
+    columns:
+    - consultant_profile_id
+    ref: consultant_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: consultant_profile_id -> consultant_profile; delete rule RESTRICT (see table description)
+  - name: fk_consultant_job_openness_opened_by_app_user_id
+    columns:
+    - opened_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: opened_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_consultant_job_openness_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: currency_id -> currency; delete rule RESTRICT (see table description)
+- name: sourcing_request
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B37
+  - B40
+  - B46
+  - B76
+  retention: Soft-deleted; kept 7 years (fee evidence); erasure of linked candidates handled in children.
+  description: An employer/recruiter asks a consultant to source candidates for a job requirement (only for requirements open to consultants).
+  columns:
+  - name: job_requirement_id
+    desc: Requirement to source for (composite FK to openness).
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: consultant_job_openness_id
+    desc: Openness row proving the requirement is open to consultants.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Requesting tenant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: requested_by_app_user_id
+    desc: Employer/recruiter making the request.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: consultant_profile_id
+    desc: Consultant asked.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: consultant_app_user_id
+    desc: Consultant user (bound to profile by composite FK).
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: sourcing_request_status_id
+    desc: Current status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: positions_to_fill
+    desc: Number of hires wanted.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '1'
+  - name: commission_model_id
+    desc: Agreed commission model.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: fee_commission_percentage
+    desc: Agreed commission % of CTC.
+    sens: Internal
+    type: DECIMAL(5,2)
+    domain: percentage
+    'null': true
+    null_why: NULL = not percentage-based.
+  - name: fee_fixed_amount
+    desc: Agreed fixed fee.
+    sens: Internal
+    type: DECIMAL(18,4)
+    domain: money
+    'null': true
+    null_why: NULL = not fixed-fee.
+  - name: currency_id
+    desc: Currency of the fixed fee.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: response_due_at
+    desc: Deadline for consultant to accept/decline.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+  - name: submission_deadline_date
+    desc: Deadline to submit candidates.
+    sens: Internal
+    type: DATE
+    domain: date
+    'null': true
+    null_why: NULL = no deadline set.
+  - name: brief_note
+    desc: Instructions to the consultant.
+    sens: Internal
+    type: STRING(2000)
+    domain: free_text
+    'null': true
+    null_why: NULL = none.
+  - name: closed_at
+    desc: When the request ended.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = live.
+  constraints:
+  - name: uq_sourcing_request_id_consultant_profile_id
+    type: unique
+    columns:
+    - id
+    - consultant_profile_id
+    desc: Target for child consistency checks.
+  - name: ck_sourcing_request_positions_positive
+    type: check
+    expr: positions_to_fill > 0
+    desc: Positive count.
+  - name: ck_sourcing_request_closed_range
+    type: check
+    expr: closed_at IS NULL OR closed_at >= created_at
+    desc: Close after create.
+  - name: ck_sourcing_request_fee_pct_range
+    type: check
+    expr: fee_commission_percentage IS NULL OR (fee_commission_percentage >= 0 AND fee_commission_percentage <= 100)
+    desc: Percentage 0..100.
+  - name: ck_sourcing_request_fee_fixed_nonneg
+    type: check
+    expr: fee_fixed_amount IS NULL OR fee_fixed_amount >= 0
+    desc: Non-negative.
+  - name: ck_sourcing_request_fee_present
+    type: check
+    expr: fee_commission_percentage IS NOT NULL OR fee_fixed_amount IS NOT NULL
+    desc: A fee term must be agreed.
+  indexes:
+  - name: uq_sourcing_request_job_requirement_id_consultant_profile_id
+    columns:
+    - job_requirement_id
+    - consultant_profile_id
+    unique: true
+    where: closed_at IS NULL AND deleted_at IS NULL
+    desc: One live request per consultant per requirement.
+  - name: idx_sourcing_request_consultant_profile_id_sourcing_request_status_id
+    columns:
+    - consultant_profile_id
+    - sourcing_request_status_id
+    desc: Consultant inbox.
+    where: deleted_at IS NULL
+  - name: idx_sourcing_request_organisation_id_sourcing_request_status_id
+    columns:
+    - organisation_id
+    - sourcing_request_status_id
+    desc: Tenant list.
+    where: deleted_at IS NULL
+  - name: idx_sourcing_request_consultant_job_openness_id
+    columns:
+    - consultant_job_openness_id
+    desc: Requests per openness.
+  - name: idx_sourcing_request_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    desc: By requester.
+  - name: idx_sourcing_request_consultant_app_user_id
+    columns:
+    - consultant_app_user_id
+    desc: By consultant user.
+  - name: idx_sourcing_request_response_due_at
+    columns:
+    - response_due_at
+    desc: Expiry job.
+    where: closed_at IS NULL
+  - name: idx_sourcing_request_currency_id
+    columns:
+    - currency_id
+    desc: FK index.
+  - name: idx_sourcing_request_sourcing_request_status_id
+    columns:
+    - sourcing_request_status_id
+    desc: Leading index for FK fk_sourcing_request_sourcing_request_status_id (child lookup / FK check).
+  - name: idx_sourcing_request_commission_model_id
+    columns:
+    - commission_model_id
+    desc: Leading index for FK fk_sourcing_request_commission_model_id (child lookup / FK check).
+  fks:
+  - name: fk_sourcing_request_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_requested_by_app_user_id
+    columns:
+    - requested_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: requested_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_sourcing_request_status_id
+    columns:
+    - sourcing_request_status_id
+    ref: sourcing_request_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_request_status_id -> sourcing_request_status; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_commission_model_id
+    columns:
+    - commission_model_id
+    ref: commission_model
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: commission_model_id -> commission_model; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: currency_id -> currency; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_job_requirement_id_openness
+    columns:
+    - job_requirement_id
+    - consultant_job_openness_id
+    ref: consultant_job_openness
+    ref_columns:
+    - job_requirement_id
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Request references an openness row of the same requirement (open-to-consultants rule, BR-SRC-01).
+  - name: fk_sourcing_request_consultant_profile_id_user
+    columns:
+    - consultant_profile_id
+    - consultant_app_user_id
+    ref: consultant_profile
+    ref_columns:
+    - id
+    - app_user_id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Consultant user matches the profile.
+  - name: fk_sourcing_request_job_requirement_id
+    columns:
+    - job_requirement_id
+    ref: job_requirement
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Requirement being sourced; RESTRICT to keep fee evidence.
+- name: sourcing_request_decision
+  kind: event
+  delete_policy: append_only
+  volume: medium
+  tier: '1'
+  milestones:
+  - B37
+  - B43
+  retention: Retained 7 years with the request.
+  description: Append-only acceptance/decline/withdraw/counter decisions on a sourcing request.
+  columns:
+  - name: sourcing_request_id
+    desc: Request decided.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: decision_party_id
+    desc: Who decided.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: sourcing_decision_type_id
+    desc: Decision.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: sourcing_decision_reason_id
+    desc: Reason.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+    'null': true
+    null_why: NULL = acceptance, no reason needed.
+  - name: decided_by_app_user_id
+    desc: Actor.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: counter_commission_percentage
+    desc: Counter-proposed commission.
+    sens: Internal
+    type: DECIMAL(5,2)
+    domain: percentage
+    'null': true
+    null_why: NULL = not a counter proposal.
+  - name: decision_comment
+    desc: Free-text comment.
+    sens: Personal
+    type: STRING(1000)
+    domain: free_text
+    'null': true
+    null_why: NULL = none.
+    pii: may mention people; access limited to the two parties
+  - name: decided_at
+    desc: Decision time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: ck_sourcing_request_decision_counter_pct_range
+    type: check
+    expr: counter_commission_percentage IS NULL OR (counter_commission_percentage >= 0 AND counter_commission_percentage <= 100)
+    desc: Percentage 0..100.
+  indexes:
+  - name: idx_sourcing_request_decision_sourcing_request_id_decided_at
+    columns:
+    - sourcing_request_id
+    - decided_at DESC
+    desc: Decision history of a request.
+  - name: idx_sourcing_request_decision_decided_by_app_user_id
+    columns:
+    - decided_by_app_user_id
+    desc: By actor.
+  - name: idx_sourcing_request_decision_sourcing_decision_reason_id
+    columns:
+    - sourcing_decision_reason_id
+    desc: Decline analysis.
+    where: sourcing_decision_reason_id IS NOT NULL
+  - name: idx_sourcing_request_decision_decision_party_id
+    columns:
+    - decision_party_id
+    desc: Leading index for FK fk_sourcing_request_decision_decision_party_id (child lookup / FK check).
+  - name: idx_sourcing_request_decision_sourcing_decision_type_id
+    columns:
+    - sourcing_decision_type_id
+    desc: Leading index for FK fk_sourcing_request_decision_sourcing_decision_type_id (child lookup / FK check).
+  fks:
+  - name: fk_sourcing_request_decision_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    ref: sourcing_request
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_request_id -> sourcing_request; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_decision_decision_party_id
+    columns:
+    - decision_party_id
+    ref: decision_party
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: decision_party_id -> decision_party; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_decision_sourcing_decision_type_id
+    columns:
+    - sourcing_decision_type_id
+    ref: sourcing_decision_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_decision_type_id -> sourcing_decision_type; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_decision_sourcing_decision_reason_id
+    columns:
+    - sourcing_decision_reason_id
+    ref: sourcing_decision_reason
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_decision_reason_id -> sourcing_decision_reason; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_request_decision_decided_by_app_user_id
+    columns:
+    - decided_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: decided_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+- name: sourcing_shortlist
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B37
+  - B40
+  - B76
+  retention: Soft-deleted; kept with the sourcing request.
+  description: Consultant candidate shortlist for a sourcing request, backed by a jobs-module job_shortlist.
+  columns:
+  - name: sourcing_request_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: job_shortlist_id
+    desc: Request the shortlist belongs to.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: title
+    desc: List title.
+    sens: Internal
+    type: STRING(150)
+    domain: free_text
+  - name: submitted_at
+    desc: When released to employer.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = still a private draft.
+  constraints:
+  - name: uq_sourcing_shortlist_id_sourcing_request_id
+    type: unique
+    columns:
+    - id
+    - sourcing_request_id
+    desc: Target of composite FK from submissions.
+  indexes:
+  - name: uq_sourcing_shortlist_job_shortlist_id
+    columns:
+    - job_shortlist_id
+    unique: true
+    where: deleted_at IS NULL
+    desc: A job_shortlist backs at most one sourcing shortlist.
+  - name: idx_sourcing_shortlist_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    desc: Lists per request.
+    where: deleted_at IS NULL
+  fks:
+  - name: fk_sourcing_shortlist_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    ref: sourcing_request
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_request_id -> sourcing_request; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_shortlist_job_shortlist_id
+    columns:
+    - job_shortlist_id
+    ref: job_shortlist
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: job_shortlist_id -> job_shortlist; delete rule RESTRICT (see table description)
+- name: sourcing_shortlist_item
+  kind: entity
+  delete_policy: hard
+  volume: high
+  tier: '1'
+  milestones:
+  - B37
+  - B40
+  retention: Deleted with the list; removed when candidate blocks the consultant.
+  description: A candidate on a consultant sourcing shortlist.
+  columns:
+  - name: sourcing_shortlist_id
+    desc: Parent list.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: candidate_profile_id
+    desc: Candidate (already registered; consultants cannot register candidates).
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: sort_position
+    desc: Order in the list.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: consultant_note
+    desc: Fit note.
+    sens: Personal
+    type: STRING(1000)
+    domain: free_text
+    'null': true
+    null_why: NULL = none.
+    pii: visible to consultant and employer after submission
+  - name: added_at
+    desc: When added.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: uq_sourcing_shortlist_item_sourcing_shortlist_id_candidate_profile_id
+    type: unique
+    columns:
+    - sourcing_shortlist_id
+    - candidate_profile_id
+    desc: Candidate once per list.
+  - name: ck_sourcing_shortlist_item_sort_position_positive
+    type: check
+    expr: sort_position > 0
+    desc: Positive.
+  indexes:
+  - name: idx_sourcing_shortlist_item_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    desc: Where is a candidate shortlisted.
+  - name: idx_sourcing_shortlist_item_added_at
+    columns:
+    - added_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 8
+  fks:
+  - name: fk_sourcing_shortlist_item_sourcing_shortlist_id
+    columns:
+    - sourcing_shortlist_id
+    ref: sourcing_shortlist
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: sourcing_shortlist_id -> sourcing_shortlist; delete rule CASCADE (see table description)
+  - name: fk_sourcing_shortlist_item_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: candidate_profile_id -> candidate_profile; delete rule RESTRICT (see table description)
+- name: sourcing_submission
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B40
+  - B76
+  retention: Soft-deleted; candidate-identifying text anonymised on erasure; kept 7 years.
+  description: Consultant submits a candidate profile to the employer for a request (requires candidate consent).
+  columns:
+  - name: sourcing_request_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: sourcing_shortlist_item_id
+    desc: Shortlist entry submitted.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: candidate_profile_id
+    desc: Candidate submitted.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: user_consent_id
+    desc: Candidate consent to share the profile with this employer via a consultant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: submission_status_id
+    desc: Status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: job_application_id
+    desc: Application created when the employer proceeds.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = no application yet.
+  - name: submitted_at
+    desc: Submission time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: employer_responded_at
+    desc: Employer response time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = no response yet.
+  - name: cover_note
+    desc: Consultant pitch.
+    sens: Personal
+    type: STRING(2000)
+    domain: free_text
+    'null': true
+    null_why: NULL = none.
+    pii: visible only to the employer tenant
+  constraints:
+  - name: uq_sourcing_submission_id_sourcing_request_id
+    type: unique
+    columns:
+    - id
+    - sourcing_request_id
+    desc: Target for commission consistency.
+  - name: ck_sourcing_submission_response_range
+    type: check
+    expr: employer_responded_at IS NULL OR employer_responded_at >= submitted_at
+    desc: Order.
+  indexes:
+  - name: uq_sourcing_submission_sourcing_request_id_candidate_profile_id
+    columns:
+    - sourcing_request_id
+    - candidate_profile_id
+    unique: true
+    where: deleted_at IS NULL
+    desc: Candidate submitted once per request.
+  - name: idx_sourcing_submission_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    desc: Submissions of a candidate.
+  - name: idx_sourcing_submission_sourcing_shortlist_item_id
+    columns:
+    - sourcing_shortlist_item_id
+    desc: From shortlist item.
+  - name: idx_sourcing_submission_user_consent_id
+    columns:
+    - user_consent_id
+    desc: Consent audit.
+  - name: idx_sourcing_submission_job_application_id
+    columns:
+    - job_application_id
+    desc: Linked application.
+    where: job_application_id IS NOT NULL
+  - name: idx_sourcing_submission_submission_status_id_submitted_at
+    columns:
+    - submission_status_id
+    - submitted_at
+    desc: Employer review queue.
+    where: deleted_at IS NULL
+  fks:
+  - name: fk_sourcing_submission_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    ref: sourcing_request
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_request_id -> sourcing_request; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_submission_sourcing_shortlist_item_id
+    columns:
+    - sourcing_shortlist_item_id
+    ref: sourcing_shortlist_item
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_shortlist_item_id -> sourcing_shortlist_item; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_submission_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: candidate_profile_id -> candidate_profile; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_submission_user_consent_id
+    columns:
+    - user_consent_id
+    ref: user_consent
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: user_consent_id -> user_consent; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_submission_submission_status_id
+    columns:
+    - submission_status_id
+    ref: submission_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: submission_status_id -> submission_status; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_submission_job_application_id
+    columns:
+    - job_application_id
+    ref: job_application
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: job_application_id -> job_application; delete rule RESTRICT (see table description)
+- name: sourcing_commission
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B40
+  - B76
+  retention: Retained 8 years (financial).
+  description: Placement fee/commission owed to a consultant for a hired submission.
+  columns:
+  - name: sourcing_request_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: sourcing_submission_id
+    desc: Hired submission.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: commission_model_id
+    desc: Model applied.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: commission_status_id
+    desc: Status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: base_amount
+    desc: Annual CTC or fee base.
+    sens: Internal
+    type: DECIMAL(18,4)
+    domain: money
+  - name: commission_percentage
+    desc: Percentage applied.
+    sens: Internal
+    type: DECIMAL(5,2)
+    domain: percentage
+    'null': true
+    null_why: NULL = fixed fee.
+  - name: commission_amount
+    desc: Fee amount.
+    sens: Internal
+    type: DECIMAL(18,4)
+    domain: money
+  - name: currency_id
+    desc: Currency.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: accrued_at
+    desc: Accrual (join date) time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: guarantee_end_date
+    desc: End of replacement guarantee period.
+    sens: Internal
+    type: DATE
+    domain: date
+    'null': true
+    null_why: NULL = no guarantee.
+  - name: invoice_id
+    desc: Invoice raised (subscriptions module).
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = not invoiced yet.
+  constraints:
+  - name: ck_sourcing_commission_amount_nonneg
+    type: check
+    expr: commission_amount >= 0 AND base_amount >= 0
+    desc: Non-negative money.
+  - name: ck_sourcing_commission_pct_range
+    type: check
+    expr: commission_percentage IS NULL OR (commission_percentage >= 0 AND commission_percentage <= 100)
+    desc: Percentage 0..100.
+  indexes:
+  - name: uq_sourcing_commission_sourcing_submission_id
+    columns:
+    - sourcing_submission_id
+    unique: true
+    where: deleted_at IS NULL
+    desc: One live commission per hired submission.
+  - name: idx_sourcing_commission_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    desc: By request.
+  - name: idx_sourcing_commission_commission_status_id_accrued_at
+    columns:
+    - commission_status_id
+    - accrued_at
+    desc: Payout run.
+    where: deleted_at IS NULL
+  - name: idx_sourcing_commission_invoice_id
+    columns:
+    - invoice_id
+    desc: By invoice.
+    where: invoice_id IS NOT NULL
+  - name: idx_sourcing_commission_currency_id
+    columns:
+    - currency_id
+    desc: FK index.
+  - name: idx_sourcing_commission_commission_model_id
+    columns:
+    - commission_model_id
+    desc: Leading index for FK fk_sourcing_commission_commission_model_id (child lookup / FK check).
+  fks:
+  - name: fk_sourcing_commission_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    ref: sourcing_request
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_request_id -> sourcing_request; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_commission_sourcing_submission_id
+    columns:
+    - sourcing_submission_id
+    ref: sourcing_submission
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_submission_id -> sourcing_submission; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_commission_commission_model_id
+    columns:
+    - commission_model_id
+    ref: commission_model
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: commission_model_id -> commission_model; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_commission_commission_status_id
+    columns:
+    - commission_status_id
+    ref: commission_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: commission_status_id -> commission_status; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_commission_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: currency_id -> currency; delete rule RESTRICT (see table description)
+  - name: fk_sourcing_commission_invoice_id
+    columns:
+    - invoice_id
+    ref: invoice
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: invoice_id -> invoice; delete rule RESTRICT (see table description)
+- name: consultant_rating
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B46
+  retention: Soft-deleted on moderation; kept while consultant active.
+  description: Employer rating of a consultant after a sourcing request.
+  columns:
+  - name: consultant_profile_id
+    desc: Rated consultant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: sourcing_request_id
+    desc: Request rated.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: rated_by_app_user_id
+    desc: Rater.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: score
+    desc: Score 1..5.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: review_text
+    desc: Review.
+    sens: Personal
+    type: STRING(1000)
+    domain: free_text
+    'null': true
+    null_why: NULL = score only.
+    pii: shown with rater organisation only
+  constraints:
+  - name: ck_consultant_rating_score_range
+    type: check
+    expr: score >= 1 AND score <= 5
+    desc: Rating scale.
+  indexes:
+  - name: uq_consultant_rating_sourcing_request_id_rated_by_app_user_id
+    columns:
+    - sourcing_request_id
+    - rated_by_app_user_id
+    unique: true
+    where: deleted_at IS NULL
+    desc: One rating per rater per request.
+  - name: idx_consultant_rating_consultant_profile_id
+    columns:
+    - consultant_profile_id
+    desc: Ratings of a consultant.
+    where: deleted_at IS NULL
+  - name: idx_consultant_rating_rated_by_app_user_id
+    columns:
+    - rated_by_app_user_id
+    desc: By rater.
+  fks:
+  - name: fk_consultant_rating_consultant_profile_id
+    columns:
+    - consultant_profile_id
+    ref: consultant_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: consultant_profile_id -> consultant_profile; delete rule RESTRICT (see table description)
+  - name: fk_consultant_rating_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    ref: sourcing_request
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_request_id -> sourcing_request; delete rule RESTRICT (see table description)
+  - name: fk_consultant_rating_rated_by_app_user_id
+    columns:
+    - rated_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: rated_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+- name: outreach_template
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B43
+  - B76
+  retention: Soft-deleted; purged 1 year after deletion.
+  description: Reusable bulk-outreach message template.
+  columns:
+  - name: owner_app_user_id
+    desc: Owner.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Tenant sharing the template.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = personal template.
+  - name: template_name
+    desc: Template name.
+    sens: Internal
+    type: STRING(120)
+    domain: free_text
+  - name: notification_channel_id
+    desc: Channel the template is for.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: default_language_id
+    desc: Language of the original text.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: outreach_template_status_id
+    desc: Status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: is_system_template
+    desc: Platform-provided.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'false'
+  constraints: []
+  indexes:
+  - name: uq_outreach_template_owner_app_user_id_template_name
+    columns:
+    - owner_app_user_id
+    - template_name
+    unique: true
+    where: deleted_at IS NULL
+    desc: Unique name per owner.
+  - name: idx_outreach_template_organisation_id
+    columns:
+    - organisation_id
+    desc: Shared templates.
+    where: organisation_id IS NOT NULL
+  - name: idx_outreach_template_notification_channel_id
+    columns:
+    - notification_channel_id
+    desc: By channel.
+  - name: idx_outreach_template_default_language_id
+    columns:
+    - default_language_id
+    desc: By language.
+  - name: idx_outreach_template_outreach_template_status_id
+    columns:
+    - outreach_template_status_id
+    desc: Leading index for FK fk_outreach_template_outreach_template_status_id (child lookup / FK check).
+  fks:
+  - name: fk_outreach_template_owner_app_user_id
+    columns:
+    - owner_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: owner_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_outreach_template_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_outreach_template_notification_channel_id
+    columns:
+    - notification_channel_id
+    ref: notification_channel
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: notification_channel_id -> notification_channel; delete rule RESTRICT (see table description)
+  - name: fk_outreach_template_default_language_id
+    columns:
+    - default_language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: default_language_id -> language; delete rule RESTRICT (see table description)
+  - name: fk_outreach_template_outreach_template_status_id
+    columns:
+    - outreach_template_status_id
+    ref: outreach_template_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_template_status_id -> outreach_template_status; delete rule RESTRICT (see table description)
+- name: outreach_template_translation
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B43
+  retention: Deleted with the template.
+  description: Template text per language.
+  columns:
+  - name: outreach_template_id
+    desc: Template.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: language_id
+    desc: Language.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: subject_text
+    desc: Subject with {{placeholders}}.
+    sens: Internal
+    type: STRING(250)
+    domain: free_text
+    'null': true
+    null_why: NULL = channel has no subject (SMS, chat).
+  - name: body_text
+    desc: Body with {{placeholders}}.
+    sens: Internal
+    type: STRING(4000)
+    domain: free_text
+  constraints:
+  - name: uq_outreach_template_translation_outreach_template_id_language_id
+    type: unique
+    columns:
+    - outreach_template_id
+    - language_id
+    desc: One translation per language.
+  indexes:
+  - name: idx_outreach_template_translation_language_id
+    columns:
+    - language_id
+    desc: By language.
+  fks:
+  - name: fk_outreach_template_translation_outreach_template_id
+    columns:
+    - outreach_template_id
+    ref: outreach_template
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: outreach_template_id -> outreach_template; delete rule CASCADE (see table description)
+  - name: fk_outreach_template_translation_language_id
+    columns:
+    - language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: language_id -> language; delete rule RESTRICT (see table description)
+- name: outreach_batch
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B37
+  - B43
+  - B76
+  retention: Soft-deleted; batch metadata kept 3 years; recipients per BR-SRC retention.
+  description: Bulk outreach campaign to many candidates.
+  columns:
+  - name: sender_app_user_id
+    desc: Sender (recruiter/employer/consultant).
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Sender tenant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = independent consultant.
+  - name: sourcing_request_id
+    desc: Request a consultant acts under.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = employer/recruiter batch.
+  - name: job_requirement_id
+    desc: Job being promoted.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = general talent outreach.
+  - name: is_consultant_sender
+    desc: True when sent by a consultant (requires sourcing_request_id).
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'false'
+  - name: notification_channel_id
+    desc: Channel (email, SMS, in-app, chat).
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: outreach_template_id
+    desc: Template used.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: outreach_batch_status_id
+    desc: Status.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: audience_filter
+    desc: Snapshot of the candidate filter/saved search used.
+    sens: Internal
+    type: JSONB
+    domain: json
+    'null': true
+    null_why: NULL = hand-picked recipients.
+  - name: credits_per_recipient
+    desc: Credits charged per delivered message (1 for email, more for InMail-like).
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '1'
+  - name: credits_reserved
+    desc: Credits reserved at scheduling.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '0'
+  - name: recipient_count
+    desc: Recipients admitted (after exclusions).
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '0'
+  - name: scheduled_at
+    desc: Planned send time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = send immediately.
+  - name: started_at
+    desc: Dispatch start.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = not started.
+  - name: completed_at
+    desc: Dispatch end.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = not finished.
+  constraints:
+  - name: ck_outreach_batch_consultant_needs_request
+    type: check
+    expr: NOT is_consultant_sender OR sourcing_request_id IS NOT NULL
+    desc: Consultant batches only under a sourcing request (open-to-consultants rule).
+  - name: ck_outreach_batch_credits_nonneg
+    type: check
+    expr: credits_per_recipient >= 0 AND credits_reserved >= 0 AND recipient_count >= 0
+    desc: Non-negative counts.
+  - name: ck_outreach_batch_completed_range
+    type: check
+    expr: completed_at IS NULL OR started_at IS NOT NULL
+    desc: Cannot complete without start.
+  indexes:
+  - name: idx_outreach_batch_sender_app_user_id_created_at
+    columns:
+    - sender_app_user_id
+    - created_at DESC
+    desc: My batches.
+    where: deleted_at IS NULL
+  - name: idx_outreach_batch_organisation_id
+    columns:
+    - organisation_id
+    desc: Tenant batches.
+    where: organisation_id IS NOT NULL
+  - name: idx_outreach_batch_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    desc: Batches of a request.
+    where: sourcing_request_id IS NOT NULL
+  - name: idx_outreach_batch_job_requirement_id
+    columns:
+    - job_requirement_id
+    desc: Batches per job.
+    where: job_requirement_id IS NOT NULL
+  - name: idx_outreach_batch_outreach_batch_status_id_scheduled_at
+    columns:
+    - outreach_batch_status_id
+    - scheduled_at
+    desc: Scheduler.
+    where: deleted_at IS NULL
+  - name: idx_outreach_batch_outreach_template_id
+    columns:
+    - outreach_template_id
+    desc: Template usage.
+  - name: idx_outreach_batch_notification_channel_id
+    columns:
+    - notification_channel_id
+    desc: By channel.
+  fks:
+  - name: fk_outreach_batch_sender_app_user_id
+    columns:
+    - sender_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sender_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_outreach_batch_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_outreach_batch_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    ref: sourcing_request
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_request_id -> sourcing_request; delete rule RESTRICT (see table description)
+  - name: fk_outreach_batch_job_requirement_id
+    columns:
+    - job_requirement_id
+    ref: job_requirement
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: job_requirement_id -> job_requirement; delete rule RESTRICT (see table description)
+  - name: fk_outreach_batch_notification_channel_id
+    columns:
+    - notification_channel_id
+    ref: notification_channel
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: notification_channel_id -> notification_channel; delete rule RESTRICT (see table description)
+  - name: fk_outreach_batch_outreach_template_id
+    columns:
+    - outreach_template_id
+    ref: outreach_template
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_template_id -> outreach_template; delete rule RESTRICT (see table description)
+  - name: fk_outreach_batch_outreach_batch_status_id
+    columns:
+    - outreach_batch_status_id
+    ref: outreach_batch_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_batch_status_id -> outreach_batch_status; delete rule RESTRICT (see table description)
+- name: outreach_recipient
+  kind: entity
+  delete_policy: hard
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B37
+  - B40
+  - B43
+  - B76
+  retention: Purged 24 months after batch completion; erased on candidate erasure.
+  description: One candidate in one outreach batch with delivery/engagement state (very high volume).
+  columns:
+  - name: outreach_batch_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: candidate_profile_id
+    desc: Candidate contacted (blocked candidates are never inserted).
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: outreach_delivery_status_id
+    desc: Delivery state.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: provider_message_ref
+    desc: Provider message id (idempotency/webhook correlation).
+    sens: Internal
+    type: STRING(128)
+    domain: code
+    'null': true
+    null_why: NULL = not yet handed to provider.
+  - name: queued_at
+    desc: Queued time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: sent_at
+    desc: Sent time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = not sent.
+  - name: delivered_at
+    desc: Delivered time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = not delivered.
+  - name: opened_at
+    desc: First open.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = never opened/unknown.
+  - name: replied_at
+    desc: First reply.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = no reply.
+  - name: credits_charged
+    desc: Credits consumed for this recipient.
+    sens: Internal
+    type: INT4
+    domain: quantity
+    default: '0'
+  constraints:
+  - name: uq_outreach_recipient_outreach_batch_id_candidate_profile_id
+    type: unique
+    columns:
+    - outreach_batch_id
+    - candidate_profile_id
+    desc: A candidate appears once per batch.
+  - name: ck_outreach_recipient_credits_nonneg
+    type: check
+    expr: credits_charged >= 0
+    desc: Non-negative.
+  - name: ck_outreach_recipient_sent_range
+    type: check
+    expr: sent_at IS NULL OR sent_at >= queued_at
+    desc: Order.
+  indexes:
+  - name: uq_outreach_recipient_provider_message_ref
+    columns:
+    - provider_message_ref
+    unique: true
+    where: provider_message_ref IS NOT NULL
+    desc: Webhook idempotency.
+  - name: idx_outreach_recipient_candidate_profile_id_queued_at
+    columns:
+    - candidate_profile_id
+    - queued_at DESC
+    desc: Contact history of a candidate (frequency capping).
+  - name: idx_outreach_recipient_outreach_delivery_status_id_queued_at
+    columns:
+    - outreach_delivery_status_id
+    - queued_at
+    desc: Dispatcher queue, sharded.
+    hash: true
+    bucket_count: 16
+  - name: idx_outreach_recipient_queued_at
+    columns:
+    - queued_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 16
+  fks:
+  - name: fk_outreach_recipient_outreach_batch_id
+    columns:
+    - outreach_batch_id
+    ref: outreach_batch
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_batch_id -> outreach_batch; delete rule RESTRICT (see table description)
+  - name: fk_outreach_recipient_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: candidate_profile_id -> candidate_profile; delete rule RESTRICT (see table description)
+  - name: fk_outreach_recipient_outreach_delivery_status_id
+    columns:
+    - outreach_delivery_status_id
+    ref: outreach_delivery_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_delivery_status_id -> outreach_delivery_status; delete rule RESTRICT (see table description)
+- name: outreach_exclusion
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B37
+  - B46
+  retention: Purged 12 months after batch completion; does not expose the candidate to the sender (reason class only to staff).
+  description: Candidates excluded from a batch and why (blocks, opt-outs, no consent).
+  columns:
+  - name: outreach_batch_id
+    desc: Batch.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: candidate_profile_id
+    desc: Excluded candidate.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: outreach_exclusion_reason_id
+    desc: Reason.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: excluded_at
+    desc: Exclusion time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: uq_outreach_exclusion_outreach_batch_id_candidate_profile_id
+    type: unique
+    columns:
+    - outreach_batch_id
+    - candidate_profile_id
+    desc: Excluded once per batch.
+  indexes:
+  - name: idx_outreach_exclusion_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    desc: Reverse lookup.
+  - name: idx_outreach_exclusion_excluded_at
+    columns:
+    - excluded_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 16
+  - name: idx_outreach_exclusion_outreach_exclusion_reason_id
+    columns:
+    - outreach_exclusion_reason_id
+    desc: Leading index for FK fk_outreach_exclusion_outreach_exclusion_reason_id (child lookup / FK check).
+  fks:
+  - name: fk_outreach_exclusion_outreach_batch_id
+    columns:
+    - outreach_batch_id
+    ref: outreach_batch
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: outreach_batch_id -> outreach_batch; delete rule CASCADE (see table description)
+  - name: fk_outreach_exclusion_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: candidate_profile_id -> candidate_profile; delete rule RESTRICT (see table description)
+  - name: fk_outreach_exclusion_outreach_exclusion_reason_id
+    columns:
+    - outreach_exclusion_reason_id
+    ref: outreach_exclusion_reason
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_exclusion_reason_id -> outreach_exclusion_reason; delete rule RESTRICT (see table description)
+- name: outreach_message
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B43
+  retention: 'TTL 90 days on rendered_at (integration boundary: bodies kept only for audit).'
+  description: Rendered message body per recipient, kept only for the audit window.
+  ttl:
+    expire_after: 90 days
+    column: rendered_at
+  columns:
+  - name: outreach_recipient_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: language_id
+    desc: Language rendered.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: subject_text
+    desc: Rendered subject.
+    sens: Personal
+    type: STRING(250)
+    domain: free_text
+    'null': true
+    null_why: NULL = no subject for the channel.
+    pii: encrypted at rest; TTL 90 days
+  - name: body_text
+    desc: Rendered body.
+    sens: Personal
+    type: STRING(4000)
+    domain: free_text
+    pii: encrypted at rest; TTL 90 days
+  - name: rendered_at
+    desc: Render time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: uq_outreach_message_outreach_recipient_id
+    type: unique
+    columns:
+    - outreach_recipient_id
+    desc: One rendered message per recipient.
+  indexes:
+  - name: idx_outreach_message_rendered_at
+    columns:
+    - rendered_at
+    desc: TTL/time scan, sharded.
+    hash: true
+    bucket_count: 16
+  - name: idx_outreach_message_language_id
+    columns:
+    - language_id
+    desc: By language.
+  fks:
+  - name: fk_outreach_message_outreach_recipient_id
+    columns:
+    - outreach_recipient_id
+    ref: outreach_recipient
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_recipient_id -> outreach_recipient; delete rule RESTRICT (see table description)
+  - name: fk_outreach_message_language_id
+    columns:
+    - language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: language_id -> language; delete rule RESTRICT (see table description)
+- name: outreach_reply
+  kind: event
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B43
+  retention: TTL 180 days on received_at.
+  description: Candidate reply to an outreach message.
+  ttl:
+    expire_after: 180 days
+    column: received_at
+  columns:
+  - name: outreach_recipient_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: notification_channel_id
+    desc: Channel replied on.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: reply_intent_id
+    desc: Classified intent.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+    'null': true
+    null_why: NULL = not yet classified.
+  - name: body_text
+    desc: Reply text.
+    sens: Personal
+    type: STRING(2000)
+    domain: free_text
+    pii: encrypted at rest; TTL 180 days
+  - name: is_auto_reply
+    desc: Out-of-office or bot reply.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'false'
+  - name: received_at
+    desc: Received time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints: []
+  indexes:
+  - name: idx_outreach_reply_outreach_recipient_id_received_at
+    columns:
+    - outreach_recipient_id
+    - received_at
+    desc: Replies of a recipient.
+  - name: idx_outreach_reply_received_at
+    columns:
+    - received_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 8
+  - name: idx_outreach_reply_notification_channel_id
+    columns:
+    - notification_channel_id
+    desc: By channel.
+  - name: idx_outreach_reply_reply_intent_id
+    columns:
+    - reply_intent_id
+    desc: Leading index for FK fk_outreach_reply_reply_intent_id (child lookup / FK check).
+  fks:
+  - name: fk_outreach_reply_outreach_recipient_id
+    columns:
+    - outreach_recipient_id
+    ref: outreach_recipient
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_recipient_id -> outreach_recipient; delete rule RESTRICT (see table description)
+  - name: fk_outreach_reply_notification_channel_id
+    columns:
+    - notification_channel_id
+    ref: notification_channel
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: notification_channel_id -> notification_channel; delete rule RESTRICT (see table description)
+  - name: fk_outreach_reply_reply_intent_id
+    columns:
+    - reply_intent_id
+    ref: reply_intent
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: reply_intent_id -> reply_intent; delete rule RESTRICT (see table description)
+- name: outreach_credit_usage
+  kind: ledger
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B43
+  - B76
+  retention: Retained 8 years (financial).
+  description: Credit movements of a batch; links to the wallet ledger owned by subscriptions_payments.
+  columns:
+  - name: outreach_batch_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: outreach_recipient_id
+    desc: Recipient for per-message events.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = batch-level (reserve/release).
+  - name: outreach_credit_event_id
+    desc: Reserve / consume / release / refund.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: credits
+    desc: Credits moved (positive).
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: wallet_ledger_entry_id
+    desc: Ledger entry that deducted/refunded.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = free quota or pending ledger posting.
+  - name: idempotency_key
+    desc: Idempotency key shared with the ledger entry.
+    sens: Internal
+    type: STRING(80)
+    domain: code
+  - name: occurred_at
+    desc: Event time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: uq_outreach_credit_usage_idempotency_key
+    type: unique
+    columns:
+    - idempotency_key
+    desc: Prevent double charge on retry.
+  - name: ck_outreach_credit_usage_credits_positive
+    type: check
+    expr: credits > 0
+    desc: Positive credits; direction from event type.
+  indexes:
+  - name: idx_outreach_credit_usage_outreach_batch_id_occurred_at
+    columns:
+    - outreach_batch_id
+    - occurred_at
+    desc: Usage of a batch.
+  - name: idx_outreach_credit_usage_outreach_recipient_id
+    columns:
+    - outreach_recipient_id
+    desc: Per recipient.
+    where: outreach_recipient_id IS NOT NULL
+  - name: idx_outreach_credit_usage_wallet_ledger_entry_id
+    columns:
+    - wallet_ledger_entry_id
+    desc: Ledger join.
+    where: wallet_ledger_entry_id IS NOT NULL
+  - name: idx_outreach_credit_usage_occurred_at
+    columns:
+    - occurred_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 8
+  - name: idx_outreach_credit_usage_outreach_credit_event_id
+    columns:
+    - outreach_credit_event_id
+    desc: Leading index for FK fk_outreach_credit_usage_outreach_credit_event_id (child lookup / FK check).
+  fks:
+  - name: fk_outreach_credit_usage_outreach_batch_id
+    columns:
+    - outreach_batch_id
+    ref: outreach_batch
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_batch_id -> outreach_batch; delete rule RESTRICT (see table description)
+  - name: fk_outreach_credit_usage_outreach_recipient_id
+    columns:
+    - outreach_recipient_id
+    ref: outreach_recipient
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_recipient_id -> outreach_recipient; delete rule RESTRICT (see table description)
+  - name: fk_outreach_credit_usage_outreach_credit_event_id
+    columns:
+    - outreach_credit_event_id
+    ref: outreach_credit_event
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_credit_event_id -> outreach_credit_event; delete rule RESTRICT (see table description)
+  - name: fk_outreach_credit_usage_wallet_ledger_entry_id
+    columns:
+    - wallet_ledger_entry_id
+    ref: wallet_ledger_entry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: wallet_ledger_entry_id -> wallet_ledger_entry; delete rule RESTRICT (see table description)
+- name: saved_search
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B43
+  - B76
+  retention: Soft-deleted; purged 90 days after deletion; erased with user.
+  description: Recruiter saved candidate search with alert frequency.
+  columns:
+  - name: owner_app_user_id
+    desc: Owner.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Tenant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = independent consultant.
+  - name: search_name
+    desc: Name.
+    sens: Internal
+    type: STRING(120)
+    domain: free_text
+  - name: filters
+    desc: Search filters (skills, locations, experience, salary...).
+    sens: Internal
+    type: JSONB
+    domain: json
+  - name: saved_search_frequency_id
+    desc: Alert frequency.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: notification_channel_id
+    desc: Alert channel.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+    'null': true
+    null_why: NULL = no alerts configured.
+  - name: last_run_at
+    desc: Last alert run.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = never run.
+  - name: next_run_at
+    desc: Next scheduled run.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    'null': true
+    null_why: NULL = no alerts.
+  constraints: []
+  indexes:
+  - name: uq_saved_search_owner_app_user_id_search_name
+    columns:
+    - owner_app_user_id
+    - search_name
+    unique: true
+    where: deleted_at IS NULL
+    desc: Unique name per owner.
+  - name: idx_saved_search_next_run_at
+    columns:
+    - next_run_at
+    desc: Alert scheduler.
+    where: next_run_at IS NOT NULL AND deleted_at IS NULL
+  - name: idx_saved_search_organisation_id
+    columns:
+    - organisation_id
+    desc: Tenant searches.
+    where: organisation_id IS NOT NULL
+  - name: idx_saved_search_filters
+    columns:
+    - filters
+    desc: Inverted index for filter analytics.
+    inverted: true
+  - name: idx_saved_search_notification_channel_id
+    columns:
+    - notification_channel_id
+    desc: By channel.
+    where: notification_channel_id IS NOT NULL
+  - name: idx_saved_search_saved_search_frequency_id
+    columns:
+    - saved_search_frequency_id
+    desc: Leading index for FK fk_saved_search_saved_search_frequency_id (child lookup / FK check).
+  fks:
+  - name: fk_saved_search_owner_app_user_id
+    columns:
+    - owner_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: owner_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_saved_search_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_saved_search_saved_search_frequency_id
+    columns:
+    - saved_search_frequency_id
+    ref: saved_search_frequency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: saved_search_frequency_id -> saved_search_frequency; delete rule RESTRICT (see table description)
+  - name: fk_saved_search_notification_channel_id
+    columns:
+    - notification_channel_id
+    ref: notification_channel
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: notification_channel_id -> notification_channel; delete rule RESTRICT (see table description)
+- name: saved_search_run
+  kind: event
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B43
+  retention: TTL 180 days.
+  description: Execution of a saved search (alert run).
+  ttl:
+    expire_after: 180 days
+    column: ran_at
+  columns:
+  - name: saved_search_id
+    desc: Search.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: ran_at
+    desc: Run time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  - name: result_count
+    desc: Total matches.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: new_result_count
+    desc: New matches since last run.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: duration_ms
+    desc: Execution time.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  constraints: []
+  indexes:
+  - name: idx_saved_search_run_saved_search_id_ran_at
+    columns:
+    - saved_search_id
+    - ran_at DESC
+    desc: Runs of a search.
+  - name: idx_saved_search_run_ran_at
+    columns:
+    - ran_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 8
+  fks:
+  - name: fk_saved_search_run_saved_search_id
+    columns:
+    - saved_search_id
+    ref: saved_search
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: saved_search_id -> saved_search; delete rule CASCADE (see table description)
+- name: candidate_search_history
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B46
+  - B76
+  retention: TTL 24 months on searched_at.
+  description: Recruiter search log (append-only).
+  ttl:
+    expire_after: 24 months
+    column: searched_at
+  columns:
+  - name: searcher_app_user_id
+    desc: Searching user.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Tenant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = independent consultant.
+  - name: saved_search_id
+    desc: Saved search used.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = ad-hoc search.
+  - name: query_text
+    desc: Free-text keywords.
+    sens: Personal
+    type: STRING(500)
+    domain: free_text
+    'null': true
+    null_why: NULL = filters only.
+    pii: may contain names; TTL 24 months
+  - name: filters
+    desc: Filters applied.
+    sens: Internal
+    type: JSONB
+    domain: json
+  - name: result_count
+    desc: Matches returned.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  - name: searched_at
+    desc: Search time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints: []
+  indexes:
+  - name: idx_candidate_search_history_searched_at
+    columns:
+    - searched_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 16
+  - name: idx_candidate_search_history_searcher_app_user_id_searched_at
+    columns:
+    - searcher_app_user_id
+    - searched_at DESC
+    desc: My recent searches.
+  - name: idx_candidate_search_history_organisation_id_searched_at
+    columns:
+    - organisation_id
+    - searched_at DESC
+    desc: Tenant search audit.
+    where: organisation_id IS NOT NULL
+  - name: idx_candidate_search_history_saved_search_id
+    columns:
+    - saved_search_id
+    desc: From saved search.
+    where: saved_search_id IS NOT NULL
+  fks:
+  - name: fk_candidate_search_history_searcher_app_user_id
+    columns:
+    - searcher_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: searcher_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_candidate_search_history_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_candidate_search_history_saved_search_id
+    columns:
+    - saved_search_id
+    ref: saved_search
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: saved_search_id -> saved_search; delete rule RESTRICT (see table description)
+- name: candidate_note
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B46
+  - B76
+  retention: Soft-deleted; erased when candidate erasure is processed.
+  description: Recruiter private note about a candidate.
+  columns:
+  - name: candidate_profile_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: author_app_user_id
+    desc: Author.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Tenant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = independent consultant.
+  - name: note_text
+    desc: Note.
+    sens: Personal
+    type: STRING(4000)
+    domain: free_text
+    pii: visible to author and (if shared) tenant; erased on candidate erasure request
+  - name: is_shared_with_organisation
+    desc: Visible to the tenant.
+    sens: Internal
+    type: BOOL
+    domain: boolean
+    default: 'false'
+  constraints: []
+  indexes:
+  - name: idx_candidate_note_candidate_profile_id_author_app_user_id
+    columns:
+    - candidate_profile_id
+    - author_app_user_id
+    desc: Notes on a candidate by author.
+    where: deleted_at IS NULL
+  - name: idx_candidate_note_author_app_user_id
+    columns:
+    - author_app_user_id
+    desc: My notes.
+    where: deleted_at IS NULL
+  - name: idx_candidate_note_organisation_id
+    columns:
+    - organisation_id
+    desc: Shared notes.
+    where: organisation_id IS NOT NULL AND deleted_at IS NULL
+  fks:
+  - name: fk_candidate_note_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: candidate_profile_id -> candidate_profile; delete rule RESTRICT (see table description)
+  - name: fk_candidate_note_author_app_user_id
+    columns:
+    - author_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: author_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_candidate_note_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+- name: candidate_tag
+  kind: entity
+  delete_policy: soft
+  volume: low
+  tier: '1'
+  milestones:
+  - B46
+  retention: Soft-deleted; purged with tenant.
+  description: Tenant-defined tag label for candidates.
+  columns:
+  - name: organisation_id
+    desc: Tenant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: tag_label
+    desc: Label.
+    sens: Internal
+    type: STRING(60)
+    domain: free_text
+  - name: tag_label_normalised
+    desc: Lowercase label for uniqueness.
+    sens: Internal
+    type: STRING(60)
+    domain: free_text
+    computed: lower(tag_label)
+  constraints: []
+  indexes:
+  - name: uq_candidate_tag_organisation_id_tag_label_normalised
+    columns:
+    - organisation_id
+    - tag_label_normalised
+    unique: true
+    where: deleted_at IS NULL
+    desc: Unique label per tenant, case-insensitive.
+  fks:
+  - name: fk_candidate_tag_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+- name: candidate_tag_assignment
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B46
+  retention: Deleted on removal or candidate erasure.
+  description: Tag applied to a candidate by a recruiter.
+  columns:
+  - name: candidate_tag_id
+    desc: Tag.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: candidate_profile_id
+    desc: Candidate.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: assigned_by_app_user_id
+    desc: Assigner.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: assigned_at
+    desc: When.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: uq_candidate_tag_assignment_candidate_tag_id_candidate_profile_id
+    type: unique
+    columns:
+    - candidate_tag_id
+    - candidate_profile_id
+    desc: Once per tag and candidate.
+  indexes:
+  - name: idx_candidate_tag_assignment_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    desc: Tags of a candidate.
+  - name: idx_candidate_tag_assignment_assigned_by_app_user_id
+    columns:
+    - assigned_by_app_user_id
+    desc: By assigner.
+  fks:
+  - name: fk_candidate_tag_assignment_candidate_tag_id
+    columns:
+    - candidate_tag_id
+    ref: candidate_tag
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: candidate_tag_id -> candidate_tag; delete rule CASCADE (see table description)
+  - name: fk_candidate_tag_assignment_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: candidate_profile_id -> candidate_profile; delete rule RESTRICT (see table description)
+  - name: fk_candidate_tag_assignment_assigned_by_app_user_id
+    columns:
+    - assigned_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: assigned_by_app_user_id -> app_user; delete rule RESTRICT (see table description)
+- name: candidate_rating
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B46
+  retention: Soft-deleted; erased on candidate erasure; never shown to the candidate.
+  description: Recruiter private rating of a candidate.
+  columns:
+  - name: candidate_profile_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: rater_app_user_id
+    desc: Rater.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: job_requirement_id
+    desc: Requirement the rating relates to.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = general rating.
+  - name: rating_score
+    desc: Score 1..5.
+    sens: Internal
+    type: INT4
+    domain: quantity
+  constraints:
+  - name: ck_candidate_rating_rating_score_range
+    type: check
+    expr: rating_score >= 1 AND rating_score <= 5
+    desc: Scale.
+  indexes:
+  - name: uq_candidate_rating_rater_app_user_id_candidate_profile_id
+    columns:
+    - rater_app_user_id
+    - candidate_profile_id
+    unique: true
+    where: job_requirement_id IS NULL AND deleted_at IS NULL
+    desc: One general rating per rater.
+  - name: uq_candidate_rating_rater_app_user_id_candidate_profile_id_job_requirement_id
+    columns:
+    - rater_app_user_id
+    - candidate_profile_id
+    - job_requirement_id
+    unique: true
+    where: job_requirement_id IS NOT NULL AND deleted_at IS NULL
+    desc: One rating per rater per requirement.
+  - name: idx_candidate_rating_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    desc: Ratings of a candidate.
+    where: deleted_at IS NULL
+  - name: idx_candidate_rating_job_requirement_id
+    columns:
+    - job_requirement_id
+    desc: By requirement.
+    where: job_requirement_id IS NOT NULL
+  fks:
+  - name: fk_candidate_rating_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: candidate_profile_id -> candidate_profile; delete rule RESTRICT (see table description)
+  - name: fk_candidate_rating_rater_app_user_id
+    columns:
+    - rater_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: rater_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_candidate_rating_job_requirement_id
+    columns:
+    - job_requirement_id
+    ref: job_requirement
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: job_requirement_id -> job_requirement; delete rule RESTRICT (see table description)
+- name: candidate_contact_attempt
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B46
+  - B76
+  retention: TTL 24 months; contacts to blocked candidates are retained as evidence of suppression.
+  description: Log of every attempt to contact a candidate, including suppressed ones.
+  ttl:
+    expire_after: 24 months
+    column: attempted_at
+  columns:
+  - name: candidate_profile_id
+    desc: Reference to the parent or owning row.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: contacter_app_user_id
+    desc: Recruiter/consultant/employer.
+    sens: Internal
+    type: UUID
+    domain: identifier
+  - name: organisation_id
+    desc: Contacter tenant.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = independent consultant.
+  - name: notification_channel_id
+    desc: Channel.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: contact_attempt_outcome_id
+    desc: Outcome; suppressed_blocked when a block applied.
+    sens: Internal
+    type: UUID
+    domain: enum_ref
+  - name: outreach_recipient_id
+    desc: Originating bulk outreach.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = one-to-one contact.
+  - name: sourcing_request_id
+    desc: Request context.
+    sens: Internal
+    type: UUID
+    domain: identifier
+    'null': true
+    null_why: NULL = not under a sourcing request.
+  - name: block_checked_at
+    desc: When the block/consent check ran (always before send).
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+  - name: attempted_at
+    desc: Attempt time.
+    sens: Internal
+    type: TIMESTAMPTZ
+    domain: timestamp
+    default: now()
+  constraints:
+  - name: ck_candidate_contact_attempt_check_before_attempt
+    type: check
+    expr: block_checked_at <= attempted_at
+    desc: Block check precedes the attempt.
+  indexes:
+  - name: idx_candidate_contact_attempt_candidate_profile_id_attempted_at
+    columns:
+    - candidate_profile_id
+    - attempted_at DESC
+    desc: Frequency cap / candidate view of who contacted them.
+  - name: idx_candidate_contact_attempt_contacter_app_user_id_attempted_at
+    columns:
+    - contacter_app_user_id
+    - attempted_at DESC
+    desc: Activity of a recruiter.
+  - name: idx_candidate_contact_attempt_attempted_at
+    columns:
+    - attempted_at
+    desc: Sharded time scan.
+    hash: true
+    bucket_count: 16
+  - name: idx_candidate_contact_attempt_organisation_id
+    columns:
+    - organisation_id
+    desc: Tenant activity.
+    where: organisation_id IS NOT NULL
+  - name: idx_candidate_contact_attempt_outreach_recipient_id
+    columns:
+    - outreach_recipient_id
+    desc: From bulk outreach.
+    where: outreach_recipient_id IS NOT NULL
+  - name: idx_candidate_contact_attempt_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    desc: Under request.
+    where: sourcing_request_id IS NOT NULL
+  - name: idx_candidate_contact_attempt_notification_channel_id
+    columns:
+    - notification_channel_id
+    desc: Leading index for FK fk_candidate_contact_attempt_notification_channel_id (child lookup / FK check).
+  - name: idx_candidate_contact_attempt_contact_attempt_outcome_id
+    columns:
+    - contact_attempt_outcome_id
+    desc: Leading index for FK fk_candidate_contact_attempt_contact_attempt_outcome_id (child lookup / FK check).
+  fks:
+  - name: fk_candidate_contact_attempt_candidate_profile_id
+    columns:
+    - candidate_profile_id
+    ref: candidate_profile
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: candidate_profile_id -> candidate_profile; delete rule RESTRICT (see table description)
+  - name: fk_candidate_contact_attempt_contacter_app_user_id
+    columns:
+    - contacter_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: contacter_app_user_id -> app_user; delete rule RESTRICT (see table description)
+  - name: fk_candidate_contact_attempt_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: organisation_id -> organisation; delete rule RESTRICT (see table description)
+  - name: fk_candidate_contact_attempt_notification_channel_id
+    columns:
+    - notification_channel_id
+    ref: notification_channel
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: notification_channel_id -> notification_channel; delete rule RESTRICT (see table description)
+  - name: fk_candidate_contact_attempt_contact_attempt_outcome_id
+    columns:
+    - contact_attempt_outcome_id
+    ref: contact_attempt_outcome
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: contact_attempt_outcome_id -> contact_attempt_outcome; delete rule RESTRICT (see table description)
+  - name: fk_candidate_contact_attempt_outreach_recipient_id
+    columns:
+    - outreach_recipient_id
+    ref: outreach_recipient
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: outreach_recipient_id -> outreach_recipient; delete rule RESTRICT (see table description)
+  - name: fk_candidate_contact_attempt_sourcing_request_id
+    columns:
+    - sourcing_request_id
+    ref: sourcing_request
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: sourcing_request_id -> sourcing_request; delete rule RESTRICT (see table description)
+views:
+- name: vw_consultant_open_requirement
+  kind: view
+  tables:
+  - consultant_job_openness
+  - job_requirement
+  - consultant_profile
+  purpose: Only requirements currently open to consultants for the calling consultant (all-consultants windows or personal invitations).
+  security: Consultant app role can SELECT only this view, never job_requirement; filter by session consultant_profile.
+  sql_sketch: SELECT o.* FROM consultant_job_openness o WHERE o.closed_at IS NULL AND o.deleted_at IS NULL AND o.valid_from <= now() AND (o.valid_to IS NULL OR o.valid_to > now()) AND (o.consultant_profile_id
+    IS NULL OR o.consultant_profile_id = current_consultant_profile())
+- name: vw_outreach_eligible_candidate
+  kind: view
+  tables:
+  - candidate_profile
+  - outreach_batch
+  purpose: 'Candidates a sender may contact: not blocked (user_block/organisation_block), consent present, not contacted recently.'
+  security: Outreach insert path reads only this view; blocked rows never visible to the sender.
+  sql_sketch: SELECT cp.id FROM candidate_profile cp WHERE NOT EXISTS (SELECT 1 FROM user_block b WHERE b.candidate_profile_id=cp.id AND b.blocked_app_user_id=$sender) AND NOT EXISTS (SELECT 1 FROM organisation_block
+    ob WHERE ob.candidate_profile_id=cp.id AND ob.organisation_id=$org)
+- name: vw_sourcing_request_summary
+  kind: view
+  tables:
+  - sourcing_request
+  - sourcing_submission
+  - sourcing_commission
+  purpose: Request with submission and hire counts and commission total.
+  security: Employer tenant and consultant parties only.
+  sql_sketch: SELECT sr.id, count(ss.id) AS submissions FROM sourcing_request sr LEFT JOIN sourcing_submission ss ON ss.sourcing_request_id = sr.id GROUP BY sr.id
+business_rules:
+- id: BR-SRC-01
+  rule: A consultant may only work on requirements open to consultants.
+  mechanism_type: CHAIN_FK
+  mechanism: sourcing_request has composite FK (job_requirement_id, consultant_job_openness_id) -> consultant_job_openness(job_requirement_id, id) [UNIQUE(job_requirement_id,id)], so a request can only
+    point to an openness row of the same requirement; partial uniques allow one live all-consultant window and one live invitation per consultant per requirement. All consultant read access goes through
+    vw_consultant_open_requirement (closed_at IS NULL, window valid).
+  tables:
+  - sourcing_request
+  - consultant_job_openness
+  milestone: B46
+- id: BR-SRC-02
+  rule: Openness rows exist only for requirements with is_open_to_consultants = true.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Open txn: SELECT is_open_to_consultants FROM job_requirement WHERE id=$1 FOR UPDATE; abort if false; INSERT consultant_job_openness. Close txn (flag set false or job closed): same lock, UPDATE
+    consultant_job_openness SET closed_at=now() WHERE job_requirement_id=$1 AND closed_at IS NULL; UPDATE sourcing_request SET closed_at=now(), sourcing_request_status_id=closed WHERE job_requirement_id=$1
+    AND closed_at IS NULL; retry on 40001. Hardening option: a trigger on job_requirement; not relied upon (D-01).'
+  tables:
+  - consultant_job_openness
+  - sourcing_request
+  - job_requirement
+  milestone: B46
+- id: BR-SRC-03
+  rule: One live sourcing request per consultant per requirement.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq_sourcing_request_job_requirement_id_consultant_profile_id UNIQUE (job_requirement_id, consultant_profile_id) WHERE closed_at IS NULL AND deleted_at IS NULL.
+  tables:
+  - sourcing_request
+  milestone: B37
+- id: BR-SRC-04
+  rule: Consultant identity on a request is consistent.
+  mechanism_type: CHAIN_FK
+  mechanism: Composite FK (consultant_profile_id, consultant_app_user_id) -> consultant_profile(id, app_user_id).
+  tables:
+  - sourcing_request
+  - consultant_profile
+  milestone: B37
+- id: BR-SRC-05
+  rule: Acceptance/decline decisions are append-only and reasoned.
+  mechanism_type: PRIVILEGE
+  mechanism: sourcing_request_decision INSERT/SELECT grants only; status on sourcing_request updated in the same txn; declines carry sourcing_decision_reason_id (app-validated, NULL only for acceptances).
+    Audit event written for every decision.
+  tables:
+  - sourcing_request_decision
+  - sourcing_request
+  milestone: B43
+- id: BR-SRC-06
+  rule: Blocked candidates are never contacted by outreach.
+  mechanism_type: VIEW
+  mechanism: 'Recipient admission: INSERT INTO outreach_recipient SELECT ... FROM vw_outreach_eligible_candidate e WHERE e.id = ANY($candidates) (NOT EXISTS user_block / organisation_block for sender user,
+    tenant and consultant); rejected candidates INSERT INTO outreach_exclusion(reason blocked/opted_out/no_consent). Dispatcher re-runs the same predicate immediately before send; on hit sets outreach_delivery_status=suppressed
+    and logs candidate_contact_attempt(suppressed_blocked). ck_candidate_contact_attempt_check_before_attempt proves the check ran.'
+  tables:
+  - outreach_recipient
+  - outreach_exclusion
+  - candidate_contact_attempt
+  milestone: B46
+- id: BR-SRC-07
+  rule: A candidate appears once per batch.
+  mechanism_type: UNIQUE
+  mechanism: uq_outreach_recipient_outreach_batch_id_candidate_profile_id UNIQUE (outreach_batch_id, candidate_profile_id).
+  tables:
+  - outreach_recipient
+  milestone: B37
+- id: BR-SRC-08
+  rule: Consultant outreach requires a sourcing request.
+  mechanism_type: CHECK
+  mechanism: 'ck_outreach_batch_consultant_needs_request: NOT is_consultant_sender OR sourcing_request_id IS NOT NULL; the request must be live (app guard in dispatch txn re-reads sourcing_request.closed_at
+    IS NULL FOR SHARE).'
+  tables:
+  - outreach_batch
+  milestone: B46
+- id: BR-SRC-09
+  rule: Outreach credits are charged idempotently against the wallet.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Batch scheduling txn: SELECT wallet ... FOR UPDATE (subscriptions module); insert wallet_ledger_entry (reserve) and outreach_credit_usage(reserve, wallet_ledger_entry_id, idempotency_key);
+    per delivery consume; unused released; reply refund as new row (refund_on_reply) within configurable window. uq_outreach_credit_usage_idempotency_key blocks double charge on retry; wallet CHECK balance
+    >= 0 blocks overspend (D-14).'
+  tables:
+  - outreach_credit_usage
+  - outreach_batch
+  milestone: B43
+- id: BR-SRC-10
+  rule: Message bodies are retained only for the audit window.
+  mechanism_type: TTL
+  mechanism: outreach_message TTL 90 days (rendered_at); outreach_reply 180 days; candidate_search_history and candidate_contact_attempt 24 months; saved_search_run 180 days.
+  tables:
+  - outreach_message
+  - outreach_reply
+  - candidate_search_history
+  - candidate_contact_attempt
+  - saved_search_run
+  milestone: B43
+- id: BR-SRC-11
+  rule: A candidate can be submitted to an employer only with consent.
+  mechanism_type: FK
+  mechanism: sourcing_submission.user_consent_id NOT NULL FK -> user_consent; app validates consent type and not withdrawn at submit; unique (sourcing_request_id, candidate_profile_id) live.
+  tables:
+  - sourcing_submission
+  milestone: B40
+- id: BR-SRC-12
+  rule: Sourcing shortlists reference the jobs-module shortlist.
+  mechanism_type: FK
+  mechanism: sourcing_shortlist.job_shortlist_id NOT NULL FK -> job_shortlist, partial unique per live row; items unique per (shortlist, candidate).
+  tables:
+  - sourcing_shortlist
+  - sourcing_shortlist_item
+  milestone: B40
+- id: BR-SRC-13
+  rule: Recruiters cannot register candidates.
+  mechanism_type: PRIVILEGE
+  mechanism: Recruiter/consultant roles have no INSERT on candidate_profile; every candidate reference in this module is an FK to an existing candidate_profile.
+  tables:
+  - outreach_recipient
+  - sourcing_shortlist_item
+  - talent_pool_member
+  milestone: B46
+- id: BR-SRC-14
+  rule: Fee and percentage values are bounded.
+  mechanism_type: CHECK
+  mechanism: Percentages CHECK 0..100; fixed fees >= 0; sourcing_request requires at least one fee term (ck_sourcing_request_fee_present).
+  tables:
+  - sourcing_request
+  - sourcing_commission
+  - consultant_job_openness
+  milestone: B40
+- id: BR-SRC-15
+  rule: Candidate private data of recruiters is tenant-scoped and erasable.
+  mechanism_type: APP_LAYER
+  mechanism: candidate_note, candidate_rating, candidate_tag_assignment, talent_pool_member rows are filtered by organisation_id/author in the access layer and deleted/anonymised by the erasure job; blocked-candidate
+    sweep job removes pool memberships and shortlist items of senders the candidate blocks.
+  tables:
+  - candidate_note
+  - candidate_rating
+  - candidate_tag_assignment
+  - talent_pool_member
+  milestone: B46
+- id: BR-SRC-16
+  rule: Commission is posted once per hire.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq_sourcing_commission_sourcing_submission_id WHERE deleted_at IS NULL; invoice_id filled when invoiced; corrections soft-delete + new row (ledger entry in subscriptions).
+  tables:
+  - sourcing_commission
+  milestone: B40

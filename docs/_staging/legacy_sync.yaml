@@ -1,0 +1,761 @@
+module: administration
+notes: |
+  # Legacy job and candidate system synchronisation (integration boundary 'Legacy job & candidate systems')
+  Closes the gaps L-01..L-04 of docs/09_integration_boundaries.xlsx ('Legacy sync'). Four tables, two lookups, owned by the administration module because source systems, run
+  schedules and conflict decisions are operational/administrative data that every business module (profile, jobs, organisation) shares.
+
+  ## Design
+  * `legacy_source_system` is the registry of external systems (legacy candidate system, legacy job system, ATS). Its `import_source_id` reuses the existing profile lookup; the default
+    `sync_conflict_policy_id` reuses the existing `sync_conflict_policy` lookup (source_wins / platform_wins / newest_wins / manual_review), which is the conflict resolution rule vocabulary.
+    Secrets are never stored: `connection_ref` is a secret-manager reference.
+  * `legacy_sync_run` is one execution per (source system, entity kind) with the watermark (`watermark_from_ref` -> `watermark_to_ref`) and result counts. Idempotency: UNIQUE
+    (legacy_source_system_id, run_key); a partial unique index allows at most one open run per source and entity kind; the next run starts from the `watermark_to_ref` of the last
+    completed run only (the watermark of a failed run is never advanced).
+  * `legacy_record_map` is the idempotency anchor: UNIQUE (legacy_source_system_id, legacy_entity_kind_id, source_record_ref) -> exactly one platform record. A second UNIQUE
+    (source, kind, platform_record_ref) prevents two legacy records claiming one platform record. `platform_record_ref` is polymorphic (candidate_profile, organisation, job_requirement,
+    job_application ids chosen by the entity kind) and therefore carries no FK; a nightly orphan check job verifies it. Deletes in legacy are tombstoned, never propagated.
+  * `legacy_sync_conflict` is an append-only, TTL-limited log of field-level conflicts: which field, keyed hashes of both values (raw values are not copied), the rule applied
+    (`sync_conflict_policy_id`) and the outcome (`legacy_conflict_outcome`). A manual-review decision is a new row that supersedes the earlier one.
+  * `job_requirement` gains `legacy_source_system_id` and the partial unique (legacy_source_system_id, external_job_ref) so a re-run cannot create duplicate jobs (L-01).
+    `candidate_profile.legacy_candidate_ref` stays unique globally; with several source systems new imports resolve through `legacy_record_map` (L-02).
+  * Existing `profile_import` stays the per-candidate raw payload audit; `legacy_sync_run` is the batch level above it. Field-level mapping beyond a version string
+    (`field_mapping_version`) is intentionally configuration in code.
+
+  ## Retention
+  Runs and record maps live while the source system is enabled; conflicts expire after 24 months (row-level TTL, no table references them with RESTRICT).
+lookups:
+- name: legacy_entity_kind
+  description: Kind of entity synchronised from a legacy system (decides the target table of legacy_record_map.platform_record_ref).
+  milestones:
+  - B4
+  - B12
+  values:
+  - code: candidate
+    en: Candidate profile
+    sort: 10
+  - code: organisation
+    en: Organisation
+    sort: 20
+  - code: job_requirement
+    en: Job requirement
+    sort: 30
+  - code: job_application
+    en: Job application
+    sort: 40
+  - code: candidate_experience
+    en: Candidate experience
+    sort: 50
+  - code: candidate_education
+    en: Candidate education
+    sort: 60
+  - code: candidate_skill
+    en: Candidate skill
+    sort: 70
+- name: legacy_conflict_outcome
+  description: Result of resolving one field-level legacy sync conflict.
+  milestones:
+  - B4
+  - B12
+  values:
+  - code: legacy_applied
+    en: Legacy value applied
+    sort: 10
+  - code: platform_kept
+    en: Platform value kept
+    sort: 20
+  - code: merged
+    en: Values merged
+    sort: 30
+  - code: queued_for_review
+    en: Queued for manual review
+    sort: 40
+  - code: rejected
+    en: Rejected as invalid
+    sort: 50
+tables:
+- name: legacy_source_system
+  kind: config
+  delete_policy: soft
+  volume: low
+  tier: X
+  milestones:
+  - B4
+  - B12
+  - B20
+  retention: Kept while any record map or job references it; disabled (is_enabled = false) and soft-deleted when decommissioned.
+  description: 'Registry of external legacy candidate/job/ATS systems that are synchronised into the platform: kind, default conflict rule, schedule and secret reference.'
+  no_hash_why: Low volume registry table.
+  columns:
+  - name: code
+    type: STRING(64)
+    domain: code
+    desc: Stable machine code of the source system (e.g. legacy_naukri_feed).
+    sens: Internal
+  - name: display_name
+    type: STRING(150)
+    domain: free_text
+    desc: Operator-facing name.
+    sens: Internal
+  - name: import_source_id
+    type: UUID
+    domain: enum_ref
+    desc: 'Kind of source (import_source lookup: legacy_candidate_system, legacy_job_system, ats_sync ...).'
+    sens: Internal
+  - name: sync_conflict_policy_id
+    type: UUID
+    domain: enum_ref
+    desc: Default conflict resolution rule for this source (sync_conflict_policy lookup).
+    sens: Internal
+  - name: field_mapping_version
+    type: STRING(20)
+    domain: code
+    desc: Version of the field mapping configuration the sync code applies.
+    sens: Internal
+  - name: connection_ref
+    type: STRING(200)
+    domain: token
+    desc: Secret-manager reference (path/name) to the connection credentials; the credentials themselves are never stored.
+    sens: Sensitive
+    pii: reference to a vault entry only (no password, key or token value in the database); access limited to the sync service role
+  - name: schedule_expression
+    type: STRING(64)
+    domain: code
+    desc: Cron expression of the periodic sync.
+    'null': true
+    null_why: NULL = manual runs only (no schedule).
+    sens: Internal
+  - name: propagates_deletes
+    type: BOOL
+    domain: boolean
+    desc: True when a deletion in the legacy system is propagated; default false (deletes are only tombstoned in the record map).
+    default: 'false'
+    sens: Internal
+  - name: is_enabled
+    type: BOOL
+    domain: boolean
+    desc: False pauses all runs for this source.
+    default: 'true'
+    sens: Internal
+  - name: last_successful_run_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Finish time of the last completed run.
+    'null': true
+    null_why: NULL = no run has completed yet.
+    sens: Internal
+  constraints: []
+  indexes:
+  - name: uq_legacy_source_system_code
+    unique: true
+    columns:
+    - code
+    where: deleted_at IS NULL
+    desc: Natural key of a live source system.
+  - name: idx_legacy_source_system_import_source_id
+    columns:
+    - import_source_id
+    desc: Source systems by kind.
+  - name: idx_legacy_source_system_sync_conflict_policy_id
+    columns:
+    - sync_conflict_policy_id
+    desc: Source systems by default conflict rule (leading index of the FK).
+  fks:
+  - name: fk_legacy_source_system_import_source_id
+    columns:
+    - import_source_id
+    ref: import_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup value in use cannot be removed (retire via is_active).
+  - name: fk_legacy_source_system_sync_conflict_policy_id
+    columns:
+    - sync_conflict_policy_id
+    ref: sync_conflict_policy
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup value in use cannot be removed (retire via is_active).
+- name: legacy_sync_run
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B4
+  - B12
+  - B20
+  retention: Kept 24 months after finish for audit and watermark history; purged by a monthly job after the conflict rows (24-month TTL) have expired.
+  description: 'One synchronisation run of one entity kind from one legacy source system: watermark window, status and result counts. Batch level above profile_import.'
+  no_hash_why: Medium volume; read by source system and start time, not by a global time order.
+  columns:
+  - name: legacy_source_system_id
+    type: UUID
+    domain: identifier
+    desc: Source system of the run.
+    sens: Internal
+  - name: legacy_entity_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Entity kind synchronised by this run.
+    sens: Internal
+  - name: import_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Run status (pending, running, completed, partially_applied, failed, rolled_back).
+    sens: Internal
+  - name: sync_conflict_policy_id
+    type: UUID
+    domain: enum_ref
+    desc: Conflict rule applied by this run (copied from the source default unless overridden).
+    sens: Internal
+  - name: run_key
+    type: STRING(150)
+    domain: code
+    desc: 'Idempotency key: source + entity kind + window, e.g. legacy_jobs:job_requirement:2026-10-16T00.'
+    sens: Internal
+  - name: watermark_from_ref
+    type: STRING(300)
+    domain: token
+    desc: Cursor/high-water mark this run started from (opaque source value).
+    'null': true
+    null_why: NULL = full run from the beginning.
+    sens: Internal
+  - name: watermark_to_ref
+    type: STRING(300)
+    domain: token
+    desc: Cursor/high-water mark reached; becomes the next run's start only when the run completed.
+    'null': true
+    null_why: NULL = run not finished or the source supplies no cursor.
+    sens: Internal
+  - name: is_active_run
+    type: BOOL
+    domain: boolean
+    desc: True while the run is open (finished_at IS NULL); drives the one-open-run-per-source partial unique.
+    default: 'true'
+    sens: Internal
+  - name: is_dry_run
+    type: BOOL
+    domain: boolean
+    desc: True = validate and count only, no platform writes.
+    default: 'false'
+    sens: Internal
+  - name: started_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Run start (UTC).
+    default: now()
+    sens: Internal
+  - name: finished_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Run end (UTC).
+    'null': true
+    null_why: NULL = run still open.
+    sens: Internal
+  - name: items_read
+    type: INT4
+    domain: quantity
+    desc: Records read from the source.
+    default: '0'
+    sens: Internal
+  - name: items_created
+    type: INT4
+    domain: quantity
+    desc: Platform records created.
+    default: '0'
+    sens: Internal
+  - name: items_updated
+    type: INT4
+    domain: quantity
+    desc: Platform records updated.
+    default: '0'
+    sens: Internal
+  - name: items_skipped
+    type: INT4
+    domain: quantity
+    desc: Records skipped as unchanged (same payload hash) or by rule.
+    default: '0'
+    sens: Internal
+  - name: items_conflicted
+    type: INT4
+    domain: quantity
+    desc: Records with at least one field-level conflict.
+    default: '0'
+    sens: Internal
+  - name: items_failed
+    type: INT4
+    domain: quantity
+    desc: Records that failed validation or writing.
+    default: '0'
+    sens: Internal
+  - name: error_summary
+    type: STRING(1000)
+    domain: free_text
+    desc: Short failure summary for operators.
+    'null': true
+    null_why: NULL = no error.
+    sens: Internal
+  constraints:
+  - name: uq_legacy_sync_run_legacy_source_system_id_run_key
+    type: unique
+    columns:
+    - legacy_source_system_id
+    - run_key
+    desc: 'Idempotent run: the same run key cannot be started twice for a source.'
+  - name: ck_legacy_sync_run_finished_after_started
+    type: check
+    expr: finished_at IS NULL OR finished_at >= started_at
+    desc: End not before start.
+  - name: ck_legacy_sync_run_active_open
+    type: check
+    expr: is_active_run = (finished_at IS NULL)
+    desc: A run is active exactly while it has no finish time.
+  - name: ck_legacy_sync_run_counts
+    type: check
+    expr: items_read >= 0 AND items_created >= 0 AND items_updated >= 0 AND items_skipped >= 0 AND items_conflicted >= 0 AND items_failed >= 0
+    desc: Counters are non-negative.
+  indexes:
+  - name: uq_legacy_sync_run_legacy_source_system_id_entity_kind_open
+    unique: true
+    columns:
+    - legacy_source_system_id
+    - legacy_entity_kind_id
+    where: is_active_run
+    desc: At most one open run per source system and entity kind (no concurrent watermark movement).
+  - name: idx_legacy_sync_run_legacy_source_system_id_started_at
+    columns:
+    - legacy_source_system_id
+    - started_at DESC
+    desc: Run history of a source, newest first; finds the last completed watermark.
+  - name: idx_legacy_sync_run_import_status_id
+    columns:
+    - import_status_id
+    where: is_active_run
+    desc: Open/failed run monitor.
+  - name: idx_legacy_sync_run_sync_conflict_policy_id
+    columns:
+    - sync_conflict_policy_id
+    desc: Leading index of the policy FK.
+  fks:
+  - name: fk_legacy_sync_run_legacy_source_system_id
+    columns:
+    - legacy_source_system_id
+    ref: legacy_source_system
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Runs keep their source system; sources are soft-deleted.
+  - name: fk_legacy_sync_run_legacy_entity_kind_id
+    columns:
+    - legacy_entity_kind_id
+    ref: legacy_entity_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup value in use cannot be removed.
+    index_exempt: lookup rows are never deleted (retired via is_active), so no child scan is needed
+  - name: fk_legacy_sync_run_import_status_id
+    columns:
+    - import_status_id
+    ref: import_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup value in use cannot be removed.
+    index_exempt: lookup rows are never deleted (retired via is_active), so no child scan is needed
+  - name: fk_legacy_sync_run_sync_conflict_policy_id
+    columns:
+    - sync_conflict_policy_id
+    ref: sync_conflict_policy
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup value in use cannot be removed.
+- name: legacy_record_map
+  kind: entity
+  delete_policy: hard
+  volume: high
+  tier: X
+  milestones:
+  - B4
+  - B12
+  - B20
+  retention: Kept while the source system is enabled (it is the idempotency anchor); tombstoned rows purged 24 months after tombstoning; deleted with the source system on decommission.
+  description: Idempotency map from (legacy source system, entity kind, source record reference) to exactly one platform record, with payload hash and tombstone flag.
+  columns:
+  - name: legacy_source_system_id
+    type: UUID
+    domain: identifier
+    desc: Source system the record comes from.
+    sens: Internal
+  - name: legacy_entity_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: Entity kind; decides which table platform_record_ref points to.
+    sens: Internal
+  - name: source_record_ref
+    type: STRING(200)
+    domain: free_text
+    desc: Id of the record in the legacy system (opaque text).
+    sens: Internal
+  - name: platform_record_ref
+    type: UUID
+    domain: identifier
+    desc: Id of the platform record (candidate_profile, organisation, job_requirement ... by entity kind); polymorphic, verified by the nightly orphan check, hence *_ref and no FK.
+    sens: Internal
+  - name: first_seen_legacy_sync_run_id
+    type: UUID
+    domain: identifier
+    desc: Run that first imported this record.
+    'null': true
+    null_why: NULL = the run row was purged.
+    sens: Internal
+  - name: last_seen_legacy_sync_run_id
+    type: UUID
+    domain: identifier
+    desc: Run that last saw this record in the source.
+    'null': true
+    null_why: NULL = the run row was purged.
+    sens: Internal
+  - name: source_payload_sha256
+    type: STRING(64)
+    domain: code
+    desc: 'SHA-256 of the normalised source payload (change detection: equal hash = skip).'
+    'null': true
+    null_why: NULL = payload not hashed.
+    sens: Internal
+  - name: source_updated_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Last-modified time reported by the source (input for newest_wins).
+    'null': true
+    null_why: NULL = source reports no modification time.
+    sens: Internal
+  - name: last_synced_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Last time this mapping was applied or confirmed.
+    default: now()
+    sens: Internal
+  - name: is_tombstoned
+    type: BOOL
+    domain: boolean
+    desc: True = the record disappeared/was deleted in the source (not propagated).
+    default: 'false'
+    sens: Internal
+  - name: tombstoned_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the deletion in the source was detected.
+    'null': true
+    null_why: NULL = record still present in the source.
+    sens: Internal
+  constraints:
+  - name: uq_legacy_record_map_legacy_source_system_id_legacy_entity_kind_id_source_record_ref
+    type: unique
+    columns:
+    - legacy_source_system_id
+    - legacy_entity_kind_id
+    - source_record_ref
+    desc: 'Idempotency: one mapping per source record; re-import finds it instead of inserting.'
+  - name: uq_legacy_record_map_legacy_source_system_id_legacy_entity_kind_id_platform_record_ref
+    type: unique
+    columns:
+    - legacy_source_system_id
+    - legacy_entity_kind_id
+    - platform_record_ref
+    desc: A platform record is claimed by at most one record of the same source.
+  - name: ck_legacy_record_map_tombstone
+    type: check
+    expr: is_tombstoned = (tombstoned_at IS NOT NULL)
+    desc: Tombstone flag and time agree.
+  indexes:
+  - name: idx_legacy_record_map_platform_record_ref
+    columns:
+    - platform_record_ref
+    - legacy_entity_kind_id
+    desc: 'Reverse lookup: which legacy record produced this platform record.'
+  - name: idx_legacy_record_map_last_synced_at
+    columns:
+    - last_synced_at
+    hash: true
+    bucket_count: 8
+    desc: Hash-sharded time index for staleness/tombstone sweeps without a hot range.
+  - name: idx_legacy_record_map_first_seen_legacy_sync_run_id
+    columns:
+    - first_seen_legacy_sync_run_id
+    where: first_seen_legacy_sync_run_id IS NOT NULL
+    desc: Records created by a run.
+  - name: idx_legacy_record_map_last_seen_legacy_sync_run_id
+    columns:
+    - last_seen_legacy_sync_run_id
+    where: last_seen_legacy_sync_run_id IS NOT NULL
+    desc: 'Records seen by a run (tombstone detection: not seen in the last full run).'
+  fks:
+  - name: fk_legacy_record_map_legacy_source_system_id
+    columns:
+    - legacy_source_system_id
+    ref: legacy_source_system
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Map rows must be purged before the source system is hard-deleted.
+  - name: fk_legacy_record_map_legacy_entity_kind_id
+    columns:
+    - legacy_entity_kind_id
+    ref: legacy_entity_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup value in use cannot be removed.
+    index_exempt: lookup rows are never deleted (retired via is_active), so no child scan is needed
+  - name: fk_legacy_record_map_first_seen_legacy_sync_run_id
+    columns:
+    - first_seen_legacy_sync_run_id
+    ref: legacy_sync_run
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: purging an old run must not delete the idempotency anchor.'
+  - name: fk_legacy_record_map_last_seen_legacy_sync_run_id
+    columns:
+    - last_seen_legacy_sync_run_id
+    ref: legacy_sync_run
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: purging an old run must not delete the idempotency anchor.'
+- name: legacy_sync_conflict
+  kind: event
+  delete_policy: append_only
+  volume: medium
+  tier: X
+  milestones:
+  - B4
+  - B12
+  - B20
+  retention: 24 months, then removed by row-level TTL (detected_at). Holds keyed hashes only, no raw personal values.
+  description: 'Append-only log of field-level conflicts between a legacy value and the platform value: field, both value hashes, rule applied, outcome and review decision.'
+  ttl:
+    expire_after: 24 months
+    column: detected_at
+  no_hash_why: Medium volume; read per run or record map, not by a global time order.
+  columns:
+  - name: legacy_sync_run_id
+    type: UUID
+    domain: identifier
+    desc: Run that detected the conflict.
+    sens: Internal
+  - name: legacy_record_map_id
+    type: UUID
+    domain: identifier
+    desc: Mapped record the conflict belongs to.
+    sens: Internal
+  - name: field_name
+    type: STRING(100)
+    domain: code
+    desc: Platform field in conflict, as table.column (e.g. candidate_profile.contact_email).
+    sens: Internal
+  - name: legacy_value_hash
+    type: STRING(64)
+    domain: code
+    desc: Keyed HMAC-SHA256 of the legacy value (not reversible).
+    sens: Personal
+    pii: keyed hash only; the raw legacy value is never copied (re-read from the legacy system when a reviewer needs it)
+  - name: platform_value_hash
+    type: STRING(64)
+    domain: code
+    desc: Keyed HMAC-SHA256 of the platform value.
+    sens: Personal
+    pii: keyed hash only; the raw platform value is never copied
+  - name: sync_conflict_policy_id
+    type: UUID
+    domain: enum_ref
+    desc: Rule that was applied (source_wins, platform_wins, newest_wins, manual_review).
+    sens: Internal
+  - name: legacy_conflict_outcome_id
+    type: UUID
+    domain: enum_ref
+    desc: Outcome of the resolution.
+    sens: Internal
+  - name: source_updated_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Source modification time compared by newest_wins.
+    'null': true
+    null_why: NULL = source reports no modification time.
+    sens: Internal
+  - name: platform_updated_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Platform modification time compared by newest_wins.
+    'null': true
+    null_why: NULL = platform value never edited (import value).
+    sens: Internal
+  - name: detected_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the conflict was detected (UTC).
+    default: now()
+    sens: Internal
+  - name: supersedes_legacy_sync_conflict_id
+    type: UUID
+    domain: identifier
+    desc: Earlier conflict row this row resolves (manual review decision).
+    'null': true
+    null_why: NULL = first decision for this conflict.
+    sens: Internal
+  - name: resolved_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Reviewer who decided a manual-review conflict.
+    'null': true
+    null_why: NULL = resolved automatically by the rule.
+    sens: Internal
+  - name: resolution_note
+    type: STRING(500)
+    domain: free_text
+    desc: Reviewer comment.
+    'null': true
+    null_why: NULL = no comment.
+    sens: Internal
+  constraints:
+  - name: ck_legacy_sync_conflict_review_actor
+    type: check
+    expr: resolved_by_app_user_id IS NULL OR supersedes_legacy_sync_conflict_id IS NOT NULL
+    desc: A reviewer decision always supersedes the queued row it resolves.
+  indexes:
+  - name: uq_legacy_sync_conflict_supersedes_legacy_sync_conflict_id
+    unique: true
+    columns:
+    - supersedes_legacy_sync_conflict_id
+    where: supersedes_legacy_sync_conflict_id IS NOT NULL
+    desc: A conflict is superseded at most once (single decision chain).
+  - name: idx_legacy_sync_conflict_legacy_sync_run_id
+    columns:
+    - legacy_sync_run_id
+    - legacy_conflict_outcome_id
+    desc: Conflicts of a run by outcome (review queue).
+  - name: idx_legacy_sync_conflict_legacy_record_map_id
+    columns:
+    - legacy_record_map_id
+    - detected_at DESC
+    desc: Conflict history of a mapped record.
+  - name: idx_legacy_sync_conflict_resolved_by_app_user_id
+    columns:
+    - resolved_by_app_user_id
+    where: resolved_by_app_user_id IS NOT NULL
+    desc: Reviewer workload.
+  - name: idx_legacy_sync_conflict_sync_conflict_policy_id
+    columns:
+    - sync_conflict_policy_id
+    desc: Leading index of the policy FK; conflicts per rule.
+  fks:
+  - name: fk_legacy_sync_conflict_legacy_sync_run_id
+    columns:
+    - legacy_sync_run_id
+    ref: legacy_sync_run
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Runs are purged only after their conflict rows expired.
+  - name: fk_legacy_sync_conflict_legacy_record_map_id
+    columns:
+    - legacy_record_map_id
+    ref: legacy_record_map
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Map rows are purged only after their conflict rows expired.
+  - name: fk_legacy_sync_conflict_sync_conflict_policy_id
+    columns:
+    - sync_conflict_policy_id
+    ref: sync_conflict_policy
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup value in use cannot be removed.
+    index_exempt: lookup rows are never deleted (retired via is_active), so no child scan is needed
+  - name: fk_legacy_sync_conflict_legacy_conflict_outcome_id
+    columns:
+    - legacy_conflict_outcome_id
+    ref: legacy_conflict_outcome
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup value in use cannot be removed.
+    index_exempt: lookup rows are never deleted (retired via is_active), so no child scan is needed
+  - name: fk_legacy_sync_conflict_supersedes_legacy_sync_conflict_id
+    columns:
+    - supersedes_legacy_sync_conflict_id
+    ref: legacy_sync_conflict
+    ref_columns:
+    - id
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: 'SET NULL: when the earlier row expires by TTL the decision row survives.'
+  - name: fk_legacy_sync_conflict_resolved_by_app_user_id
+    columns:
+    - resolved_by_app_user_id
+    ref: app_user
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Users are soft-deleted/anonymised, never hard-deleted.
+business_rules:
+- id: BR-LGS-01
+  rule: A legacy record maps to exactly one platform record and a re-run never creates a duplicate.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE (legacy_source_system_id, legacy_entity_kind_id, source_record_ref) on legacy_record_map; second UNIQUE (legacy_source_system_id, legacy_entity_kind_id, platform_record_ref); sync does
+    INSERT ... ON CONFLICT DO NOTHING then UPDATE.
+  tables:
+  - legacy_record_map
+  milestone: B20
+- id: BR-LGS-02
+  rule: Only one open sync run exists per source system and entity kind; a run key is never reused.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: Partial unique (legacy_source_system_id, legacy_entity_kind_id) WHERE is_active_run, CHECK is_active_run = (finished_at IS NULL), UNIQUE (legacy_source_system_id, run_key).
+  tables:
+  - legacy_sync_run
+  milestone: B20
+- id: BR-LGS-03
+  rule: The watermark only advances from a completed run.
+  mechanism_type: JOB
+  mechanism: Sync job reads watermark_to_ref of the latest legacy_sync_run with import_status completed for the source and entity kind in the same transaction that opens the next run (SELECT ... FOR UPDATE
+    on legacy_source_system).
+  tables:
+  - legacy_sync_run
+  - legacy_source_system
+  milestone: B20
+- id: BR-LGS-04
+  rule: Every field-level conflict is recorded with the rule applied and its outcome; decisions are never edited.
+  mechanism_type: PRIVILEGE
+  mechanism: legacy_sync_conflict is append_only (INSERT/SELECT grants only); a manual decision is a new row superseding the queued one (partial unique on supersedes_legacy_sync_conflict_id).
+  tables:
+  - legacy_sync_conflict
+  milestone: B20
+- id: BR-LGS-05
+  rule: An imported job is identified by (source system, external reference) and exists once.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: Partial unique index uq_job_requirement_legacy_source_system_id_external_job_ref WHERE external_job_ref IS NOT NULL AND deleted_at IS NULL; CHECK external_job_ref IS NULL OR legacy_source_system_id
+    IS NOT NULL.
+  tables:
+  - job_requirement
+  - legacy_source_system
+  milestone: B20

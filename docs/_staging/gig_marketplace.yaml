@@ -1,0 +1,5390 @@
+module: gig_marketplace
+notes: |
+  ## Gig marketplace: design notes (milestones B26, B29, B32, B35, B75)
+
+  ### 1. Shared vs separate (D-15) and why
+  Decision: gigs are a SEPARATE subsystem (gig_*), sharing only master data (job_category, skill, country, city, currency, language,
+  proficiency_level), organisation, app_user, and the wallet/payment/notification services. Candidates/permanent roles keep
+  job_requirement/job_application.
+  Why separate (cardinality and semantics differ):
+  * Window + price: a gig has a start/end window on a 15-minute grid and a fixed OR rate-based price; job_requirement has openings,
+    salary bands and a posting lifecycle. Forcing both into one table would need 10+ nullable discriminator-dependent columns and
+    type-dependent CHECKs.
+  * Direction: gig bids are one-direction (worker applies, requester accepts/rejects, no counter-offer); job_application has a
+    multi-stage pipeline (shortlist, interview, offer, join) owned by recruiters.
+  * Fulfilment: accepted gigs are executed in an external system (handoff_ref, idempotency key, reconciled status, external earnings);
+    jobs end at "joined". Gig rows therefore carry reconciliation and webhook state that makes no sense for jobs.
+  * Integrity: overlap prevention (gig_slot), "rate only completed", "one list entry" are expressed as DB constraints specific to gigs.
+  Trade-offs accepted:
+  * Reporting: cross-type demand/supply reports (e.g. all open demand for a category/city) need a UNION. Mitigation: view
+    vw_unified_demand (job_requirement UNION ALL gig_request on a common column set: demand_type, organisation_id, job_category_id,
+    city_id, status_code, opened_at, window/price summary) and the analytics bridge (bridge_demand_source) built from it; the analytics
+    module consumes the view, so BI users see one table.
+  * Future change: a new "type" (e.g. managed remote workforce) can be a third subsystem plus a branch in the view; no migration of
+    existing tables. A future merge of types would be a backfill into a unified table via the same view column set (cheap).
+  * Duplication: skill/category matching code exists twice; mitigated by shared master tables, so ontology changes apply to both.
+  Alternatives considered: (A) single job_requirement with job_kind discriminator (rejected: sparse columns, weak CHECKs, shared
+  pipeline wrongly applied to gigs); (B) shared "work_item" supertype with gig/job subtype tables (rejected: CockroachDB has no table
+  inheritance; supertype+subtype needs 1:1 FKs and joins on every read for little reuse); (C) separate (chosen) + union view.
+
+  ### 2. Overlap rule (B35) with no exclusion constraints
+  Pattern P2 SLOT_TABLE. gig_assignment stores the window (window_start_at/window_end_at, both CHECKed to the 15-min grid, end >
+  start, max 31 days). In the SAME transaction as accepting the assignment the app inserts one gig_slot row per 15-minute slot:
+  UNIQUE (gig_worker_profile_id, slot_start_at). Any overlapping window collides on at least one slot -> unique violation -> txn
+  aborts, no application-level race even under concurrency (SERIALIZABLE + unique index).
+  Sizing: 31 days * 96 slots/day = 2,976 slots max per assignment (CHECK expected_slot_count BETWEEN 1 AND 2976). A typical gig
+  (4 h) = 16 rows. Realistic load: 1M assignments * ~40 slots = ~40M rows total; ~16 bytes of key + overhead each, plus TTL keeps only
+  the trailing 90 days (row-level TTL on slot_start_at). The unique key leads with the worker UUID (random, no hot range); the only
+  time-ordered index (slot_start_at) is hash-sharded (16 buckets). Writes are batched in multi-row INSERT (<= 2,976 rows, one
+  statement). Time-off (gig_time_off) is materialised into the same table (gig_slot.gig_time_off_id, exactly one owner via CHECK), so a
+  worker cannot be assigned during approved leave and cannot add leave over an assignment (the unique violation tells the UI).
+  Cleanup: cancellation/no_show/reschedule deletes slots by gig_assignment_id (idx) in the txn that writes gig_cancellation; a nightly
+  job re-checks gig_cancellation.slots_released_at IS NULL and the invariant count(slots) = expected_slot_count for statuses with
+  holds_slots. Composite FK (gig_assignment_id, gig_worker_profile_id) guarantees slot.worker = assignment.worker.
+  Availability interplay (advisory vs enforced): gig_availability_rule (weekly recurrence, local time) and gig_availability_window
+  (one-off extra windows) describe when a worker WANTS work; they drive search/matching and are validated by the app when accepting an
+  application (window must be inside rules/windows). Only gig_slot (assignments + time off) is hard-enforced. Rationale: availability
+  is soft preference that changes weekly; slots are commitments.
+  Alternatives: (a) btree_gist exclusion constraints (not in CRDB); (b) range column + app check (race-prone); (c) per-worker row lock
+  (P4) - used additionally (SELECT worker FOR UPDATE) only to give friendly errors, correctness comes from UNIQUE.
+
+  ### 3. Other integrity mechanisms (all declarative)
+  * Price consistency: gig_price_type.is_rate_based + composite FK (gig_price_type_id, is_rate_based) + CHECK that fixed_price xor
+    (rate_amount, rate_unit) are populated according to the flag.
+  * Accept/assign chain: gig_application.is_accepted pinned by composite FK to gig_application_status(id,is_accepted); gig_assignment
+    composite FK (application, request, worker, application_is_accepted=true) -> gig_application: an assignment can exist only for an
+    accepted application of the same worker and request. Assignment currency pinned to the request currency, tenant pinned to the request.
+  * Headcount: accepted_count <= headcount CHECK; increment under SELECT gig_request FOR UPDATE (P4).
+  * Rating: composite FK (gig_assignment_id, assignment_is_completed=true) -> gig_assignment(id,is_completed) where is_completed is
+    pinned to gig_assignment_status.is_completed; one live rating per assignment via partial unique index; stars 1..5 CHECK; the
+    assignment cannot leave completed while a rating exists (ON UPDATE RESTRICT semantic via FK).
+  * Favourite XOR blacklist: single table gig_requester_worker_list, partial unique (organisation_id, gig_worker_profile_id) WHERE
+    deleted_at IS NULL, list_type lookup; moving a worker between lists = UPDATE of list_type, so mutual exclusion holds by
+    construction. List scope is organisation (tenant, D-11); added_by_app_user_id records the user. Blacklist is enforced at apply/invite
+    time in the txn (TXN_LOCK + read of the list row), not by FK.
+  * Idempotent handoff: handoff_idempotency_key unique; webhook idempotency unique (source_system, idempotency_key); earnings snapshots
+    unique (source_system, idempotency_key).
+
+  ### 4. Integration boundary (external fulfilment system)
+  Outbound: assignment insert -> outbox/handoff with handoff_idempotency_key; response stores handoff_ref. Inbound: webhook ->
+  gig_fulfilment_event (immutable, signature verified, minimal JSONB payload, 395-day TTL) -> processor writes
+  gig_fulfilment_event_attempt rows, updates gig_assignment (external_status_code, status, reconcile state), appends
+  gig_assignment_status_history, gig_earnings_snapshot, gig_payout_reference, gig_timesheet_entry. Earnings on gig_assignment
+  (estimated/total/projected) are COPIES with earnings_as_of_at and earnings_reconciled_at: the external system is source of truth.
+  A reconciliation job compares and sets gig_reconcile_state (drift_detected -> manual_review). The platform never stores bank/UPI
+  data: only payout_ref + channel + status.
+
+  ### 5. PII (B75) in this module
+  Sensitive: gig_worker_profile.kyc_token (vendor token only, no ID document data). Personal: home coordinates (full precision stored,
+  masked to 2 dp in vw_gig_worker_public), check-in coordinates (nulled after 180 d), bio/review/dispute/report free text (encrypted at
+  rest, D-17), certification credential numbers, requester site coordinates (exact only to accepted worker), webhook payloads (contract
+  forbids PII, schema-validated). Erasure: anonymise-in-place of soft rows; ratings are kept with reviewer text removed.
+
+  ### 6. Competitor coverage (public docs/knowledge; Upwork GraphQL docs were consulted, others from product knowledge - not re-verified)
+  * Upwork: fixed-price contracts with milestones vs hourly with work diary -> gig_request_milestone + gig_timesheet_entry; job success
+    score/ratings -> gig_rating/summary; availability setting -> gig_availability_status. Connects/bids pricing is not modelled
+    (credits live in the wallet module). Escrow not modelled (external).
+  * Fiverr: packages basic/standard/premium, revisions, delivery days -> gig_service_offering/gig_service_package. Seller levels not
+    modelled (derivable from completed_gig_count + rating).
+  * TaskRabbit: tasker hourly rate, task categories, service radius/home base, schedule availability, favourite taskers -> profile
+    columns, availability rules, gig_requester_worker_list.
+  * Uber driver onboarding / Urban Company partner: KYC/background verification, document expiry, partner ratings -> kyc_token,
+    gig_worker_certification (expiry job), verification_status. Background-check vendor results stay at the vendor.
+  * Toptal: vetting tiers -> verification_status lookup (extendable). Freelancer.com: milestone payments and bids -> milestones,
+    application; contests not modelled.
+  Extensions: team/agency gig accounts, multi-worker joint assignment (a GROUP of slots per worker already works), recurring
+  bookings (assignment series table), surge pricing.
+
+  ### 7. Volumes/hash sharding
+  very_high: gig_slot, gig_timesheet_entry, gig_fulfilment_event(+attempt) each with a hash-sharded time index; high:
+  histories, earnings snapshots, gig_request, gig_application, gig_assignment (human-paced; no sequential index leads, so
+  no_hash_why recorded). Trigram search (GIN gin_trgm_ops) on gig_request.title / gig_service_offering.title; ranking beyond that is the
+  search service fed by changefeed (D-16).
+  Registry tables relied on from other modules: country, city, currency, language, skill, job_category, geo_source,
+  proficiency_level, verification_status, organisation, app_user, job_requirement (view only).
+lookups:
+- name: gig_price_type
+  description: Pricing model of a gig request or offering. is_rate_based is the machine flag enforced by composite FK so price columns stay consistent.
+  values:
+  - code: fixed
+    en: Fixed price
+    hi: निश्चित मूल्य
+    sort: 10
+  - code: rate_based
+    en: Rate based (per hour/day)
+    hi: दर आधारित
+    sort: 20
+  milestones:
+  - B26
+  - B32
+  extra_columns:
+  - name: is_rate_based
+    type: BOOL
+    domain: boolean
+    'null': false
+    default: 'false'
+    sens: Public
+    desc: True for rate_based; false for fixed. Referenced by composite FK (id, is_rate_based).
+  constraints:
+  - name: uq_gig_price_type_id_is_rate_based
+    type: unique
+    columns:
+    - id
+    - is_rate_based
+    desc: Target of composite FKs that pin the flag to the type.
+- name: gig_rate_unit
+  description: Unit of a rate-based price or a worker charge rate.
+  values:
+  - code: hour
+    en: Per hour
+    hi: प्रति घंटा
+    sort: 10
+  - code: day
+    en: Per day
+    hi: प्रति दिन
+    sort: 20
+  - code: task
+    en: Per task
+    hi: प्रति कार्य
+    sort: 30
+  milestones:
+  - B26
+  - B32
+- name: gig_request_status
+  description: Lifecycle of a gig request.
+  values:
+  - code: draft
+    en: Draft
+    sort: 10
+  - code: open
+    en: Open for applications
+    hi: आवेदन के लिए खुला
+    sort: 20
+  - code: filled
+    en: Filled
+    hi: भरा हुआ
+    sort: 30
+  - code: in_progress
+    en: In progress
+    sort: 40
+  - code: completed
+    en: Completed
+    hi: पूर्ण
+    sort: 50
+  - code: cancelled
+    en: Cancelled
+    hi: रद्द
+    sort: 60
+  - code: expired
+    en: Expired
+    sort: 70
+  milestones:
+  - B26
+  - B32
+- name: gig_request_visibility
+  description: Who can see a gig request.
+  values:
+  - code: public
+    en: Public marketplace
+    sort: 10
+  - code: invite_only
+    en: Invited workers only
+    sort: 20
+  - code: favourites_only
+    en: Favourite workers only
+    sort: 30
+  milestones:
+  - B26
+  - B32
+- name: gig_work_mode
+  description: Where the gig work is performed.
+  values:
+  - code: onsite
+    en: On site
+    sort: 10
+  - code: remote
+    en: Remote
+    sort: 20
+  - code: hybrid
+    en: Hybrid
+    sort: 30
+  milestones:
+  - B26
+  - B32
+- name: gig_experience_level
+  description: Seniority wanted/offered.
+  values:
+  - code: entry
+    en: Entry
+    sort: 10
+  - code: intermediate
+    en: Intermediate
+    sort: 20
+  - code: expert
+    en: Expert
+    sort: 30
+  milestones:
+  - B26
+  - B32
+- name: gig_availability_status
+  description: Worker's current availability switch (search filter).
+  values:
+  - code: available
+    en: Available
+    hi: उपलब्ध
+    sort: 10
+  - code: busy
+    en: Busy
+    sort: 20
+  - code: away
+    en: Away
+    sort: 30
+  - code: unavailable
+    en: Unavailable
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_application_status
+  description: Status of a worker's application. is_accepted pinned by composite FK so assignments can only hang off accepted applications.
+  values:
+  - code: submitted
+    en: Submitted
+    sort: 10
+  - code: shortlisted
+    en: Shortlisted
+    sort: 20
+  - code: accepted
+    en: Accepted
+    hi: स्वीकृत
+    sort: 30
+  - code: rejected
+    en: Rejected
+    hi: अस्वीकृत
+    sort: 40
+  - code: withdrawn
+    en: Withdrawn by worker
+    sort: 50
+  - code: expired
+    en: Expired
+    sort: 60
+  milestones:
+  - B26
+  - B32
+  extra_columns:
+  - name: is_accepted
+    type: BOOL
+    domain: boolean
+    'null': false
+    default: 'false'
+    sens: Public
+    desc: True only for accepted.
+  constraints:
+  - name: uq_gig_application_status_id_is_accepted
+    type: unique
+    columns:
+    - id
+    - is_accepted
+    desc: Target of composite FK.
+- name: gig_assignment_status
+  description: Assignment lifecycle (platform view, reconciled with the external fulfilment system). is_completed pinned by composite FK; holds_slots marks statuses whose slot rows must exist.
+  values:
+  - code: pending_handoff
+    en: Pending handoff
+    sort: 10
+  - code: handed_off
+    en: Handed off
+    sort: 20
+  - code: scheduled
+    en: Scheduled
+    sort: 30
+  - code: in_progress
+    en: In progress
+    sort: 40
+  - code: completed
+    en: Completed
+    hi: पूर्ण
+    sort: 50
+  - code: cancelled
+    en: Cancelled
+    hi: रद्द
+    sort: 60
+  - code: no_show
+    en: No show
+    sort: 70
+  - code: disputed
+    en: Disputed
+    sort: 80
+  milestones:
+  - B26
+  - B32
+  extra_columns:
+  - name: is_completed
+    type: BOOL
+    domain: boolean
+    'null': false
+    default: 'false'
+    sens: Public
+    desc: True only for completed.
+  - name: holds_slots
+    type: BOOL
+    domain: boolean
+    'null': false
+    default: 'false'
+    sens: Public
+    desc: True when slot rows must be present (pending_handoff..in_progress, disputed).
+  constraints:
+  - name: uq_gig_assignment_status_id_is_completed
+    type: unique
+    columns:
+    - id
+    - is_completed
+    desc: Target of composite FK.
+- name: gig_reconcile_state
+  description: State of reconciliation between platform and external fulfilment system.
+  values:
+  - code: in_sync
+    en: In sync
+    sort: 10
+  - code: pending
+    en: Pending
+    sort: 20
+  - code: drift_detected
+    en: Drift detected
+    sort: 30
+  - code: manual_review
+    en: Manual review
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_actor_party
+  description: Which party performed an action.
+  values:
+  - code: requester
+    en: Requester
+    sort: 10
+  - code: worker
+    en: Gig worker
+    sort: 20
+  - code: platform
+    en: Platform/admin
+    sort: 30
+  - code: external_system
+    en: External fulfilment system
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_worker_list_type
+  description: Requester's list a worker is on (single table, mutually exclusive).
+  values:
+  - code: favourite
+    en: Favourite
+    hi: पसंदीदा
+    sort: 10
+  - code: blacklist
+    en: Blacklisted
+    hi: ब्लैकलिस्ट
+    sort: 20
+  milestones:
+  - B26
+  - B32
+- name: gig_invite_status
+  description: Invite lifecycle.
+  values:
+  - code: sent
+    en: Sent
+    sort: 10
+  - code: accepted
+    en: Accepted
+    sort: 20
+  - code: declined
+    en: Declined
+    sort: 30
+  - code: expired
+    en: Expired
+    sort: 40
+  - code: withdrawn
+    en: Withdrawn
+    sort: 50
+  milestones:
+  - B26
+  - B32
+- name: gig_milestone_status
+  description: Milestone/deliverable progress.
+  values:
+  - code: pending
+    en: Pending
+    sort: 10
+  - code: in_progress
+    en: In progress
+    sort: 20
+  - code: submitted
+    en: Submitted
+    sort: 30
+  - code: approved
+    en: Approved
+    sort: 40
+  - code: rejected
+    en: Rejected
+    sort: 50
+  milestones:
+  - B26
+  - B32
+- name: gig_package_tier
+  description: Rate-card package tier (Fiverr-style).
+  values:
+  - code: basic
+    en: Basic
+    sort: 10
+  - code: standard
+    en: Standard
+    sort: 20
+  - code: premium
+    en: Premium
+    sort: 30
+  milestones:
+  - B26
+  - B32
+- name: gig_weekday
+  description: ISO weekday for recurring availability.
+  values:
+  - code: mon
+    en: Monday
+    hi: सोमवार
+    sort: 10
+  - code: tue
+    en: Tuesday
+    hi: मंगलवार
+    sort: 20
+  - code: wed
+    en: Wednesday
+    hi: बुधवार
+    sort: 30
+  - code: thu
+    en: Thursday
+    hi: गुरुवार
+    sort: 40
+  - code: fri
+    en: Friday
+    hi: शुक्रवार
+    sort: 50
+  - code: sat
+    en: Saturday
+    hi: शनिवार
+    sort: 60
+  - code: sun
+    en: Sunday
+    hi: रविवार
+    sort: 70
+  milestones:
+  - B26
+  - B32
+- name: gig_time_off_type
+  description: Reason class of worker time off.
+  values:
+  - code: leave
+    en: Personal leave
+    sort: 10
+  - code: holiday
+    en: Holiday/festival
+    sort: 20
+  - code: medical
+    en: Medical
+    sort: 30
+  - code: other
+    en: Other
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_attachment_type
+  description: Kind of request attachment.
+  values:
+  - code: brief
+    en: Brief
+    sort: 10
+  - code: photo
+    en: Photo
+    sort: 20
+  - code: drawing
+    en: Drawing/plan
+    sort: 30
+  - code: other
+    en: Other
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_portfolio_media_type
+  description: Portfolio item media class.
+  values:
+  - code: image
+    en: Image
+    sort: 10
+  - code: video
+    en: Video
+    sort: 20
+  - code: link
+    en: External link
+    sort: 30
+  - code: document
+    en: Document
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_checkin_method
+  description: How a check-in/out was captured.
+  values:
+  - code: gps
+    en: GPS geofence
+    sort: 10
+  - code: qr
+    en: QR code
+    sort: 20
+  - code: otp
+    en: Requester OTP
+    sort: 30
+  - code: manual
+    en: Manual correction
+    sort: 40
+  - code: external
+    en: External system
+    sort: 50
+  milestones:
+  - B26
+  - B32
+- name: gig_dispute_reason
+  description: Dispute reason.
+  values:
+  - code: quality
+    en: Work quality
+    sort: 10
+  - code: no_show
+    en: No show
+    sort: 20
+  - code: payment
+    en: Payment/earnings mismatch
+    sort: 30
+  - code: conduct
+    en: Conduct
+    sort: 40
+  - code: other
+    en: Other
+    sort: 50
+  milestones:
+  - B26
+  - B32
+- name: gig_dispute_status
+  description: Dispute lifecycle.
+  values:
+  - code: open
+    en: Open
+    sort: 10
+  - code: under_review
+    en: Under review
+    sort: 20
+  - code: resolved_worker
+    en: Resolved for worker
+    sort: 30
+  - code: resolved_requester
+    en: Resolved for requester
+    sort: 40
+  - code: withdrawn
+    en: Withdrawn
+    sort: 50
+  milestones:
+  - B26
+  - B32
+- name: gig_cancellation_reason
+  description: Why an assignment was cancelled.
+  values:
+  - code: schedule_conflict
+    en: Schedule conflict
+    sort: 10
+  - code: requester_changed_plan
+    en: Requester changed plan
+    sort: 20
+  - code: worker_unavailable
+    en: Worker unavailable
+    sort: 30
+  - code: safety
+    en: Safety concern
+    sort: 40
+  - code: price
+    en: Price disagreement
+    sort: 50
+  - code: other
+    en: Other
+    sort: 60
+  milestones:
+  - B26
+  - B32
+- name: gig_report_reason
+  description: Reason a gig worker or request is reported.
+  values:
+  - code: spam
+    en: Spam/fake
+    sort: 10
+  - code: abuse
+    en: Abuse/harassment
+    sort: 20
+  - code: fraud
+    en: Fraud
+    sort: 30
+  - code: off_platform
+    en: Off-platform payment solicitation
+    sort: 40
+  - code: illegal
+    en: Illegal work
+    sort: 50
+  - code: other
+    en: Other
+    sort: 60
+  milestones:
+  - B26
+  - B32
+- name: gig_report_status
+  description: Report moderation status.
+  values:
+  - code: new
+    en: New
+    sort: 10
+  - code: reviewing
+    en: Reviewing
+    sort: 20
+  - code: actioned
+    en: Actioned
+    sort: 30
+  - code: dismissed
+    en: Dismissed
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_earnings_kind
+  description: Kind of earnings figure reported by the external system.
+  values:
+  - code: estimated
+    en: Estimated
+    sort: 10
+  - code: total
+    en: Total
+    sort: 20
+  - code: projected
+    en: Projected
+    sort: 30
+  milestones:
+  - B26
+  - B32
+- name: gig_payout_status
+  description: Status of an external payout.
+  values:
+  - code: pending
+    en: Pending
+    sort: 10
+  - code: paid
+    en: Paid
+    sort: 20
+  - code: failed
+    en: Failed
+    sort: 30
+  - code: reversed
+    en: Reversed
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_payout_channel
+  description: Channel of an external payout (no account data stored).
+  values:
+  - code: bank_transfer
+    en: Bank transfer
+    sort: 10
+  - code: upi
+    en: UPI
+    sort: 20
+  - code: wallet
+    en: Wallet
+    sort: 30
+  - code: cash
+    en: Cash
+    sort: 40
+  milestones:
+  - B26
+  - B32
+- name: gig_fulfilment_event_type
+  description: Inbound event types from the external fulfilment system.
+  values:
+  - code: handoff_accepted
+    en: Handoff accepted
+    sort: 10
+  - code: work_started
+    en: Work started
+    sort: 20
+  - code: check_in
+    en: Check in
+    sort: 30
+  - code: check_out
+    en: Check out
+    sort: 40
+  - code: work_completed
+    en: Work completed
+    sort: 50
+  - code: work_cancelled
+    en: Work cancelled
+    sort: 60
+  - code: earnings_update
+    en: Earnings update
+    sort: 70
+  - code: payout_update
+    en: Payout update
+    sort: 80
+  milestones:
+  - B26
+  - B32
+- name: gig_event_process_status
+  description: Outcome of one processing attempt of an inbound event.
+  values:
+  - code: processed
+    en: Processed
+    sort: 10
+  - code: failed
+    en: Failed
+    sort: 20
+  - code: ignored_duplicate
+    en: Ignored duplicate
+    sort: 30
+  - code: ignored_stale
+    en: Ignored stale
+    sort: 40
+  - code: dead_letter
+    en: Dead letter
+    sort: 50
+  milestones:
+  - B26
+  - B32
+- name: gig_alert_frequency
+  description: Delivery frequency of a gig search alert.
+  values:
+  - code: instant
+    en: Instant
+    sort: 10
+  - code: daily
+    en: Daily
+    sort: 20
+  - code: weekly
+    en: Weekly
+    sort: 30
+  milestones:
+  - B26
+  - B32
+tables:
+- name: gig_worker_profile
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  - B35
+  - B75
+  retention: Soft delete; on erasure request anonymise bio/coordinates/kyc_token in place (DPDP/GDPR); KYC token purged 90 days after account closure; ratings kept anonymised.
+  description: Marketplace profile of a gig worker; separate from candidate_profile (D-15). One per app_user.
+  columns:
+  - name: app_user_id
+    type: UUID
+    domain: identifier
+    desc: Owning user account.
+    sens: Internal
+  - name: headline
+    type: STRING(160)
+    domain: free_text
+    desc: Short profile headline.
+    sens: Public
+  - name: bio
+    type: STRING(2000)
+    domain: free_text
+    desc: Free-text bio.
+    'null': true
+    null_why: NULL = worker has not written a bio.
+    sens: Personal
+    pii: User-authored free text; encrypted at rest; shown to requesters per profile visibility.
+  - name: hourly_rate
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Standard hourly charge rate.
+    'null': true
+    null_why: NULL = worker does not offer hourly pricing.
+    sens: Internal
+  - name: daily_rate
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Standard day charge rate.
+    'null': true
+    null_why: NULL = worker does not offer day pricing.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of hourly_rate/daily_rate.
+    sens: Internal
+  - name: service_radius_km
+    type: INT4
+    domain: quantity
+    desc: Max travel distance for on-site gigs in km.
+    'null': true
+    null_why: NULL = remote-only / no travel limit stated.
+    sens: Internal
+  - name: home_latitude
+    type: DECIMAL(9,6)
+    domain: latitude
+    desc: Home base latitude (service-radius centre).
+    'null': true
+    null_why: NULL = coordinates not provided.
+    sens: Personal
+    pii: Stored full precision, access-controlled; requesters only see rounded (2 dp) values via vw_gig_worker_public.
+  - name: home_longitude
+    type: DECIMAL(9,6)
+    domain: longitude
+    desc: Home base longitude.
+    'null': true
+    null_why: NULL = coordinates not provided.
+    sens: Personal
+    pii: As home_latitude.
+  - name: geo_source_id
+    type: UUID
+    domain: enum_ref
+    desc: Source of the coordinates (gps, geocoded address, manual pin).
+    'null': true
+    null_why: NULL when no coordinates are stored.
+    sens: Internal
+  - name: home_city_id
+    type: UUID
+    domain: identifier
+    desc: City of the home base.
+    'null': true
+    null_why: NULL = not provided.
+    sens: Internal
+  - name: home_country_id
+    type: UUID
+    domain: identifier
+    desc: Country of the home base.
+    sens: Internal
+  - name: time_zone
+    type: STRING(64)
+    domain: time_zone
+    desc: IANA time zone used to interpret recurring availability.
+    sens: Internal
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Platform verification level of the worker.
+    sens: Internal
+  - name: rating_avg
+    type: DECIMAL(3,2)
+    domain: ratio
+    desc: Denormalised average star rating (0..5), maintained with gig_worker_rating_summary.
+    'null': true
+    null_why: NULL = no ratings yet.
+    sens: Internal
+  - name: rating_count
+    type: INT4
+    domain: quantity
+    desc: Number of ratings behind rating_avg.
+    default: '0'
+    sens: Internal
+  - name: completed_gig_count
+    type: INT4
+    domain: quantity
+    desc: Completed assignments (denormalised).
+    default: '0'
+    sens: Internal
+  - name: gig_availability_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Current availability switch.
+    sens: Internal
+  - name: kyc_token
+    type: STRING(128)
+    domain: token
+    desc: Vendor KYC token/reference of the identity check; no document data stored.
+    'null': true
+    null_why: NULL = KYC not started.
+    sens: Sensitive
+    pii: Vendor token only (D-10); resolved at KYC vendor; never logged; column grant limited to compliance role.
+  - name: kyc_verified_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When KYC passed.
+    'null': true
+    null_why: NULL = not verified.
+    sens: Internal
+  - name: is_listed
+    type: BOOL
+    domain: boolean
+    desc: Visible in marketplace search.
+    default: 'true'
+    sens: Internal
+  - name: profile_completeness
+    type: DECIMAL(5,2)
+    domain: percentage
+    desc: Profile completeness percentage.
+    default: '0'
+    sens: Internal
+  - name: last_active_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Last activity (for search ranking).
+    'null': true
+    null_why: NULL = never active after signup.
+    sens: Internal
+  constraints:
+  - name: ck_gig_worker_profile_rates
+    type: check
+    expr: (hourly_rate IS NULL OR hourly_rate >= 0) AND (daily_rate IS NULL OR daily_rate >= 0)
+    desc: Non-negative rates.
+  - name: ck_gig_worker_profile_radius
+    type: check
+    expr: service_radius_km IS NULL OR service_radius_km BETWEEN 0 AND 1000
+    desc: Radius range.
+  - name: ck_gig_worker_profile_latitude
+    type: check
+    expr: home_latitude IS NULL OR home_latitude BETWEEN -90 AND 90
+    desc: Latitude range.
+  - name: ck_gig_worker_profile_longitude
+    type: check
+    expr: home_longitude IS NULL OR home_longitude BETWEEN -180 AND 180
+    desc: Longitude range.
+  - name: ck_gig_worker_profile_geo_pair
+    type: check
+    expr: (home_latitude IS NULL) = (home_longitude IS NULL) AND ((home_latitude IS NULL) OR (geo_source_id IS NOT NULL))
+    desc: Coordinates come as a pair with a stated source.
+  - name: ck_gig_worker_profile_rating_avg
+    type: check
+    expr: rating_avg IS NULL OR rating_avg BETWEEN 0 AND 5
+    desc: Rating range.
+  - name: ck_gig_worker_profile_rating_count
+    type: check
+    expr: rating_count >= 0 AND completed_gig_count >= 0
+    desc: Counters non-negative.
+  - name: ck_gig_worker_profile_completeness
+    type: check
+    expr: profile_completeness BETWEEN 0 AND 100
+    desc: Percentage range.
+  indexes:
+  - name: uq_gig_worker_profile_app_user_id
+    columns:
+    - app_user_id
+    desc: One gig profile per user (live rows).
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_gig_worker_profile_home_country_id_home_city_id_gig_availability_status_id
+    columns:
+    - home_country_id
+    - home_city_id
+    - gig_availability_status_id
+    desc: Marketplace search by location + availability.
+    where: is_listed AND deleted_at IS NULL
+    storing:
+    - hourly_rate
+    - rating_avg
+  - name: idx_gig_worker_profile_rating_avg
+    columns:
+    - rating_avg DESC
+    desc: Top-rated browse.
+    where: is_listed AND deleted_at IS NULL
+  - name: idx_gig_worker_profile_home_latitude_home_longitude
+    columns:
+    - home_latitude
+    - home_longitude
+    desc: Bounding-box pre-filter for radius search (exact distance in app/search service).
+    where: home_latitude IS NOT NULL AND deleted_at IS NULL
+  - name: uq_gig_worker_profile_kyc_token
+    columns:
+    - kyc_token
+    desc: Resolve webhook from KYC vendor.
+    unique: true
+    where: kyc_token IS NOT NULL AND deleted_at IS NULL
+  - name: idx_gig_worker_profile_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  - name: idx_gig_worker_profile_home_city_id
+    columns:
+    - home_city_id
+    desc: Leading index for FK on home_city_id (D-20).
+  - name: idx_gig_worker_profile_geo_source_id
+    columns:
+    - geo_source_id
+    desc: Leading index for FK on geo_source_id (D-20).
+  - name: idx_gig_worker_profile_verification_status_id
+    columns:
+    - verification_status_id
+    desc: Leading index for FK on verification_status_id (D-20).
+  fks:
+  - name: fk_gig_worker_profile_app_user_id
+    columns:
+    - app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Account owns the profile; erasure goes via anonymisation job, not cascade.
+  - name: fk_gig_worker_profile_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Reference currency.
+  - name: fk_gig_worker_profile_home_city_id
+    columns:
+    - home_city_id
+    ref: city
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: City may be retired.
+  - name: fk_gig_worker_profile_home_country_id
+    columns:
+    - home_country_id
+    ref: country
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Reference country.
+  - name: fk_gig_worker_profile_geo_source_id
+    columns:
+    - geo_source_id
+    ref: geo_source
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+  - name: fk_gig_worker_profile_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master lookup.
+  - name: fk_gig_worker_profile_gig_availability_status_id
+    columns:
+    - gig_availability_status_id
+    ref: gig_availability_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_worker_skill
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  retention: Deleted with the worker profile; edited by the worker at will.
+  description: Skills a gig worker offers with proficiency.
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: skill_id
+    type: UUID
+    domain: identifier
+    desc: Skill from master data.
+    sens: Internal
+  - name: proficiency_level_id
+    type: UUID
+    domain: enum_ref
+    desc: Self-declared proficiency.
+    sens: Internal
+  - name: years_experience
+    type: DECIMAL(4,1)
+    domain: measure
+    desc: Years of practical experience.
+    'null': true
+    null_why: NULL = not stated.
+    sens: Internal
+  - name: is_primary
+    type: BOOL
+    domain: boolean
+    desc: Headline skill shown first.
+    default: 'false'
+    sens: Internal
+  - name: endorsement_count
+    type: INT4
+    domain: quantity
+    desc: Requester endorsements (denormalised).
+    default: '0'
+    sens: Internal
+  constraints:
+  - name: uq_gig_worker_skill_gig_worker_profile_id_skill_id
+    type: unique
+    columns:
+    - gig_worker_profile_id
+    - skill_id
+    desc: A skill appears once per worker.
+  - name: ck_gig_worker_skill_years
+    type: check
+    expr: years_experience IS NULL OR years_experience BETWEEN 0 AND 60
+    desc: Range.
+  - name: ck_gig_worker_skill_endorsements
+    type: check
+    expr: endorsement_count >= 0
+    desc: Non-negative.
+  indexes:
+  - name: idx_gig_worker_skill_skill_id_proficiency_level_id
+    columns:
+    - skill_id
+    - proficiency_level_id
+    desc: Find workers by skill.
+    storing:
+    - gig_worker_profile_id
+  - name: uq_gig_worker_skill_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    desc: One primary skill.
+    unique: true
+    where: is_primary
+  - name: idx_gig_worker_skill_proficiency_level_id
+    columns:
+    - proficiency_level_id
+    desc: Leading index for FK on proficiency_level_id (D-20).
+  fks:
+  - name: fk_gig_worker_skill_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Child data follows the profile.
+  - name: fk_gig_worker_skill_skill_id
+    columns:
+    - skill_id
+    ref: skill
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master skill.
+  - name: fk_gig_worker_skill_proficiency_level_id
+    columns:
+    - proficiency_level_id
+    ref: proficiency_level
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+- name: gig_worker_language
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B32
+  retention: Deleted with the worker profile.
+  description: Languages a gig worker can work in.
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: language_id
+    type: UUID
+    domain: identifier
+    desc: Language.
+    sens: Internal
+  - name: proficiency_level_id
+    type: UUID
+    domain: enum_ref
+    desc: Spoken proficiency.
+    sens: Internal
+  constraints:
+  - name: uq_gig_worker_language_gig_worker_profile_id_language_id
+    type: unique
+    columns:
+    - gig_worker_profile_id
+    - language_id
+    desc: One row per language.
+  indexes:
+  - name: idx_gig_worker_language_language_id
+    columns:
+    - language_id
+    desc: Find workers by language.
+  - name: idx_gig_worker_language_proficiency_level_id
+    columns:
+    - proficiency_level_id
+    desc: Leading index for FK on proficiency_level_id (D-20).
+  fks:
+  - name: fk_gig_worker_language_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Child data follows the profile.
+  - name: fk_gig_worker_language_language_id
+    columns:
+    - language_id
+    ref: language
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master language.
+  - name: fk_gig_worker_language_proficiency_level_id
+    columns:
+    - proficiency_level_id
+    ref: proficiency_level
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+- name: gig_worker_certification
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B32
+  - B75
+  retention: Soft delete; hard purge 1 year after profile erasure; scans deleted on erasure.
+  description: Licences/certificates a gig worker holds (trade licence, safety card, etc.).
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: certificate_name
+    type: STRING(200)
+    domain: free_text
+    desc: Name of certificate.
+    sens: Internal
+  - name: issuer_name
+    type: STRING(200)
+    domain: free_text
+    desc: Issuing body.
+    sens: Internal
+  - name: credential_ref
+    type: STRING(128)
+    domain: free_text
+    desc: Credential/licence number as printed.
+    'null': true
+    null_why: NULL = none printed.
+    sens: Personal
+    pii: Identifier of a personal credential; encrypted at rest; shown only after verification to requesters with active assignment.
+  - name: issued_date
+    type: DATE
+    domain: date
+    desc: Issue date.
+    'null': true
+    null_why: NULL = unknown.
+    sens: Internal
+  - name: expiry_date
+    type: DATE
+    domain: date
+    desc: Expiry date.
+    'null': true
+    null_why: NULL = does not expire.
+    sens: Internal
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Verification outcome.
+    sens: Internal
+  - name: document_storage_ref
+    type: STRING(512)
+    domain: free_text
+    desc: Object-store key of the scanned certificate.
+    'null': true
+    null_why: NULL = no scan uploaded.
+    sens: Personal
+    pii: Object store with server-side encryption; signed URLs only.
+  constraints:
+  - name: ck_gig_worker_certification_dates
+    type: check
+    expr: expiry_date IS NULL OR issued_date IS NULL OR expiry_date >= issued_date
+    desc: Expiry not before issue.
+  indexes:
+  - name: idx_gig_worker_certification_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    desc: Profile page.
+    where: deleted_at IS NULL
+  - name: idx_gig_worker_certification_expiry_date
+    columns:
+    - expiry_date
+    desc: Expiry reminder job.
+    where: expiry_date IS NOT NULL AND deleted_at IS NULL
+  - name: idx_gig_worker_certification_verification_status_id
+    columns:
+    - verification_status_id
+    desc: Leading index for FK on verification_status_id (D-20).
+  fks:
+  - name: fk_gig_worker_certification_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Child data follows the profile.
+  - name: fk_gig_worker_certification_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master lookup.
+- name: gig_worker_portfolio_item
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B32
+  retention: Soft delete; media removed 30 days after delete or profile erasure.
+  description: Portfolio samples (images/links) shown on a worker profile.
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: title
+    type: STRING(200)
+    domain: free_text
+    desc: Title.
+    sens: Internal
+  - name: description
+    type: STRING(1000)
+    domain: free_text
+    desc: Description.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  - name: gig_portfolio_media_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Media class.
+    sens: Internal
+  - name: media_url
+    type: STRING(1024)
+    domain: url
+    desc: Object-store or external URL.
+    sens: Internal
+  - name: sort_order
+    type: INT4
+    domain: quantity
+    desc: Display order.
+    default: '0'
+    sens: Internal
+  constraints:
+  - name: ck_gig_worker_portfolio_item_sort_order
+    type: check
+    expr: sort_order >= 0
+    desc: Non-negative.
+  indexes:
+  - name: idx_gig_worker_portfolio_item_gig_worker_profile_id_sort_order
+    columns:
+    - gig_worker_profile_id
+    - sort_order
+    desc: Ordered gallery.
+    where: deleted_at IS NULL
+  fks:
+  - name: fk_gig_worker_portfolio_item_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Child data follows the profile.
+  - name: fk_gig_worker_portfolio_item_gig_portfolio_media_type_id
+    columns:
+    - gig_portfolio_media_type_id
+    ref: gig_portfolio_media_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_worker_project
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B32
+  retention: Soft delete; anonymised on erasure.
+  description: Gig projects on a worker's profile with role, duration, outcome (docket 'profile projects'; candidate_project is owned by profile module).
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: project_title
+    type: STRING(200)
+    domain: free_text
+    desc: Project title.
+    sens: Internal
+  - name: role_title
+    type: STRING(150)
+    domain: free_text
+    desc: Role played.
+    sens: Internal
+  - name: client_name
+    type: STRING(200)
+    domain: free_text
+    desc: Client or context.
+    'null': true
+    null_why: NULL = confidential/not stated.
+    sens: Internal
+  - name: project_start_date
+    type: DATE
+    domain: date
+    desc: Start date.
+    sens: Internal
+  - name: project_end_date
+    type: DATE
+    domain: date
+    desc: End date.
+    'null': true
+    null_why: NULL = ongoing.
+    sens: Internal
+  - name: outcome
+    type: STRING(2000)
+    domain: free_text
+    desc: Result/outcome summary.
+    'null': true
+    null_why: NULL = not described.
+    sens: Internal
+  - name: team_size
+    type: INT4
+    domain: quantity
+    desc: People on the project.
+    'null': true
+    null_why: NULL = unknown.
+    sens: Internal
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Platform assignment this project came from (verified).
+    'null': true
+    null_why: NULL = self-declared/off-platform project.
+    sens: Internal
+  - name: project_url
+    type: STRING(1024)
+    domain: url
+    desc: Public link.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  constraints:
+  - name: ck_gig_worker_project_dates
+    type: check
+    expr: project_end_date IS NULL OR project_end_date >= project_start_date
+    desc: End not before start.
+  - name: ck_gig_worker_project_team_size
+    type: check
+    expr: team_size IS NULL OR team_size > 0
+    desc: Positive.
+  indexes:
+  - name: idx_gig_worker_project_gig_worker_profile_id_project_start_date
+    columns:
+    - gig_worker_profile_id
+    - project_start_date DESC
+    desc: Profile timeline.
+    where: deleted_at IS NULL
+  - name: uq_gig_worker_project_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    desc: Link from assignment.
+    unique: true
+    where: gig_assignment_id IS NOT NULL AND deleted_at IS NULL
+  fks:
+  - name: fk_gig_worker_project_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Child data follows the profile.
+  - name: fk_gig_worker_project_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    ref: gig_assignment
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: Keep project if assignment row is purged.
+- name: gig_service_offering
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  retention: Soft delete; purged with profile erasure.
+  description: A service the worker sells (TaskRabbit/Urban Company 'service', Fiverr 'gig').
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Seller.
+    sens: Internal
+  - name: title
+    type: STRING(200)
+    domain: free_text
+    desc: Offering title.
+    sens: Public
+  - name: description
+    type: STRING(3000)
+    domain: free_text
+    desc: Description.
+    'null': true
+    null_why: NULL = title only.
+    sens: Internal
+  - name: job_category_id
+    type: UUID
+    domain: identifier
+    desc: Shared job category (D-15).
+    sens: Internal
+  - name: gig_work_mode_id
+    type: UUID
+    domain: enum_ref
+    desc: Delivery mode.
+    sens: Internal
+  - name: starting_price
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Lowest package price (denormalised for sorting).
+    'null': true
+    null_why: NULL = no package priced yet.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of prices.
+    sens: Internal
+  - name: delivery_days
+    type: INT4
+    domain: quantity
+    desc: Typical delivery time in days.
+    'null': true
+    null_why: NULL = not applicable (time-based service).
+    sens: Internal
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    desc: Visible and bookable.
+    default: 'true'
+    sens: Internal
+  constraints:
+  - name: ck_gig_service_offering_price
+    type: check
+    expr: starting_price IS NULL OR starting_price >= 0
+    desc: Non-negative.
+  - name: ck_gig_service_offering_delivery
+    type: check
+    expr: delivery_days IS NULL OR delivery_days > 0
+    desc: Positive.
+  indexes:
+  - name: idx_gig_service_offering_job_category_id_gig_work_mode_id
+    columns:
+    - job_category_id
+    - gig_work_mode_id
+    desc: Category browse.
+    where: is_active AND deleted_at IS NULL
+    storing:
+    - starting_price
+  - name: idx_gig_service_offering_title
+    columns:
+    - title
+    desc: Trigram (gin_trgm_ops) search on title (D-16).
+    where: deleted_at IS NULL
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_gig_service_offering_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    desc: Seller page.
+    where: deleted_at IS NULL
+  - name: idx_gig_service_offering_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  fks:
+  - name: fk_gig_service_offering_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Offerings belong to the profile.
+  - name: fk_gig_service_offering_job_category_id
+    columns:
+    - job_category_id
+    ref: job_category
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master category.
+  - name: fk_gig_service_offering_gig_work_mode_id
+    columns:
+    - gig_work_mode_id
+    ref: gig_work_mode
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_service_offering_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Reference currency.
+- name: gig_service_package
+  kind: config
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B32
+  retention: Deleted with offering; price history not kept (assignment stores agreed price).
+  description: Rate-card package (basic/standard/premium) of an offering.
+  columns:
+  - name: gig_service_offering_id
+    type: UUID
+    domain: identifier
+    desc: Offering.
+    sens: Internal
+  - name: gig_package_tier_id
+    type: UUID
+    domain: enum_ref
+    desc: Tier.
+    sens: Internal
+  - name: package_name
+    type: STRING(100)
+    domain: free_text
+    desc: Package name.
+    sens: Internal
+  - name: description
+    type: STRING(1000)
+    domain: free_text
+    desc: What is included.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  - name: price
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Package price.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency.
+    sens: Internal
+  - name: gig_rate_unit_id
+    type: UUID
+    domain: enum_ref
+    desc: Unit the price applies to.
+    sens: Internal
+  - name: delivery_days
+    type: INT4
+    domain: quantity
+    desc: Delivery days.
+    'null': true
+    null_why: NULL = n/a.
+    sens: Internal
+  - name: revisions_included
+    type: INT2
+    domain: quantity
+    desc: Included revisions.
+    default: '0'
+    sens: Internal
+  constraints:
+  - name: uq_gig_service_package_gig_service_offering_id_gig_package_tier_id
+    type: unique
+    columns:
+    - gig_service_offering_id
+    - gig_package_tier_id
+    desc: One package per tier per offering.
+  - name: ck_gig_service_package_price
+    type: check
+    expr: price >= 0
+    desc: Non-negative.
+  - name: ck_gig_service_package_revisions
+    type: check
+    expr: revisions_included >= 0
+    desc: Non-negative.
+  indexes:
+  - name: idx_gig_service_package_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  fks:
+  - name: fk_gig_service_package_gig_service_offering_id
+    columns:
+    - gig_service_offering_id
+    ref: gig_service_offering
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Rate card follows offering.
+  - name: fk_gig_service_package_gig_package_tier_id
+    columns:
+    - gig_package_tier_id
+    ref: gig_package_tier
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_service_package_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Reference.
+  - name: fk_gig_service_package_gig_rate_unit_id
+    columns:
+    - gig_rate_unit_id
+    ref: gig_rate_unit
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_service_offering_skill
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  retention: Deleted with offering.
+  description: Skills an offering requires/uses.
+  columns:
+  - name: gig_service_offering_id
+    type: UUID
+    domain: identifier
+    desc: Offering.
+    sens: Internal
+  - name: skill_id
+    type: UUID
+    domain: identifier
+    desc: Skill.
+    sens: Internal
+  constraints:
+  - name: uq_gig_service_offering_skill_gig_service_offering_id_skill_id
+    type: unique
+    columns:
+    - gig_service_offering_id
+    - skill_id
+    desc: No duplicates.
+  indexes:
+  - name: idx_gig_service_offering_skill_skill_id
+    columns:
+    - skill_id
+    desc: Find offerings by skill.
+  fks:
+  - name: fk_gig_service_offering_skill_gig_service_offering_id
+    columns:
+    - gig_service_offering_id
+    ref: gig_service_offering
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows offering.
+  - name: fk_gig_service_offering_skill_skill_id
+    columns:
+    - skill_id
+    ref: skill
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master skill.
+- name: gig_availability_rule
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B35
+  retention: Soft delete; superseded rules kept 1 year by effective_to_date, then purged.
+  description: Recurring weekly availability of a worker (local time).
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: gig_weekday_id
+    type: UUID
+    domain: enum_ref
+    desc: Day of week.
+    sens: Internal
+  - name: local_start_time
+    type: TIME
+    domain: time_of_day
+    desc: Start in worker's time zone.
+    sens: Internal
+  - name: local_end_time
+    type: TIME
+    domain: time_of_day
+    desc: End in worker's time zone.
+    sens: Internal
+  - name: effective_from_date
+    type: DATE
+    domain: date
+    desc: First date the rule applies.
+    sens: Internal
+  - name: effective_to_date
+    type: DATE
+    domain: date
+    desc: Last date the rule applies.
+    'null': true
+    null_why: NULL = open-ended.
+    sens: Internal
+  constraints:
+  - name: ck_gig_availability_rule_times
+    type: check
+    expr: local_end_time > local_start_time
+    desc: End after start within the day.
+  - name: ck_gig_availability_rule_dates
+    type: check
+    expr: effective_to_date IS NULL OR effective_to_date >= effective_from_date
+    desc: End not before start.
+  indexes:
+  - name: uq_gig_availability_rule_gig_worker_profile_id_gig_weekday_id_local_start_time
+    columns:
+    - gig_worker_profile_id
+    - gig_weekday_id
+    - local_start_time
+    desc: Same-day windows must differ in start (exact non-overlap by TXN check).
+    unique: true
+    where: effective_to_date IS NULL AND deleted_at IS NULL
+  fks:
+  - name: fk_gig_availability_rule_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows profile.
+  - name: fk_gig_availability_rule_gig_weekday_id
+    columns:
+    - gig_weekday_id
+    ref: gig_weekday
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_availability_window
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B35
+  retention: Soft delete; purged 90 days after window_end_at.
+  description: One-off extra availability window (beyond recurring rules).
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: window_start_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Start (15-min grid).
+    sens: Internal
+  - name: window_end_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: End (15-min grid).
+    sens: Internal
+  - name: note
+    type: STRING(300)
+    domain: free_text
+    desc: Worker note.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  constraints:
+  - name: ck_gig_availability_window_range
+    type: check
+    expr: window_end_at > window_start_at
+    desc: End after start.
+  - name: ck_gig_availability_window_grid
+    type: check
+    expr: (extract(epoch FROM window_start_at)::INT8 % 900) = 0 AND (extract(epoch FROM window_end_at)::INT8 % 900) = 0
+    desc: 15-minute grid.
+  - name: ck_gig_availability_window_max_length
+    type: check
+    expr: window_end_at - window_start_at <= INTERVAL '31 days'
+    desc: Max 31 days.
+  indexes:
+  - name: idx_gig_availability_window_gig_worker_profile_id_window_start_at
+    columns:
+    - gig_worker_profile_id
+    - window_start_at
+    desc: Availability lookups.
+    where: deleted_at IS NULL
+  fks:
+  - name: fk_gig_availability_window_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows profile.
+- name: gig_time_off
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B35
+  retention: Soft delete; slots removed on delete; purged 180 days after end.
+  description: Blocked period of a worker; materialised into gig_slot rows so assignments cannot overlap it.
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: gig_time_off_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Class.
+    sens: Internal
+  - name: time_off_start_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Start (15-min grid).
+    sens: Internal
+  - name: time_off_end_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: End (15-min grid).
+    sens: Internal
+  - name: reason
+    type: STRING(300)
+    domain: free_text
+    desc: Free-text reason.
+    'null': true
+    null_why: NULL = not given.
+    sens: Personal
+    pii: May reveal health/personal info; visible to worker and admins only.
+  constraints:
+  - name: uq_gig_time_off_id_gig_worker_profile_id
+    type: unique
+    columns:
+    - id
+    - gig_worker_profile_id
+    desc: Composite FK target from gig_slot.
+  - name: ck_gig_time_off_range
+    type: check
+    expr: time_off_end_at > time_off_start_at
+    desc: End after start.
+  - name: ck_gig_time_off_grid
+    type: check
+    expr: (extract(epoch FROM time_off_start_at)::INT8 % 900) = 0 AND (extract(epoch FROM time_off_end_at)::INT8 % 900) = 0
+    desc: 15-minute grid.
+  - name: ck_gig_time_off_max_length
+    type: check
+    expr: time_off_end_at - time_off_start_at <= INTERVAL '31 days'
+    desc: Max 31 days per row; longer leave = chained rows.
+  indexes:
+  - name: idx_gig_time_off_gig_worker_profile_id_time_off_start_at
+    columns:
+    - gig_worker_profile_id
+    - time_off_start_at
+    desc: Calendar view.
+    where: deleted_at IS NULL
+  fks:
+  - name: fk_gig_time_off_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows profile.
+  - name: fk_gig_time_off_gig_time_off_type_id
+    columns:
+    - gig_time_off_type_id
+    ref: gig_time_off_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_request
+  kind: entity
+  delete_policy: soft
+  volume: high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  - B35
+  retention: Soft delete; closed requests kept 3 years for dispute/tax; coordinates nulled 1 year after completion; erasure anonymises requester text.
+  description: A requester's short-duration gig with window and price (fixed or rate based).
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Requesting organisation (tenant, D-11).
+    sens: Internal
+  - name: requester_app_user_id
+    type: UUID
+    domain: identifier
+    desc: User who posted.
+    sens: Internal
+  - name: title
+    type: STRING(200)
+    domain: free_text
+    desc: Title.
+    sens: Public
+  - name: description
+    type: STRING(4000)
+    domain: free_text
+    desc: Description.
+    sens: Internal
+  - name: job_category_id
+    type: UUID
+    domain: identifier
+    desc: Shared job category.
+    sens: Internal
+  - name: gig_work_mode_id
+    type: UUID
+    domain: enum_ref
+    desc: Work mode.
+    sens: Internal
+  - name: gig_experience_level_id
+    type: UUID
+    domain: enum_ref
+    desc: Wanted level.
+    'null': true
+    null_why: NULL = any level.
+    sens: Internal
+  - name: city_id
+    type: UUID
+    domain: identifier
+    desc: Location city.
+    'null': true
+    null_why: NULL = remote/anywhere.
+    sens: Internal
+  - name: country_id
+    type: UUID
+    domain: identifier
+    desc: Country.
+    sens: Internal
+  - name: latitude
+    type: DECIMAL(9,6)
+    domain: latitude
+    desc: Site latitude.
+    'null': true
+    null_why: NULL = remote or undisclosed.
+    sens: Personal
+    pii: Site may be a residence; exact point shown only to accepted workers; others see 2 dp.
+  - name: longitude
+    type: DECIMAL(9,6)
+    domain: longitude
+    desc: Site longitude.
+    'null': true
+    null_why: NULL = remote or undisclosed.
+    sens: Personal
+    pii: As latitude.
+  - name: geo_source_id
+    type: UUID
+    domain: enum_ref
+    desc: Coordinate source.
+    'null': true
+    null_why: NULL when no coordinates.
+    sens: Internal
+  - name: window_start_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Work window start (15-min grid).
+    sens: Internal
+  - name: window_end_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Work window end (15-min grid).
+    sens: Internal
+  - name: gig_price_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Pricing model.
+    sens: Internal
+  - name: is_rate_based
+    type: BOOL
+    domain: boolean
+    desc: Mirror of price type flag (composite FK).
+    default: 'false'
+    sens: Internal
+  - name: fixed_price
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Fixed price.
+    'null': true
+    null_why: NULL when rate based.
+    sens: Internal
+  - name: rate_amount
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Rate per unit.
+    'null': true
+    null_why: NULL when fixed price.
+    sens: Internal
+  - name: gig_rate_unit_id
+    type: UUID
+    domain: enum_ref
+    desc: Rate unit.
+    'null': true
+    null_why: NULL when fixed price.
+    sens: Internal
+  - name: budget_max
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Requester budget ceiling.
+    'null': true
+    null_why: NULL = no stated ceiling.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of all money columns.
+    sens: Internal
+  - name: gig_request_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Lifecycle status.
+    sens: Internal
+  - name: headcount
+    type: INT2
+    domain: quantity
+    desc: Workers needed.
+    default: '1'
+    sens: Internal
+  - name: accepted_count
+    type: INT2
+    domain: quantity
+    desc: Accepted applications so far (maintained under row lock).
+    default: '0'
+    sens: Internal
+  - name: gig_request_visibility_id
+    type: UUID
+    domain: enum_ref
+    desc: Visibility.
+    sens: Internal
+  - name: application_deadline_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Applications close.
+    'null': true
+    null_why: NULL = until filled.
+    sens: Internal
+  - name: published_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When opened.
+    'null': true
+    null_why: NULL = never published.
+    sens: Internal
+  constraints:
+  - name: uq_gig_request_id_organisation_id
+    type: unique
+    columns:
+    - id
+    - organisation_id
+    desc: Composite FK target proving tenant.
+  - name: uq_gig_request_id_currency_id
+    type: unique
+    columns:
+    - id
+    - currency_id
+    desc: Composite FK target pinning assignment currency to request currency.
+  - name: ck_gig_request_window
+    type: check
+    expr: window_end_at > window_start_at
+    desc: End after start.
+  - name: ck_gig_request_grid
+    type: check
+    expr: (extract(epoch FROM window_start_at)::INT8 % 900) = 0 AND (extract(epoch FROM window_end_at)::INT8 % 900) = 0
+    desc: 15-min grid.
+  - name: ck_gig_request_max_length
+    type: check
+    expr: window_end_at - window_start_at <= INTERVAL '31 days'
+    desc: 'Short-duration gigs: max 31 days (<= 2976 slots).'
+  - name: ck_gig_request_price_shape
+    type: check
+    expr: (is_rate_based AND rate_amount IS NOT NULL AND gig_rate_unit_id IS NOT NULL AND fixed_price IS NULL) OR (NOT is_rate_based AND fixed_price IS NOT NULL AND rate_amount IS NULL AND gig_rate_unit_id
+      IS NULL)
+    desc: Money/rate fields consistent with price type.
+  - name: ck_gig_request_money_range
+    type: check
+    expr: (fixed_price IS NULL OR fixed_price > 0) AND (rate_amount IS NULL OR rate_amount > 0) AND (budget_max IS NULL OR budget_max > 0)
+    desc: Positive amounts.
+  - name: ck_gig_request_headcount
+    type: check
+    expr: headcount BETWEEN 1 AND 500 AND accepted_count BETWEEN 0 AND headcount
+    desc: Accepted never exceeds headcount.
+  - name: ck_gig_request_latitude
+    type: check
+    expr: latitude IS NULL OR latitude BETWEEN -90 AND 90
+    desc: Range.
+  - name: ck_gig_request_longitude
+    type: check
+    expr: longitude IS NULL OR longitude BETWEEN -180 AND 180
+    desc: Range.
+  - name: ck_gig_request_geo_pair
+    type: check
+    expr: (latitude IS NULL) = (longitude IS NULL) AND (latitude IS NULL OR geo_source_id IS NOT NULL)
+    desc: Pair with source.
+  - name: ck_gig_request_deadline
+    type: check
+    expr: application_deadline_at IS NULL OR application_deadline_at <= window_end_at
+    desc: Deadline within window.
+  indexes:
+  - name: idx_gig_request_gig_request_status_id_window_start_at
+    columns:
+    - gig_request_status_id
+    - window_start_at
+    desc: Open requests by start.
+    where: deleted_at IS NULL
+    storing:
+    - job_category_id
+    - city_id
+  - name: idx_gig_request_job_category_id_country_id_city_id_window_start_at
+    columns:
+    - job_category_id
+    - country_id
+    - city_id
+    - window_start_at
+    desc: Category + location search.
+    where: deleted_at IS NULL
+  - name: idx_gig_request_organisation_id_gig_request_status_id
+    columns:
+    - organisation_id
+    - gig_request_status_id
+    desc: Requester dashboard.
+    where: deleted_at IS NULL
+  - name: idx_gig_request_title
+    columns:
+    - title
+    desc: Trigram search (gin_trgm_ops) D-16.
+    where: deleted_at IS NULL
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_gig_request_requester_app_user_id
+    columns:
+    - requester_app_user_id
+    desc: Leading index for FK on requester_app_user_id (D-20).
+  - name: idx_gig_request_city_id
+    columns:
+    - city_id
+    desc: Leading index for FK on city_id (D-20).
+  - name: idx_gig_request_country_id
+    columns:
+    - country_id
+    desc: Leading index for FK on country_id (D-20).
+  - name: idx_gig_request_geo_source_id
+    columns:
+    - geo_source_id
+    desc: Leading index for FK on geo_source_id (D-20).
+  - name: idx_gig_request_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  fks:
+  - name: fk_gig_request_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Tenant owns request history.
+  - name: fk_gig_request_requester_app_user_id
+    columns:
+    - requester_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Poster.
+  - name: fk_gig_request_job_category_id
+    columns:
+    - job_category_id
+    ref: job_category
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+  - name: fk_gig_request_gig_work_mode_id
+    columns:
+    - gig_work_mode_id
+    ref: gig_work_mode
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_request_gig_experience_level_id
+    columns:
+    - gig_experience_level_id
+    ref: gig_experience_level
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_request_city_id
+    columns:
+    - city_id
+    ref: city
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: City retired.
+  - name: fk_gig_request_country_id
+    columns:
+    - country_id
+    ref: country
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+  - name: fk_gig_request_geo_source_id
+    columns:
+    - geo_source_id
+    ref: geo_source
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+  - name: fk_gig_request_price_type_flag
+    columns:
+    - gig_price_type_id
+    - is_rate_based
+    ref: gig_price_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Price type and flag must agree.
+    ref_columns:
+    - id
+    - is_rate_based
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_request_gig_rate_unit_id
+    columns:
+    - gig_rate_unit_id
+    ref: gig_rate_unit
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_request_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+  - name: fk_gig_request_gig_request_status_id
+    columns:
+    - gig_request_status_id
+    ref: gig_request_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+  - name: fk_gig_request_gig_request_visibility_id
+    columns:
+    - gig_request_visibility_id
+    ref: gig_request_visibility
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  no_hash_why: Insert rate far below ingest-scale (requests posted by humans); status+window index is not append-sequential.
+- name: gig_request_skill
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  retention: Deleted with request.
+  description: Skills a gig request needs.
+  columns:
+  - name: gig_request_id
+    type: UUID
+    domain: identifier
+    desc: Request.
+    sens: Internal
+  - name: skill_id
+    type: UUID
+    domain: identifier
+    desc: Skill.
+    sens: Internal
+  - name: is_required
+    type: BOOL
+    domain: boolean
+    desc: Must-have vs nice-to-have.
+    default: 'true'
+    sens: Internal
+  - name: proficiency_level_id
+    type: UUID
+    domain: enum_ref
+    desc: Minimum proficiency.
+    'null': true
+    null_why: NULL = any.
+    sens: Internal
+  constraints:
+  - name: uq_gig_request_skill_gig_request_id_skill_id
+    type: unique
+    columns:
+    - gig_request_id
+    - skill_id
+    desc: One row per skill.
+  indexes:
+  - name: idx_gig_request_skill_skill_id
+    columns:
+    - skill_id
+    desc: Match requests to worker skills.
+  - name: idx_gig_request_skill_proficiency_level_id
+    columns:
+    - proficiency_level_id
+    desc: Leading index for FK on proficiency_level_id (D-20).
+  fks:
+  - name: fk_gig_request_skill_gig_request_id
+    columns:
+    - gig_request_id
+    ref: gig_request
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows request.
+  - name: fk_gig_request_skill_skill_id
+    columns:
+    - skill_id
+    ref: skill
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master skill.
+  - name: fk_gig_request_skill_proficiency_level_id
+    columns:
+    - proficiency_level_id
+    ref: proficiency_level
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+- name: gig_request_attachment
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B32
+  - B75
+  retention: Soft delete; object removed 90 days after request purge.
+  description: Files attached to a request (briefs, photos).
+  columns:
+  - name: gig_request_id
+    type: UUID
+    domain: identifier
+    desc: Request.
+    sens: Internal
+  - name: gig_attachment_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Kind.
+    sens: Internal
+  - name: file_name
+    type: STRING(255)
+    domain: free_text
+    desc: Original file name.
+    sens: Personal
+    pii: File names can contain names; access-controlled.
+  - name: storage_ref
+    type: STRING(512)
+    domain: free_text
+    desc: Object-store key.
+    sens: Internal
+  - name: mime_type
+    type: STRING(100)
+    domain: free_text
+    desc: MIME type.
+    sens: Internal
+  - name: size_bytes
+    type: INT8
+    domain: quantity
+    desc: Size in bytes.
+    sens: Internal
+  - name: checksum_sha256
+    type: STRING(64)
+    domain: code
+    desc: Content hash for integrity/dedup.
+    sens: Internal
+  constraints:
+  - name: ck_gig_request_attachment_size
+    type: check
+    expr: size_bytes BETWEEN 1 AND 52428800
+    desc: Max 50 MB.
+  indexes:
+  - name: idx_gig_request_attachment_gig_request_id
+    columns:
+    - gig_request_id
+    desc: List attachments.
+    where: deleted_at IS NULL
+  fks:
+  - name: fk_gig_request_attachment_gig_request_id
+    columns:
+    - gig_request_id
+    ref: gig_request
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows request.
+  - name: fk_gig_request_attachment_gig_attachment_type_id
+    columns:
+    - gig_attachment_type_id
+    ref: gig_attachment_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_request_milestone
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B32
+  retention: Soft delete; kept with request.
+  description: Milestone/deliverable of a fixed-price request (Upwork/Freelancer style).
+  columns:
+  - name: gig_request_id
+    type: UUID
+    domain: identifier
+    desc: Request.
+    sens: Internal
+  - name: sequence_no
+    type: INT2
+    domain: quantity
+    desc: Order.
+    sens: Internal
+  - name: title
+    type: STRING(200)
+    domain: free_text
+    desc: Milestone title.
+    sens: Internal
+  - name: deliverable_description
+    type: STRING(1000)
+    domain: free_text
+    desc: Expected deliverable.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  - name: due_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Due time.
+    'null': true
+    null_why: NULL = no date.
+    sens: Internal
+  - name: amount
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Amount released on approval.
+    'null': true
+    null_why: NULL = unpriced (rate-based request).
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency (same as request).
+    sens: Internal
+  - name: gig_milestone_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Progress.
+    sens: Internal
+  constraints:
+  - name: uq_gig_request_milestone_gig_request_id_sequence_no
+    type: unique
+    columns:
+    - gig_request_id
+    - sequence_no
+    desc: Ordered per request.
+  - name: ck_gig_request_milestone_amount
+    type: check
+    expr: amount IS NULL OR amount > 0
+    desc: Positive.
+  - name: ck_gig_request_milestone_seq
+    type: check
+    expr: sequence_no > 0
+    desc: Positive.
+  indexes:
+  - name: idx_gig_request_milestone_gig_milestone_status_id_due_at
+    columns:
+    - gig_milestone_status_id
+    - due_at
+    desc: Due soon.
+    where: deleted_at IS NULL
+  - name: idx_gig_request_milestone_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  fks:
+  - name: fk_gig_request_milestone_gig_request_id
+    columns:
+    - gig_request_id
+    ref: gig_request
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows request.
+  - name: fk_gig_request_milestone_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+  - name: fk_gig_request_milestone_gig_milestone_status_id
+    columns:
+    - gig_milestone_status_id
+    ref: gig_milestone_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+- name: gig_request_status_history
+  kind: event
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  retention: Kept 3 years after request closure, then archived.
+  description: Append-only status transitions of a request.
+  columns:
+  - name: gig_request_id
+    type: UUID
+    domain: identifier
+    desc: Request.
+    sens: Internal
+  - name: from_gig_request_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Previous status.
+    'null': true
+    null_why: NULL = first status (creation).
+    sens: Internal
+  - name: to_gig_request_status_id
+    type: UUID
+    domain: enum_ref
+    desc: New status.
+    sens: Internal
+  - name: changed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Transition time.
+    default: now()
+    sens: Internal
+  - name: gig_actor_party_id
+    type: UUID
+    domain: enum_ref
+    desc: Actor class.
+    sens: Internal
+  - name: reason
+    type: STRING(300)
+    domain: free_text
+    desc: Reason.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  constraints: []
+  indexes:
+  - name: idx_gig_request_status_history_gig_request_id_changed_at
+    columns:
+    - gig_request_id
+    - changed_at DESC
+    desc: Timeline.
+  - name: idx_gig_request_status_history_changed_at
+    columns:
+    - changed_at
+    desc: Time-ordered scan (hash-sharded).
+    hash: true
+    bucket_count: 16
+  fks:
+  - name: fk_gig_request_status_history_gig_request_id
+    columns:
+    - gig_request_id
+    ref: gig_request
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: History outlives soft-deleted request.
+  - name: fk_gig_request_status_history_from_gig_request_status_id
+    columns:
+    - from_gig_request_status_id
+    ref: gig_request_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_request_status_history_to_gig_request_status_id
+    columns:
+    - to_gig_request_status_id
+    ref: gig_request_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_request_status_history_gig_actor_party_id
+    columns:
+    - gig_actor_party_id
+    ref: gig_actor_party
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_application
+  kind: entity
+  delete_policy: soft
+  volume: high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  - B35
+  retention: Soft delete; kept 3 years after request closure; cover_note anonymised on erasure.
+  description: 'Worker''s application to a request. One direction: requester accepts or rejects; no counter-offer.'
+  columns:
+  - name: gig_request_id
+    type: UUID
+    domain: identifier
+    desc: Request.
+    sens: Internal
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Applicant.
+    sens: Internal
+  - name: gig_application_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Status.
+    sens: Internal
+  - name: is_accepted
+    type: BOOL
+    domain: boolean
+    desc: Mirror of status flag (composite FK).
+    default: 'false'
+    sens: Internal
+  - name: cover_note
+    type: STRING(2000)
+    domain: free_text
+    desc: Cover note.
+    'null': true
+    null_why: NULL = none.
+    sens: Personal
+    pii: User free text; encrypted at rest; not shown to other applicants.
+  - name: proposed_amount
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Worker's offered price/rate (take-it-or-leave-it).
+    'null': true
+    null_why: NULL = accepts listed price.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of proposed_amount.
+    sens: Internal
+  - name: applied_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Submit time.
+    default: now()
+    sens: Internal
+  - name: decided_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Accept/reject time.
+    'null': true
+    null_why: NULL = undecided.
+    sens: Internal
+  - name: decided_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Requester-side decider.
+    'null': true
+    null_why: NULL = undecided/system expiry.
+    sens: Internal
+  - name: decision_note
+    type: STRING(500)
+    domain: free_text
+    desc: Note to worker.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  - name: withdrawn_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Worker withdrawal time.
+    'null': true
+    null_why: NULL = not withdrawn.
+    sens: Internal
+  constraints:
+  - name: uq_gig_application_gig_worker_profile_id_gig_request_id
+    type: unique
+    columns:
+    - gig_worker_profile_id
+    - gig_request_id
+    desc: One application per worker per request.
+  - name: uq_gig_application_assignment_target
+    type: unique
+    columns:
+    - id
+    - gig_request_id
+    - gig_worker_profile_id
+    - is_accepted
+    desc: Composite FK target for assignment.
+  - name: ck_gig_application_amount
+    type: check
+    expr: proposed_amount IS NULL OR proposed_amount > 0
+    desc: Positive.
+  - name: ck_gig_application_decision
+    type: check
+    expr: (NOT is_accepted) OR (decided_at IS NOT NULL AND decided_by_app_user_id IS NOT NULL)
+    desc: Accepted implies decided by a user.
+  indexes:
+  - name: idx_gig_application_gig_request_id_gig_application_status_id_applied_at
+    columns:
+    - gig_request_id
+    - gig_application_status_id
+    - applied_at
+    desc: Requester review queue.
+  - name: idx_gig_application_gig_worker_profile_id_applied_at
+    columns:
+    - gig_worker_profile_id
+    - applied_at DESC
+    desc: Worker's applications.
+  - name: idx_gig_application_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  - name: idx_gig_application_decided_by_app_user_id
+    columns:
+    - decided_by_app_user_id
+    desc: Leading index for FK on decided_by_app_user_id (D-20).
+  fks:
+  - name: fk_gig_application_gig_request_id
+    columns:
+    - gig_request_id
+    ref: gig_request
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Applications are history.
+  - name: fk_gig_application_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Applications are history.
+  - name: fk_gig_application_status_flag
+    columns:
+    - gig_application_status_id
+    - is_accepted
+    ref: gig_application_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Status and flag agree.
+    ref_columns:
+    - id
+    - is_accepted
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_application_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+  - name: fk_gig_application_decided_by_app_user_id
+    columns:
+    - decided_by_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Decider.
+  no_hash_why: Human-paced writes; indexes lead with request/worker UUID so no sequential hotspot.
+- name: gig_invite
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  retention: Soft delete; purged 1 year after expiry.
+  description: Requester invites a worker to a request.
+  columns:
+  - name: gig_request_id
+    type: UUID
+    domain: identifier
+    desc: Request.
+    sens: Internal
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Invited worker.
+    sens: Internal
+  - name: invited_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Inviter.
+    sens: Internal
+  - name: gig_invite_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Status.
+    sens: Internal
+  - name: message
+    type: STRING(1000)
+    domain: free_text
+    desc: Invite message.
+    'null': true
+    null_why: NULL = default text.
+    sens: Personal
+    pii: Free text; encrypted at rest.
+  - name: expires_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Expiry.
+    sens: Internal
+  - name: responded_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Response time.
+    'null': true
+    null_why: NULL = no response yet.
+    sens: Internal
+  - name: gig_application_id
+    type: UUID
+    domain: identifier
+    desc: Application created from invite.
+    'null': true
+    null_why: NULL = not (yet) applied.
+    sens: Internal
+  constraints: []
+  indexes:
+  - name: uq_gig_invite_gig_request_id_gig_worker_profile_id
+    columns:
+    - gig_request_id
+    - gig_worker_profile_id
+    desc: One live invite per worker/request.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_gig_invite_gig_worker_profile_id_gig_invite_status_id
+    columns:
+    - gig_worker_profile_id
+    - gig_invite_status_id
+    desc: Worker inbox.
+    where: deleted_at IS NULL
+  - name: uq_gig_invite_gig_application_id
+    columns:
+    - gig_application_id
+    desc: Reverse lookup.
+    unique: true
+    where: gig_application_id IS NOT NULL AND deleted_at IS NULL
+  - name: idx_gig_invite_invited_by_app_user_id
+    columns:
+    - invited_by_app_user_id
+    desc: Leading index for FK on invited_by_app_user_id (D-20).
+  fks:
+  - name: fk_gig_invite_gig_request_id
+    columns:
+    - gig_request_id
+    ref: gig_request
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Invite follows request.
+  - name: fk_gig_invite_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Worker.
+  - name: fk_gig_invite_invited_by_app_user_id
+    columns:
+    - invited_by_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Inviter.
+  - name: fk_gig_invite_gig_invite_status_id
+    columns:
+    - gig_invite_status_id
+    ref: gig_invite_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_invite_gig_application_id
+    columns:
+    - gig_application_id
+    ref: gig_application
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: Keep invite if application purged.
+- name: gig_assignment
+  kind: entity
+  delete_policy: soft
+  volume: high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  - B35
+  - B75
+  retention: Soft delete; kept 7 years (financial/dispute evidence), earnings figures are external copies.
+  description: 'Accepted work. Fulfilment is external: stores handoff_ref + idempotency key, reconciled status and external earnings.'
+  columns:
+  - name: gig_application_id
+    type: UUID
+    domain: identifier
+    desc: Accepted application.
+    sens: Internal
+  - name: gig_request_id
+    type: UUID
+    domain: identifier
+    desc: Request (denormalised, pinned by composite FK).
+    sens: Internal
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker (pinned).
+    sens: Internal
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Tenant (pinned to request).
+    sens: Internal
+  - name: application_is_accepted
+    type: BOOL
+    domain: boolean
+    desc: Always true; pins application to accepted state.
+    default: 'true'
+    sens: Internal
+  - name: gig_assignment_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Platform status.
+    sens: Internal
+  - name: is_completed
+    type: BOOL
+    domain: boolean
+    desc: Mirror of status flag (composite FK).
+    default: 'false'
+    sens: Internal
+  - name: window_start_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Assigned window start (15-min grid).
+    sens: Internal
+  - name: window_end_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Assigned window end (15-min grid).
+    sens: Internal
+  - name: expected_slot_count
+    type: INT4
+    domain: quantity
+    desc: Number of 15-min slots the window spans (<= 2976).
+    sens: Internal
+  - name: agreed_amount
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Agreed fixed price or rate.
+    sens: Internal
+  - name: gig_rate_unit_id
+    type: UUID
+    domain: enum_ref
+    desc: Unit if agreed amount is a rate.
+    'null': true
+    null_why: NULL = fixed price.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of agreed_amount.
+    sens: Internal
+  - name: handoff_ref
+    type: STRING(128)
+    domain: token
+    desc: External fulfilment system's reference for the handoff.
+    'null': true
+    null_why: NULL until the external system acknowledges the handoff.
+    sens: Internal
+  - name: handoff_idempotency_key
+    type: STRING(64)
+    domain: token
+    desc: Client-generated key sent with handoff; makes retries safe.
+    sens: Internal
+  - name: handoff_requested_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Handoff sent.
+    'null': true
+    null_why: NULL = not yet sent.
+    sens: Internal
+  - name: handoff_acknowledged_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Handoff acknowledged.
+    'null': true
+    null_why: NULL = not yet acknowledged.
+    sens: Internal
+  - name: external_status_code
+    type: STRING(32)
+    domain: code
+    desc: Raw status code last received from external system.
+    'null': true
+    null_why: NULL = nothing received yet.
+    sens: Internal
+  - name: gig_reconcile_state_id
+    type: UUID
+    domain: enum_ref
+    desc: Reconciliation state.
+    sens: Internal
+  - name: status_reconciled_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Last successful status reconciliation.
+    'null': true
+    null_why: NULL = never reconciled.
+    sens: Internal
+  - name: estimated_earnings
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Estimated earnings as reported externally.
+    'null': true
+    null_why: NULL = not reported.
+    sens: Internal
+  - name: total_earnings
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Total earnings as reported externally.
+    'null': true
+    null_why: NULL = not reported.
+    sens: Internal
+  - name: projected_earnings
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Projected earnings as reported externally.
+    'null': true
+    null_why: NULL = not reported.
+    sens: Internal
+  - name: earnings_currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of the three earnings figures.
+    'null': true
+    null_why: NULL = no earnings yet.
+    sens: Internal
+  - name: earnings_as_of_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: External as-of time of figures.
+    'null': true
+    null_why: NULL = no earnings yet.
+    sens: Internal
+  - name: earnings_reconciled_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When the platform last synced earnings.
+    'null': true
+    null_why: NULL = never.
+    sens: Internal
+  - name: started_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Actual start.
+    'null': true
+    null_why: NULL = not started.
+    sens: Internal
+  - name: completed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Actual completion.
+    'null': true
+    null_why: NULL = not completed.
+    sens: Internal
+  constraints:
+  - name: uq_gig_assignment_gig_application_id
+    type: unique
+    columns:
+    - gig_application_id
+    desc: At most one assignment per application.
+  - name: uq_gig_assignment_id_gig_worker_profile_id
+    type: unique
+    columns:
+    - id
+    - gig_worker_profile_id
+    desc: Composite FK target (slot, rating, timesheet).
+  - name: uq_gig_assignment_id_is_completed
+    type: unique
+    columns:
+    - id
+    - is_completed
+    desc: 'Composite FK target: rating only for completed.'
+  - name: uq_gig_assignment_id_organisation_id
+    type: unique
+    columns:
+    - id
+    - organisation_id
+    desc: 'Composite FK target: rater tenant.'
+  - name: ck_gig_assignment_window
+    type: check
+    expr: window_end_at > window_start_at
+    desc: End after start.
+  - name: ck_gig_assignment_grid
+    type: check
+    expr: (extract(epoch FROM window_start_at)::INT8 % 900) = 0 AND (extract(epoch FROM window_end_at)::INT8 % 900) = 0
+    desc: 15-min grid.
+  - name: ck_gig_assignment_max_length
+    type: check
+    expr: window_end_at - window_start_at <= INTERVAL '31 days' AND expected_slot_count BETWEEN 1 AND 2976
+    desc: Max 31 days = 2976 slots.
+  - name: ck_gig_assignment_accepted_flag
+    type: check
+    expr: application_is_accepted
+    desc: Always accepted.
+  - name: ck_gig_assignment_amount
+    type: check
+    expr: agreed_amount > 0
+    desc: Positive.
+  - name: ck_gig_assignment_earnings
+    type: check
+    expr: (estimated_earnings IS NULL OR estimated_earnings >= 0) AND (total_earnings IS NULL OR total_earnings >= 0) AND (projected_earnings IS NULL OR projected_earnings >= 0) AND ((estimated_earnings
+      IS NULL AND total_earnings IS NULL AND projected_earnings IS NULL) OR earnings_currency_id IS NOT NULL)
+    desc: Earnings figures need a currency.
+  - name: ck_gig_assignment_completion
+    type: check
+    expr: (NOT is_completed) OR completed_at IS NOT NULL
+    desc: Completed has a time.
+  indexes:
+  - name: uq_gig_assignment_handoff_ref
+    columns:
+    - handoff_ref
+    desc: Webhook lookup by external ref.
+    unique: true
+    where: handoff_ref IS NOT NULL AND deleted_at IS NULL
+  - name: uq_gig_assignment_handoff_idempotency_key
+    columns:
+    - handoff_idempotency_key
+    desc: Idempotent handoff.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_gig_assignment_gig_worker_profile_id_gig_assignment_status_id
+    columns:
+    - gig_worker_profile_id
+    - gig_assignment_status_id
+    desc: Worker's work list.
+    where: deleted_at IS NULL
+  - name: idx_gig_assignment_gig_request_id
+    columns:
+    - gig_request_id
+    desc: Request's assignments.
+    where: deleted_at IS NULL
+  - name: idx_gig_assignment_organisation_id_window_start_at
+    columns:
+    - organisation_id
+    - window_start_at
+    desc: Requester schedule.
+    where: deleted_at IS NULL
+  - name: idx_gig_assignment_gig_reconcile_state_id_status_reconciled_at
+    columns:
+    - gig_reconcile_state_id
+    - status_reconciled_at
+    desc: Reconciliation worker queue.
+    where: NOT is_completed AND deleted_at IS NULL
+  - name: idx_gig_assignment_earnings_currency_id
+    columns:
+    - earnings_currency_id
+    desc: Leading index for FK on earnings_currency_id (D-20).
+  fks:
+  - name: fk_gig_assignment_accepted_application
+    columns:
+    - gig_application_id
+    - gig_request_id
+    - gig_worker_profile_id
+    - application_is_accepted
+    ref: gig_application
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Only an accepted application of this worker for this request can become an assignment.
+    ref_columns:
+    - id
+    - gig_request_id
+    - gig_worker_profile_id
+    - is_accepted
+  - name: fk_gig_assignment_request_tenant
+    columns:
+    - gig_request_id
+    - organisation_id
+    ref: gig_request
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Tenant must match request.
+    ref_columns:
+    - id
+    - organisation_id
+  - name: fk_gig_assignment_request_currency
+    columns:
+    - gig_request_id
+    - currency_id
+    ref: gig_request
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Agreed currency equals request currency.
+    ref_columns:
+    - id
+    - currency_id
+  - name: fk_gig_assignment_status_flag
+    columns:
+    - gig_assignment_status_id
+    - is_completed
+    ref: gig_assignment_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Status and flag agree.
+    ref_columns:
+    - id
+    - is_completed
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_assignment_gig_rate_unit_id
+    columns:
+    - gig_rate_unit_id
+    ref: gig_rate_unit
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_assignment_gig_reconcile_state_id
+    columns:
+    - gig_reconcile_state_id
+    ref: gig_reconcile_state
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+  - name: fk_gig_assignment_earnings_currency_id
+    columns:
+    - earnings_currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+  no_hash_why: Human-paced writes; no sequential index leads with time (organisation_id/status lead).
+- name: gig_assignment_status_history
+  kind: event
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  retention: Kept 7 years with assignment.
+  description: Append-only assignment status transitions incl. reconciliation results.
+  columns:
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Assignment.
+    sens: Internal
+  - name: from_gig_assignment_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Previous.
+    'null': true
+    null_why: NULL = creation.
+    sens: Internal
+  - name: to_gig_assignment_status_id
+    type: UUID
+    domain: enum_ref
+    desc: New.
+    sens: Internal
+  - name: gig_actor_party_id
+    type: UUID
+    domain: enum_ref
+    desc: Who caused it.
+    sens: Internal
+  - name: external_status_code
+    type: STRING(32)
+    domain: code
+    desc: External code that triggered it.
+    'null': true
+    null_why: NULL = platform-initiated.
+    sens: Internal
+  - name: changed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Time.
+    default: now()
+    sens: Internal
+  - name: reason
+    type: STRING(300)
+    domain: free_text
+    desc: Reason.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  constraints: []
+  indexes:
+  - name: idx_gig_assignment_status_history_gig_assignment_id_changed_at
+    columns:
+    - gig_assignment_id
+    - changed_at DESC
+    desc: Timeline.
+  - name: idx_gig_assignment_status_history_changed_at
+    columns:
+    - changed_at
+    desc: Time scan (hash-sharded).
+    hash: true
+    bucket_count: 16
+  fks:
+  - name: fk_gig_assignment_status_history_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: History outlives assignment soft delete.
+  - name: fk_gig_assignment_status_history_from_gig_assignment_status_id
+    columns:
+    - from_gig_assignment_status_id
+    ref: gig_assignment_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_assignment_status_history_to_gig_assignment_status_id
+    columns:
+    - to_gig_assignment_status_id
+    ref: gig_assignment_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_assignment_status_history_gig_actor_party_id
+    columns:
+    - gig_actor_party_id
+    ref: gig_actor_party
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_slot
+  kind: link
+  delete_policy: hard
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  - B35
+  retention: Hard delete on cancel/edit; row TTL 90 days after slot_start_at (ttl_expiration_expression = slot_start_at + 90 days).
+  description: 15-minute slot rows owned by an assignment or a time-off block; UNIQUE (worker, slot_start_at) enforces no overlap per worker (pattern P2).
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker whose time is held.
+    sens: Internal
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Owning assignment.
+    'null': true
+    null_why: NULL when the slot belongs to time off.
+    sens: Internal
+  - name: gig_time_off_id
+    type: UUID
+    domain: identifier
+    desc: Owning time off.
+    'null': true
+    null_why: NULL when the slot belongs to an assignment.
+    sens: Internal
+  - name: slot_start_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Slot start, UTC, on the 15-min grid; slot spans start..start+15 min.
+    sens: Internal
+  constraints:
+  - name: uq_gig_slot_gig_worker_profile_id_slot_start_at
+    type: unique
+    columns:
+    - gig_worker_profile_id
+    - slot_start_at
+    desc: No two holds of the same worker at the same instant (B35).
+  - name: ck_gig_slot_grid
+    type: check
+    expr: (extract(epoch FROM slot_start_at)::INT8 % 900) = 0
+    desc: 15-minute grid.
+  - name: ck_gig_slot_one_owner
+    type: check
+    expr: (gig_assignment_id IS NULL) <> (gig_time_off_id IS NULL)
+    desc: Exactly one owner.
+  indexes:
+  - name: idx_gig_slot_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    desc: Release slots on cancellation.
+    where: gig_assignment_id IS NOT NULL
+  - name: idx_gig_slot_gig_time_off_id
+    columns:
+    - gig_time_off_id
+    desc: Release slots on time-off edit.
+    where: gig_time_off_id IS NOT NULL
+  - name: idx_gig_slot_slot_start_at
+    columns:
+    - slot_start_at
+    desc: Past-slot sweeps (hash-sharded).
+    hash: true
+    bucket_count: 16
+  fks:
+  - name: fk_gig_slot_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Slots follow profile.
+  - name: fk_gig_slot_assignment_worker
+    columns:
+    - gig_assignment_id
+    - gig_worker_profile_id
+    ref: gig_assignment
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Slot worker must equal assignment worker.
+    ref_columns:
+    - id
+    - gig_worker_profile_id
+  - name: fk_gig_slot_time_off_worker
+    columns:
+    - gig_time_off_id
+    - gig_worker_profile_id
+    ref: gig_time_off
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Slot worker must equal time-off worker.
+    ref_columns:
+    - id
+    - gig_worker_profile_id
+  audit: created_only
+  ttl:
+    expire_after: 90 days
+    column: slot_start_at
+- name: gig_requester_worker_list
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B35
+  retention: Soft delete; erased with tenant or worker erasure.
+  description: Requester organisation's favourite and blacklisted workers; one row per (organisation, worker) so lists are mutually exclusive.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Requesting tenant.
+    sens: Internal
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Listed worker.
+    sens: Internal
+  - name: gig_worker_list_type_id
+    type: UUID
+    domain: enum_ref
+    desc: favourite or blacklist.
+    sens: Internal
+  - name: added_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: User who added.
+    sens: Internal
+  - name: reason
+    type: STRING(500)
+    domain: free_text
+    desc: Reason/note.
+    'null': true
+    null_why: NULL = none.
+    sens: Personal
+    pii: May contain opinions about a person; visible only to the requester organisation, never to the worker.
+  constraints: []
+  indexes:
+  - name: uq_gig_requester_worker_list_organisation_id_gig_worker_profile_id
+    columns:
+    - organisation_id
+    - gig_worker_profile_id
+    desc: Exactly one list entry per tenant+worker.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_gig_requester_worker_list_gig_worker_profile_id_gig_worker_list_type_id
+    columns:
+    - gig_worker_profile_id
+    - gig_worker_list_type_id
+    desc: Blacklist check when worker applies.
+    where: deleted_at IS NULL
+  - name: idx_gig_requester_worker_list_added_by_app_user_id
+    columns:
+    - added_by_app_user_id
+    desc: Leading index for FK on added_by_app_user_id (D-20).
+  fks:
+  - name: fk_gig_requester_worker_list_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: List is tenant data.
+  - name: fk_gig_requester_worker_list_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: No list rows for a removed worker.
+  - name: fk_gig_requester_worker_list_gig_worker_list_type_id
+    columns:
+    - gig_worker_list_type_id
+    ref: gig_worker_list_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_requester_worker_list_added_by_app_user_id
+    columns:
+    - added_by_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Auditable.
+- name: gig_rating
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  - B35
+  retention: Soft delete (moderation); anonymise reviewer text on erasure; kept while worker profile exists.
+  description: Requester's rating of a completed assignment; one per assignment; only completed assignments (chain FK).
+  columns:
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Rated assignment.
+    sens: Internal
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Rated worker (pinned).
+    sens: Internal
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    desc: Rating tenant (pinned).
+    sens: Internal
+  - name: rater_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Rater.
+    sens: Internal
+  - name: assignment_is_completed
+    type: BOOL
+    domain: boolean
+    desc: Always true; pins assignment to completed.
+    default: 'true'
+    sens: Internal
+  - name: stars
+    type: INT2
+    domain: quantity
+    desc: Overall 1..5.
+    sens: Internal
+  - name: quality_stars
+    type: INT2
+    domain: quantity
+    desc: Quality 1..5.
+    'null': true
+    null_why: NULL = not rated.
+    sens: Internal
+  - name: punctuality_stars
+    type: INT2
+    domain: quantity
+    desc: Punctuality 1..5.
+    'null': true
+    null_why: NULL = not rated.
+    sens: Internal
+  - name: communication_stars
+    type: INT2
+    domain: quantity
+    desc: Communication 1..5.
+    'null': true
+    null_why: NULL = not rated.
+    sens: Internal
+  - name: review_text
+    type: STRING(2000)
+    domain: free_text
+    desc: Written review.
+    'null': true
+    null_why: NULL = stars only.
+    sens: Personal
+    pii: Free text may contain PII; encrypted at rest; moderated before public display.
+  - name: is_public
+    type: BOOL
+    domain: boolean
+    desc: Show on worker profile.
+    default: 'true'
+    sens: Internal
+  - name: worker_reply
+    type: STRING(1000)
+    domain: free_text
+    desc: Worker's public reply.
+    'null': true
+    null_why: NULL = no reply.
+    sens: Personal
+    pii: Free text; encrypted at rest.
+  constraints:
+  - name: ck_gig_rating_completed_flag
+    type: check
+    expr: assignment_is_completed
+    desc: Completed only.
+  - name: ck_gig_rating_stars
+    type: check
+    expr: stars BETWEEN 1 AND 5
+    desc: 1..5.
+  - name: ck_gig_rating_sub_stars
+    type: check
+    expr: (quality_stars IS NULL OR quality_stars BETWEEN 1 AND 5) AND (punctuality_stars IS NULL OR punctuality_stars BETWEEN 1 AND 5) AND (communication_stars IS NULL OR communication_stars BETWEEN 1
+      AND 5)
+    desc: 1..5.
+  indexes:
+  - name: uq_gig_rating_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    desc: One live rating per assignment.
+    unique: true
+    where: deleted_at IS NULL
+  - name: idx_gig_rating_gig_worker_profile_id_created_at
+    columns:
+    - gig_worker_profile_id
+    - created_at DESC
+    desc: Profile reviews.
+    where: is_public AND deleted_at IS NULL
+    storing:
+    - stars
+  - name: idx_gig_rating_rater_app_user_id
+    columns:
+    - rater_app_user_id
+    desc: Leading index for FK on rater_app_user_id (D-20).
+  fks:
+  - name: fk_gig_rating_completed_assignment
+    columns:
+    - gig_assignment_id
+    - assignment_is_completed
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Only completed assignments can be rated; assignment cannot leave completed while rated.
+    ref_columns:
+    - id
+    - is_completed
+  - name: fk_gig_rating_assignment_worker
+    columns:
+    - gig_assignment_id
+    - gig_worker_profile_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Worker must be the assignment's worker.
+    ref_columns:
+    - id
+    - gig_worker_profile_id
+  - name: fk_gig_rating_assignment_tenant
+    columns:
+    - gig_assignment_id
+    - organisation_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Rater tenant must own the assignment.
+    ref_columns:
+    - id
+    - organisation_id
+  - name: fk_gig_rating_rater_app_user_id
+    columns:
+    - rater_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Rater.
+- name: gig_worker_rating_summary
+  kind: agg
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  retention: Derived; rebuilt from gig_rating; deleted with profile.
+  description: Derived rating histogram per worker, maintained in the rating txn and rebuilt nightly.
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: rating_count
+    type: INT4
+    domain: quantity
+    desc: Ratings.
+    sens: Internal
+  - name: rating_sum
+    type: INT8
+    domain: quantity
+    desc: Sum of stars.
+    sens: Internal
+  - name: star_1_count
+    type: INT4
+    domain: quantity
+    desc: Count of 1-star.
+    default: '0'
+    sens: Internal
+  - name: star_2_count
+    type: INT4
+    domain: quantity
+    desc: Count of 2-star.
+    default: '0'
+    sens: Internal
+  - name: star_3_count
+    type: INT4
+    domain: quantity
+    desc: Count of 3-star.
+    default: '0'
+    sens: Internal
+  - name: star_4_count
+    type: INT4
+    domain: quantity
+    desc: Count of 4-star.
+    default: '0'
+    sens: Internal
+  - name: star_5_count
+    type: INT4
+    domain: quantity
+    desc: Count of 5-star.
+    default: '0'
+    sens: Internal
+  - name: last_rated_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Latest rating.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  - name: recomputed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Last rebuild.
+    sens: Internal
+  constraints:
+  - name: uq_gig_worker_rating_summary_gig_worker_profile_id
+    type: unique
+    columns:
+    - gig_worker_profile_id
+    desc: One per worker.
+  - name: ck_gig_worker_rating_summary_counts
+    type: check
+    expr: rating_count = star_1_count + star_2_count + star_3_count + star_4_count + star_5_count AND rating_count >= 0 AND rating_sum >= 0
+    desc: Histogram sums to count.
+  indexes: []
+  fks:
+  - name: fk_gig_worker_rating_summary_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Derived data.
+- name: gig_dispute
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  retention: Soft delete; kept 7 years; free text anonymised on erasure.
+  description: Dispute raised on an assignment.
+  columns:
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Assignment.
+    sens: Internal
+  - name: raised_by_gig_actor_party_id
+    type: UUID
+    domain: enum_ref
+    desc: Raised by party.
+    sens: Internal
+  - name: raised_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Raising user.
+    sens: Internal
+  - name: gig_dispute_reason_id
+    type: UUID
+    domain: enum_ref
+    desc: Reason.
+    sens: Internal
+  - name: description
+    type: STRING(3000)
+    domain: free_text
+    desc: Description.
+    sens: Personal
+    pii: Free text with possible PII; encrypted at rest; visible to parties and admins.
+  - name: disputed_amount
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Amount in dispute.
+    'null': true
+    null_why: NULL = non-monetary.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency.
+    'null': true
+    null_why: NULL when no amount.
+    sens: Internal
+  - name: gig_dispute_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Status.
+    sens: Internal
+  - name: opened_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Opened.
+    default: now()
+    sens: Internal
+  - name: resolved_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Resolved.
+    'null': true
+    null_why: NULL = unresolved.
+    sens: Internal
+  - name: resolved_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Admin resolver.
+    'null': true
+    null_why: NULL = unresolved.
+    sens: Internal
+  - name: resolution_summary
+    type: STRING(2000)
+    domain: free_text
+    desc: Outcome.
+    'null': true
+    null_why: NULL = unresolved.
+    sens: Personal
+    pii: Free text; encrypted at rest.
+  constraints:
+  - name: ck_gig_dispute_amount
+    type: check
+    expr: (disputed_amount IS NULL OR disputed_amount > 0) AND ((disputed_amount IS NULL) = (currency_id IS NULL))
+    desc: Amount and currency together.
+  - name: ck_gig_dispute_resolved
+    type: check
+    expr: resolved_at IS NULL OR resolved_at >= opened_at
+    desc: Order.
+  indexes:
+  - name: idx_gig_dispute_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    desc: Per assignment.
+    where: deleted_at IS NULL
+  - name: idx_gig_dispute_gig_dispute_status_id_opened_at
+    columns:
+    - gig_dispute_status_id
+    - opened_at
+    desc: Support queue.
+    where: resolved_at IS NULL AND deleted_at IS NULL
+  - name: idx_gig_dispute_raised_by_app_user_id
+    columns:
+    - raised_by_app_user_id
+    desc: Leading index for FK on raised_by_app_user_id (D-20).
+  - name: idx_gig_dispute_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  - name: idx_gig_dispute_resolved_by_app_user_id
+    columns:
+    - resolved_by_app_user_id
+    desc: Leading index for FK on resolved_by_app_user_id (D-20).
+  fks:
+  - name: fk_gig_dispute_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Evidence.
+  - name: fk_gig_dispute_raised_by_gig_actor_party_id
+    columns:
+    - raised_by_gig_actor_party_id
+    ref: gig_actor_party
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_dispute_raised_by_app_user_id
+    columns:
+    - raised_by_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: User.
+  - name: fk_gig_dispute_gig_dispute_reason_id
+    columns:
+    - gig_dispute_reason_id
+    ref: gig_dispute_reason
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_dispute_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+  - name: fk_gig_dispute_gig_dispute_status_id
+    columns:
+    - gig_dispute_status_id
+    ref: gig_dispute_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+  - name: fk_gig_dispute_resolved_by_app_user_id
+    columns:
+    - resolved_by_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Admin.
+- name: gig_cancellation
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B35
+  retention: Soft delete; kept 7 years with assignment.
+  description: Cancellation of an assignment (one per assignment) and slot-release bookkeeping.
+  columns:
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Assignment.
+    sens: Internal
+  - name: cancelled_by_gig_actor_party_id
+    type: UUID
+    domain: enum_ref
+    desc: Cancelled by.
+    sens: Internal
+  - name: gig_cancellation_reason_id
+    type: UUID
+    domain: enum_ref
+    desc: Reason.
+    sens: Internal
+  - name: cancelled_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: When.
+    default: now()
+    sens: Internal
+  - name: notice_hours
+    type: INT4
+    domain: quantity
+    desc: Hours of notice before window start (negative = late).
+    'null': true
+    null_why: NULL = n/a.
+    sens: Internal
+  - name: slots_released_count
+    type: INT4
+    domain: quantity
+    desc: Slots deleted.
+    default: '0'
+    sens: Internal
+  - name: slots_released_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Slot cleanup done.
+    'null': true
+    null_why: NULL = cleanup pending.
+    sens: Internal
+  - name: cancellation_comment
+    type: STRING(500)
+    domain: free_text
+    desc: Comment.
+    'null': true
+    null_why: NULL = none.
+    sens: Personal
+    pii: Free text; encrypted at rest.
+  constraints:
+  - name: uq_gig_cancellation_gig_assignment_id
+    type: unique
+    columns:
+    - gig_assignment_id
+    desc: One cancellation per assignment.
+  - name: ck_gig_cancellation_slots
+    type: check
+    expr: slots_released_count >= 0
+    desc: Non-negative.
+  indexes:
+  - name: idx_gig_cancellation_cancelled_at
+    columns:
+    - cancelled_at
+    desc: Cleanup job finds unfinished releases.
+    where: slots_released_at IS NULL
+  fks:
+  - name: fk_gig_cancellation_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Evidence.
+  - name: fk_gig_cancellation_cancelled_by_gig_actor_party_id
+    columns:
+    - cancelled_by_gig_actor_party_id
+    ref: gig_actor_party
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_cancellation_gig_cancellation_reason_id
+    columns:
+    - gig_cancellation_reason_id
+    ref: gig_cancellation_reason
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_timesheet_entry
+  kind: event
+  delete_policy: soft
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  retention: Soft delete (corrections); coordinates nulled after 180 days; rows kept 7 years.
+  description: Check-in/check-out sessions of an assignment (Upwork work diary / TaskRabbit start-stop).
+  columns:
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Assignment.
+    sens: Internal
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker (pinned).
+    sens: Internal
+  - name: check_in_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Check-in.
+    sens: Internal
+  - name: check_out_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Check-out.
+    'null': true
+    null_why: NULL = session open.
+    sens: Internal
+  - name: gig_checkin_method_id
+    type: UUID
+    domain: enum_ref
+    desc: Capture method.
+    sens: Internal
+  - name: check_in_latitude
+    type: DECIMAL(9,6)
+    domain: latitude
+    desc: Check-in latitude.
+    'null': true
+    null_why: NULL = no location captured.
+    sens: Personal
+    pii: Precise worker location; access limited to parties of the assignment; nulled after 180 days.
+  - name: check_in_longitude
+    type: DECIMAL(9,6)
+    domain: longitude
+    desc: Check-in longitude.
+    'null': true
+    null_why: NULL = no location captured.
+    sens: Personal
+    pii: As latitude.
+  - name: geo_source_id
+    type: UUID
+    domain: enum_ref
+    desc: Coordinate source.
+    'null': true
+    null_why: NULL when no coordinates.
+    sens: Internal
+  - name: break_minutes
+    type: INT2
+    domain: quantity
+    desc: Break minutes.
+    default: '0'
+    sens: Internal
+  - name: is_approved
+    type: BOOL
+    domain: boolean
+    desc: Requester approved the time.
+    default: 'false'
+    sens: Internal
+  - name: approved_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Approval time.
+    'null': true
+    null_why: NULL = not approved.
+    sens: Internal
+  - name: external_entry_ref
+    type: STRING(128)
+    domain: code
+    desc: Entry id in the fulfilment system.
+    'null': true
+    null_why: NULL = entered on platform.
+    sens: Internal
+  constraints:
+  - name: ck_gig_timesheet_entry_range
+    type: check
+    expr: check_out_at IS NULL OR check_out_at >= check_in_at
+    desc: Out not before in.
+  - name: ck_gig_timesheet_entry_latitude
+    type: check
+    expr: check_in_latitude IS NULL OR check_in_latitude BETWEEN -90 AND 90
+    desc: Range.
+  - name: ck_gig_timesheet_entry_longitude
+    type: check
+    expr: check_in_longitude IS NULL OR check_in_longitude BETWEEN -180 AND 180
+    desc: Range.
+  - name: ck_gig_timesheet_entry_geo_pair
+    type: check
+    expr: (check_in_latitude IS NULL) = (check_in_longitude IS NULL) AND (check_in_latitude IS NULL OR geo_source_id IS NOT NULL)
+    desc: Pair with source.
+  - name: ck_gig_timesheet_entry_break
+    type: check
+    expr: break_minutes BETWEEN 0 AND 1440
+    desc: Range.
+  - name: ck_gig_timesheet_entry_approval
+    type: check
+    expr: (NOT is_approved) OR approved_at IS NOT NULL
+    desc: Approved has a time.
+  indexes:
+  - name: uq_gig_timesheet_entry_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    desc: One open session per assignment.
+    unique: true
+    where: check_out_at IS NULL AND deleted_at IS NULL
+  - name: idx_gig_timesheet_entry_gig_assignment_id_check_in_at
+    columns:
+    - gig_assignment_id
+    - check_in_at
+    desc: Timesheet listing.
+    where: deleted_at IS NULL
+  - name: uq_gig_timesheet_entry_gig_assignment_id_external_entry_ref
+    columns:
+    - gig_assignment_id
+    - external_entry_ref
+    desc: Idempotent import.
+    unique: true
+    where: external_entry_ref IS NOT NULL AND deleted_at IS NULL
+  - name: idx_gig_timesheet_entry_check_in_at
+    columns:
+    - check_in_at
+    desc: Time-ordered scan (hash-sharded).
+    hash: true
+    bucket_count: 16
+  - name: idx_gig_timesheet_entry_geo_source_id
+    columns:
+    - geo_source_id
+    desc: Leading index for FK on geo_source_id (D-20).
+  fks:
+  - name: fk_gig_timesheet_entry_assignment_worker
+    columns:
+    - gig_assignment_id
+    - gig_worker_profile_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Worker must equal assignment worker.
+    ref_columns:
+    - id
+    - gig_worker_profile_id
+  - name: fk_gig_timesheet_entry_gig_checkin_method_id
+    columns:
+    - gig_checkin_method_id
+    ref: gig_checkin_method
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_timesheet_entry_geo_source_id
+    columns:
+    - geo_source_id
+    ref: geo_source
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+- name: gig_payout_reference
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  - B75
+  retention: Soft delete; kept 8 years (tax); contains no account data.
+  description: Reference to a payout executed by the external system. No bank/UPI details stored.
+  columns:
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Assignment.
+    sens: Internal
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker (pinned).
+    sens: Internal
+  - name: source_system
+    type: STRING(32)
+    domain: code
+    desc: External system code.
+    sens: Internal
+  - name: payout_ref
+    type: STRING(128)
+    domain: code
+    desc: Payout id in external system.
+    sens: Internal
+  - name: gig_payout_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Status.
+    sens: Internal
+  - name: gig_payout_channel_id
+    type: UUID
+    domain: enum_ref
+    desc: Channel.
+    sens: Internal
+  - name: amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Paid amount.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency.
+    sens: Internal
+  - name: paid_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Paid time.
+    'null': true
+    null_why: NULL = not paid.
+    sens: Internal
+  - name: reconciled_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Last sync.
+    'null': true
+    null_why: NULL = never synced.
+    sens: Internal
+  constraints:
+  - name: uq_gig_payout_reference_source_system_payout_ref
+    type: unique
+    columns:
+    - source_system
+    - payout_ref
+    desc: External natural key.
+  - name: ck_gig_payout_reference_amount
+    type: check
+    expr: amount >= 0
+    desc: Non-negative.
+  - name: ck_gig_payout_reference_paid
+    type: check
+    expr: gig_payout_status_id IS NOT NULL AND (paid_at IS NULL OR reconciled_at IS NULL OR reconciled_at >= paid_at)
+    desc: Sync after payment.
+  indexes:
+  - name: idx_gig_payout_reference_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    desc: Per assignment.
+  - name: idx_gig_payout_reference_gig_worker_profile_id_paid_at
+    columns:
+    - gig_worker_profile_id
+    - paid_at DESC
+    desc: Worker statements.
+  - name: idx_gig_payout_reference_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  fks:
+  - name: fk_gig_payout_reference_assignment_worker
+    columns:
+    - gig_assignment_id
+    - gig_worker_profile_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Worker must equal assignment worker.
+    ref_columns:
+    - id
+    - gig_worker_profile_id
+  - name: fk_gig_payout_reference_gig_payout_status_id
+    columns:
+    - gig_payout_status_id
+    ref: gig_payout_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_payout_reference_gig_payout_channel_id
+    columns:
+    - gig_payout_channel_id
+    ref: gig_payout_channel
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_payout_reference_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+- name: gig_earnings_snapshot
+  kind: snapshot
+  delete_policy: append_only
+  volume: high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B32
+  retention: Kept 8 years (tax/audit); latest values copied to gig_assignment.
+  description: Append-only earnings figures received from the external system (integration boundary).
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Assignment.
+    'null': true
+    null_why: NULL = worker-level aggregate.
+    sens: Internal
+  - name: gig_earnings_kind_id
+    type: UUID
+    domain: enum_ref
+    desc: estimated/total/projected.
+    sens: Internal
+  - name: amount
+    type: DECIMAL(18,4)
+    domain: money
+    desc: Amount as reported.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency.
+    sens: Internal
+  - name: period_start_date
+    type: DATE
+    domain: date
+    desc: Period start.
+    'null': true
+    null_why: NULL = not period-bound.
+    sens: Internal
+  - name: period_end_date
+    type: DATE
+    domain: date
+    desc: Period end.
+    'null': true
+    null_why: NULL = not period-bound.
+    sens: Internal
+  - name: as_of_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: External as-of time.
+    sens: Internal
+  - name: source_system
+    type: STRING(32)
+    domain: code
+    desc: External system code.
+    sens: Internal
+  - name: source_snapshot_ref
+    type: STRING(128)
+    domain: code
+    desc: External snapshot id.
+    'null': true
+    null_why: NULL = not provided.
+    sens: Internal
+  - name: idempotency_key
+    type: STRING(128)
+    domain: code
+    desc: Dedup key from source.
+    sens: Internal
+  - name: received_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Platform receive time.
+    default: now()
+    sens: Internal
+  constraints:
+  - name: uq_gig_earnings_snapshot_source_system_idempotency_key
+    type: unique
+    columns:
+    - source_system
+    - idempotency_key
+    desc: Replays are ignored.
+  - name: ck_gig_earnings_snapshot_amount
+    type: check
+    expr: amount >= 0
+    desc: Non-negative.
+  - name: ck_gig_earnings_snapshot_period
+    type: check
+    expr: period_end_date IS NULL OR period_start_date IS NULL OR period_end_date >= period_start_date
+    desc: End not before start.
+  indexes:
+  - name: idx_gig_earnings_snapshot_gig_assignment_id_gig_earnings_kind_id_as_of_at
+    columns:
+    - gig_assignment_id
+    - gig_earnings_kind_id
+    - as_of_at DESC
+    desc: Latest figure per kind.
+    where: gig_assignment_id IS NOT NULL
+  - name: idx_gig_earnings_snapshot_gig_worker_profile_id_as_of_at
+    columns:
+    - gig_worker_profile_id
+    - as_of_at DESC
+    desc: Worker earnings history.
+  - name: idx_gig_earnings_snapshot_as_of_at
+    columns:
+    - as_of_at
+    desc: Time scan (hash-sharded).
+    hash: true
+    bucket_count: 16
+  - name: idx_gig_earnings_snapshot_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  fks:
+  - name: fk_gig_earnings_snapshot_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Financial reference.
+  - name: fk_gig_earnings_snapshot_assignment_worker
+    columns:
+    - gig_assignment_id
+    - gig_worker_profile_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Worker must equal assignment worker.
+    ref_columns:
+    - id
+    - gig_worker_profile_id
+  - name: fk_gig_earnings_snapshot_gig_earnings_kind_id
+    columns:
+    - gig_earnings_kind_id
+    ref: gig_earnings_kind
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_earnings_snapshot_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+- name: gig_fulfilment_event
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  - B75
+  retention: Row TTL 395 days after created_at; business effect persisted in assignment/history/earnings tables.
+  description: Inbound webhook events from the external fulfilment system; immutable.
+  columns:
+  - name: source_system
+    type: STRING(32)
+    domain: code
+    desc: Sender system code.
+    sens: Internal
+  - name: idempotency_key
+    type: STRING(128)
+    domain: code
+    desc: Sender event id; dedup key.
+    sens: Internal
+  - name: gig_fulfilment_event_type_id
+    type: UUID
+    domain: enum_ref
+    desc: Event type.
+    sens: Internal
+  - name: handoff_ref
+    type: STRING(128)
+    domain: token
+    desc: Handoff reference carried by the event.
+    'null': true
+    null_why: NULL = event without a handoff reference.
+    sens: Internal
+  - name: gig_assignment_id
+    type: UUID
+    domain: identifier
+    desc: Resolved assignment.
+    'null': true
+    null_why: NULL = not resolvable at receipt (unknown handoff_ref or arrived early).
+    sens: Internal
+  - name: occurred_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Event time at source.
+    sens: Internal
+  - name: received_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Receipt time.
+    default: now()
+    sens: Internal
+  - name: schema_version
+    type: INT2
+    domain: quantity
+    desc: Payload schema version.
+    default: '1'
+    sens: Internal
+  - name: signature_valid
+    type: BOOL
+    domain: boolean
+    desc: HMAC signature verified.
+    default: 'true'
+    sens: Internal
+  - name: payload
+    type: JSONB
+    domain: json
+    desc: 'Minimal raw payload (ids, status, amounts; contract: no names/contact data).'
+    sens: Personal
+    pii: Contract forbids PII; schema-validated on receipt, unknown keys dropped; encrypted at rest.
+  constraints:
+  - name: uq_gig_fulfilment_event_source_system_idempotency_key
+    type: unique
+    columns:
+    - source_system
+    - idempotency_key
+    desc: Webhook retries are idempotent.
+  - name: ck_gig_fulfilment_event_signature
+    type: check
+    expr: signature_valid
+    desc: Only verified events are stored; rejects go to error log.
+  - name: ck_gig_fulfilment_event_version
+    type: check
+    expr: schema_version > 0
+    desc: Positive.
+  indexes:
+  - name: idx_gig_fulfilment_event_gig_assignment_id_occurred_at
+    columns:
+    - gig_assignment_id
+    - occurred_at DESC
+    desc: Assignment event timeline.
+    where: gig_assignment_id IS NOT NULL
+  - name: idx_gig_fulfilment_event_handoff_ref
+    columns:
+    - handoff_ref
+    desc: Late resolution of unmatched events.
+    where: handoff_ref IS NOT NULL
+  - name: idx_gig_fulfilment_event_received_at
+    columns:
+    - received_at
+    desc: Time scan (hash-sharded).
+    hash: true
+    bucket_count: 16
+  fks:
+  - name: fk_gig_fulfilment_event_gig_fulfilment_event_type_id
+    columns:
+    - gig_fulfilment_event_type_id
+    ref: gig_fulfilment_event_type
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_fulfilment_event_gig_assignment_id
+    columns:
+    - gig_assignment_id
+    ref: gig_assignment
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Evidence.
+  ttl:
+    expire_after: 395 days
+    column: created_at
+- name: gig_fulfilment_event_attempt
+  kind: event
+  delete_policy: append_only
+  volume: very_high
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  retention: Deleted with parent event (cascade of TTL).
+  description: Append-only processing attempts of an inbound event (keeps the event immutable).
+  columns:
+  - name: gig_fulfilment_event_id
+    type: UUID
+    domain: identifier
+    desc: Event.
+    sens: Internal
+  - name: attempt_no
+    type: INT2
+    domain: quantity
+    desc: 1-based attempt.
+    sens: Internal
+  - name: gig_event_process_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Outcome.
+    sens: Internal
+  - name: processed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Attempt time.
+    default: now()
+    sens: Internal
+  - name: error_code
+    type: STRING(64)
+    domain: code
+    desc: Error code.
+    'null': true
+    null_why: NULL = success.
+    sens: Internal
+  - name: error_detail
+    type: STRING(500)
+    domain: free_text
+    desc: Error detail (no payload copy).
+    'null': true
+    null_why: NULL = success.
+    sens: Internal
+  constraints:
+  - name: uq_gig_fulfilment_event_attempt_gig_fulfilment_event_id_attempt_no
+    type: unique
+    columns:
+    - gig_fulfilment_event_id
+    - attempt_no
+    desc: One row per attempt.
+  - name: ck_gig_fulfilment_event_attempt_attempt
+    type: check
+    expr: attempt_no > 0
+    desc: Positive.
+  indexes:
+  - name: idx_gig_fulfilment_event_attempt_processed_at
+    columns:
+    - processed_at
+    desc: Retry/dead-letter scans (hash-sharded).
+    hash: true
+    bucket_count: 16
+  fks:
+  - name: fk_gig_fulfilment_event_attempt_gig_fulfilment_event_id
+    columns:
+    - gig_fulfilment_event_id
+    ref: gig_fulfilment_event
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows event TTL.
+  - name: fk_gig_fulfilment_event_attempt_gig_event_process_status_id
+    columns:
+    - gig_event_process_status_id
+    ref: gig_event_process_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+- name: gig_search_alert
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B32
+  retention: Soft delete; purged 90 days after profile erasure.
+  description: Worker's saved search / job alert for gig requests.
+  columns:
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Worker.
+    sens: Internal
+  - name: alert_name
+    type: STRING(100)
+    domain: free_text
+    desc: Label.
+    sens: Internal
+  - name: job_category_id
+    type: UUID
+    domain: identifier
+    desc: Category filter.
+    'null': true
+    null_why: NULL = any.
+    sens: Internal
+  - name: keyword
+    type: STRING(100)
+    domain: free_text
+    desc: Keyword filter.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  - name: city_id
+    type: UUID
+    domain: identifier
+    desc: City filter.
+    'null': true
+    null_why: NULL = any.
+    sens: Internal
+  - name: min_rate
+    type: DECIMAL(12,2)
+    domain: money
+    desc: Minimum rate filter.
+    'null': true
+    null_why: NULL = none.
+    sens: Internal
+  - name: currency_id
+    type: UUID
+    domain: identifier
+    desc: Currency of min_rate.
+    'null': true
+    null_why: NULL when no rate filter.
+    sens: Internal
+  - name: gig_work_mode_id
+    type: UUID
+    domain: enum_ref
+    desc: Mode filter.
+    'null': true
+    null_why: NULL = any.
+    sens: Internal
+  - name: gig_alert_frequency_id
+    type: UUID
+    domain: enum_ref
+    desc: Frequency.
+    sens: Internal
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    desc: Enabled.
+    default: 'true'
+    sens: Internal
+  - name: last_sent_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Last delivery.
+    'null': true
+    null_why: NULL = never.
+    sens: Internal
+  constraints:
+  - name: ck_gig_search_alert_rate
+    type: check
+    expr: (min_rate IS NULL OR min_rate >= 0) AND ((min_rate IS NULL) = (currency_id IS NULL))
+    desc: Rate with currency.
+  indexes:
+  - name: idx_gig_search_alert_gig_alert_frequency_id_last_sent_at
+    columns:
+    - gig_alert_frequency_id
+    - last_sent_at
+    desc: Alert dispatcher.
+    where: is_active AND deleted_at IS NULL
+  - name: idx_gig_search_alert_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    desc: Worker's alerts.
+    where: deleted_at IS NULL
+  - name: idx_gig_search_alert_job_category_id
+    columns:
+    - job_category_id
+    desc: Leading index for FK on job_category_id (D-20).
+  - name: idx_gig_search_alert_city_id
+    columns:
+    - city_id
+    desc: Leading index for FK on city_id (D-20).
+  - name: idx_gig_search_alert_currency_id
+    columns:
+    - currency_id
+    desc: Leading index for FK on currency_id (D-20).
+  fks:
+  - name: fk_gig_search_alert_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Follows profile.
+  - name: fk_gig_search_alert_job_category_id
+    columns:
+    - job_category_id
+    ref: job_category
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: Filter may be retired.
+  - name: fk_gig_search_alert_city_id
+    columns:
+    - city_id
+    ref: city
+    on_delete: SET NULL
+    on_update: RESTRICT
+    desc: Filter may be retired.
+  - name: fk_gig_search_alert_currency_id
+    columns:
+    - currency_id
+    ref: currency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Master.
+  - name: fk_gig_search_alert_gig_work_mode_id
+    columns:
+    - gig_work_mode_id
+    ref: gig_work_mode
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_search_alert_gig_alert_frequency_id
+    columns:
+    - gig_alert_frequency_id
+    ref: gig_alert_frequency
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+- name: gig_report
+  kind: entity
+  delete_policy: soft
+  volume: medium
+  tier: '1'
+  milestones:
+  - B26
+  - B29
+  retention: Soft delete; kept 2 years; details anonymised on erasure.
+  description: Abuse/fraud report against a gig worker or a gig request.
+  columns:
+  - name: reporter_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Reporter.
+    sens: Internal
+  - name: gig_worker_profile_id
+    type: UUID
+    domain: identifier
+    desc: Reported worker.
+    'null': true
+    null_why: NULL when a request is reported.
+    sens: Internal
+  - name: gig_request_id
+    type: UUID
+    domain: identifier
+    desc: Reported request.
+    'null': true
+    null_why: NULL when a worker is reported.
+    sens: Internal
+  - name: gig_report_reason_id
+    type: UUID
+    domain: enum_ref
+    desc: Reason.
+    sens: Internal
+  - name: details
+    type: STRING(2000)
+    domain: free_text
+    desc: Details.
+    'null': true
+    null_why: NULL = none.
+    sens: Personal
+    pii: Free text; encrypted at rest; admins only.
+  - name: gig_report_status_id
+    type: UUID
+    domain: enum_ref
+    desc: Moderation status.
+    sens: Internal
+  - name: reviewed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    desc: Reviewed.
+    'null': true
+    null_why: NULL = not reviewed.
+    sens: Internal
+  - name: reviewed_by_app_user_id
+    type: UUID
+    domain: identifier
+    desc: Moderator.
+    'null': true
+    null_why: NULL = not reviewed.
+    sens: Internal
+  constraints:
+  - name: ck_gig_report_one_target
+    type: check
+    expr: (gig_worker_profile_id IS NULL) <> (gig_request_id IS NULL)
+    desc: Exactly one target.
+  indexes:
+  - name: idx_gig_report_gig_report_status_id_created_at
+    columns:
+    - gig_report_status_id
+    - created_at
+    desc: Moderation queue.
+    where: deleted_at IS NULL
+  - name: idx_gig_report_gig_request_id
+    columns:
+    - gig_request_id
+    desc: By request.
+    where: gig_request_id IS NOT NULL
+  - name: idx_gig_report_reporter_app_user_id
+    columns:
+    - reporter_app_user_id
+    desc: By reporter.
+  - name: idx_gig_report_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    desc: Leading index for FK on gig_worker_profile_id (D-20).
+  - name: idx_gig_report_reviewed_by_app_user_id
+    columns:
+    - reviewed_by_app_user_id
+    desc: Leading index for FK on reviewed_by_app_user_id (D-20).
+  fks:
+  - name: fk_gig_report_reporter_app_user_id
+    columns:
+    - reporter_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Reporter.
+  - name: fk_gig_report_gig_worker_profile_id
+    columns:
+    - gig_worker_profile_id
+    ref: gig_worker_profile
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Target.
+  - name: fk_gig_report_gig_request_id
+    columns:
+    - gig_request_id
+    ref: gig_request
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Target.
+  - name: fk_gig_report_gig_report_reason_id
+    columns:
+    - gig_report_reason_id
+    ref: gig_report_reason
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+    index_exempt: low-cardinality lookup; lookup rows are never deleted so no child-side scan is needed
+  - name: fk_gig_report_gig_report_status_id
+    columns:
+    - gig_report_status_id
+    ref: gig_report_status
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Lookup.
+  - name: fk_gig_report_reviewed_by_app_user_id
+    columns:
+    - reviewed_by_app_user_id
+    ref: app_user
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Moderator.
+views:
+- name: vw_unified_demand
+  kind: view
+  tables:
+  - job_requirement
+  - gig_request
+  purpose: Single demand feed across jobs and gigs for reporting/analytics (D-15 reporting trade-off).
+  security: Aggregates only; tenant filter via organisation_id; no personal data.
+  sql_sketch: SELECT 'job' AS demand_type, id, organisation_id, <category>, <city>, <status>, <opened_at> FROM job_requirement UNION ALL SELECT 'gig', id, organisation_id, job_category_id, city_id, gig_request_status_id,
+    published_at FROM gig_request WHERE deleted_at IS NULL
+- name: vw_gig_worker_public
+  kind: view
+  tables:
+  - gig_worker_profile
+  - gig_worker_rating_summary
+  purpose: Requester-facing worker card with coordinates rounded to 2 dp and no KYC columns.
+  security: Granted to requester role instead of the base table.
+  sql_sketch: SELECT id, headline, hourly_rate, daily_rate, round(home_latitude,2), round(home_longitude,2), rating_avg, rating_count FROM gig_worker_profile WHERE is_listed AND deleted_at IS NULL
+- name: vw_gig_open_request
+  kind: view
+  tables:
+  - gig_request
+  purpose: Open, visible, not-expired requests for marketplace browse.
+  security: Public visibility rows only for non-invited users.
+  sql_sketch: SELECT ... FROM gig_request r JOIN gig_request_status s ON s.id=r.gig_request_status_id WHERE s.code='open' AND r.deleted_at IS NULL
+business_rules:
+- id: BR-GIG-01
+  rule: A gig worker cannot hold two overlapping windows.
+  mechanism_type: SLOT_TABLE
+  mechanism: gig_slot UNIQUE (gig_worker_profile_id, slot_start_at); assignment slots inserted in the same txn as the assignment (P2).
+  tables:
+  - gig_slot
+  - gig_assignment
+  milestone: B35
+- id: BR-GIG-02
+  rule: Windows lie on the 15-minute grid and last at most 31 days.
+  mechanism_type: CHECK
+  mechanism: ck_gig_assignment_grid / ck_gig_assignment_max_length (extract(epoch FROM ts)::INT8 % 900 = 0; end - start <= INTERVAL '31 days'; expected_slot_count 1..2976); same on gig_request, gig_time_off,
+    gig_availability_window.
+  tables:
+  - gig_assignment
+  - gig_request
+  - gig_time_off
+  - gig_availability_window
+  milestone: B35
+- id: BR-GIG-03
+  rule: Approved time off blocks assignments and vice versa.
+  mechanism_type: SLOT_TABLE
+  mechanism: gig_time_off rows exploded to gig_slot with gig_time_off_id; CHECK exactly one owner; same UNIQUE catches conflicts.
+  tables:
+  - gig_time_off
+  - gig_slot
+  milestone: B35
+- id: BR-GIG-04
+  rule: A slot belongs to the same worker as its assignment/time off.
+  mechanism_type: CHAIN_FK
+  mechanism: Composite FKs (gig_assignment_id, gig_worker_profile_id) -> gig_assignment(id, gig_worker_profile_id); (gig_time_off_id, gig_worker_profile_id) -> gig_time_off.
+  tables:
+  - gig_slot
+  milestone: B35
+- id: BR-GIG-05
+  rule: Cancelled assignments release their slots.
+  mechanism_type: TXN_LOCK
+  mechanism: 'Cancellation txn: INSERT gig_cancellation, DELETE gig_slot WHERE gig_assignment_id=?, record slots_released_count; nightly JOB verifies slots_released_at and slot count invariant.'
+  tables:
+  - gig_cancellation
+  - gig_slot
+  milestone: B35
+- id: BR-GIG-06
+  rule: Gig window must have end after start.
+  mechanism_type: CHECK
+  mechanism: ck_gig_request_window, ck_gig_assignment_window, ck_gig_availability_window_range.
+  tables:
+  - gig_request
+  - gig_assignment
+  milestone: B32
+- id: BR-GIG-07
+  rule: Price is fixed or rate based and the money/rate fields must match.
+  mechanism_type: CHAIN_FK
+  mechanism: Composite FK (gig_price_type_id, is_rate_based) -> gig_price_type(id, is_rate_based) + ck_gig_request_price_shape.
+  tables:
+  - gig_request
+  - gig_price_type
+  milestone: B32
+- id: BR-GIG-08
+  rule: A worker applies at most once per request.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE (gig_worker_profile_id, gig_request_id) on gig_application.
+  tables:
+  - gig_application
+  milestone: B35
+- id: BR-GIG-09
+  rule: 'Applications flow one way: only the requester side accepts/rejects; no counter-offer.'
+  mechanism_type: PRIVILEGE
+  mechanism: Worker role may only INSERT and set withdrawn status; status accepted/rejected + decided_by only via requester-organisation role/stored procedure; no counter columns exist.
+  tables:
+  - gig_application
+  milestone: B29
+- id: BR-GIG-10
+  rule: An assignment exists only for an accepted application of the same worker and request.
+  mechanism_type: CHAIN_FK
+  mechanism: Composite FK (gig_application_id, gig_request_id, gig_worker_profile_id, application_is_accepted=true) -> gig_application(id, gig_request_id, gig_worker_profile_id, is_accepted).
+  tables:
+  - gig_assignment
+  - gig_application
+  milestone: B29
+- id: BR-GIG-11
+  rule: One assignment per application.
+  mechanism_type: UNIQUE
+  mechanism: uq_gig_assignment_gig_application_id.
+  tables:
+  - gig_assignment
+  milestone: B35
+- id: BR-GIG-12
+  rule: Accepted applications never exceed headcount.
+  mechanism_type: TXN_LOCK
+  mechanism: SELECT gig_request FOR UPDATE, increment accepted_count; ck_gig_request_headcount.
+  tables:
+  - gig_request
+  - gig_application
+  milestone: B35
+- id: BR-GIG-13
+  rule: A blacklisted worker cannot apply or be invited by that organisation.
+  mechanism_type: TXN_LOCK
+  mechanism: Apply/invite txn reads gig_requester_worker_list (organisation_id, worker) and rejects list_type=blacklist before insert.
+  tables:
+  - gig_requester_worker_list
+  - gig_application
+  - gig_invite
+  milestone: B29
+- id: BR-GIG-14
+  rule: A worker is favourite OR blacklisted for an organisation, never both.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq_gig_requester_worker_list_organisation_id_gig_worker_profile_id WHERE deleted_at IS NULL; list_type lookup column switched in place.
+  tables:
+  - gig_requester_worker_list
+  milestone: B29
+- id: BR-GIG-15
+  rule: Only completed assignments can be rated, once, 1..5 stars.
+  mechanism_type: CHAIN_FK
+  mechanism: Composite FK (gig_assignment_id, assignment_is_completed) -> gig_assignment(id,is_completed); partial unique on gig_assignment_id; ck_gig_rating_stars.
+  tables:
+  - gig_rating
+  - gig_assignment
+  milestone: B35
+- id: BR-GIG-16
+  rule: Only the requester organisation that owned the assignment rates it, for the right worker.
+  mechanism_type: CHAIN_FK
+  mechanism: Composite FKs (gig_assignment_id, organisation_id) and (gig_assignment_id, gig_worker_profile_id) on gig_rating.
+  tables:
+  - gig_rating
+  milestone: B29
+- id: BR-GIG-17
+  rule: Handoff to the external system is idempotent.
+  mechanism_type: UNIQUE
+  mechanism: Unique handoff_idempotency_key and partial unique handoff_ref on gig_assignment.
+  tables:
+  - gig_assignment
+  milestone: B29
+- id: BR-GIG-18
+  rule: Inbound external events are applied at most once.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE (source_system, idempotency_key) on gig_fulfilment_event; reprocessing writes gig_fulfilment_event_attempt rows only.
+  tables:
+  - gig_fulfilment_event
+  - gig_fulfilment_event_attempt
+  milestone: B29
+- id: BR-GIG-19
+  rule: Events and histories are immutable.
+  mechanism_type: PRIVILEGE
+  mechanism: 'append_only tables: INSERT/SELECT grants only (P5).'
+  tables:
+  - gig_fulfilment_event
+  - gig_assignment_status_history
+  - gig_request_status_history
+  - gig_earnings_snapshot
+  milestone: B29
+- id: BR-GIG-20
+  rule: Earnings are sourced from the external system and carry a currency and as-of time.
+  mechanism_type: CHECK
+  mechanism: ck_gig_assignment_earnings; gig_earnings_snapshot unique (source_system, idempotency_key); reconciliation JOB sets earnings_reconciled_at and gig_reconcile_state.
+  tables:
+  - gig_assignment
+  - gig_earnings_snapshot
+  milestone: B29
+- id: BR-GIG-21
+  rule: Gig worker profile is separate and unique per user.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: uq_gig_worker_profile_app_user_id WHERE deleted_at IS NULL.
+  tables:
+  - gig_worker_profile
+  milestone: B26
+- id: BR-GIG-22
+  rule: Worker coordinates need a source and valid range; precise location is not exposed to others.
+  mechanism_type: VIEW
+  mechanism: Lat/long range CHECKs + geo_source pair CHECK; requesters read vw_gig_worker_public (2 dp).
+  tables:
+  - gig_worker_profile
+  milestone: B75
+- id: BR-GIG-23
+  rule: KYC data is stored as a vendor token only.
+  mechanism_type: PRIVILEGE
+  mechanism: kyc_token column Sensitive; column-level grant to compliance role; no document data columns.
+  tables:
+  - gig_worker_profile
+  milestone: B75
+- id: BR-GIG-24
+  rule: No bank or payment-instrument data stored for payouts.
+  mechanism_type: APP_LAYER
+  mechanism: gig_payout_reference holds payout_ref/channel/status/amount only; reviewed in schema review.
+  tables:
+  - gig_payout_reference
+  milestone: B75
+- id: BR-GIG-25
+  rule: One open timesheet session per assignment.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: Unique index on gig_assignment_id WHERE check_out_at IS NULL AND deleted_at IS NULL.
+  tables:
+  - gig_timesheet_entry
+  milestone: B35
+- id: BR-GIG-26
+  rule: A report targets exactly one of worker or request.
+  mechanism_type: CHECK
+  mechanism: ck_gig_report_one_target.
+  tables:
+  - gig_report
+  milestone: B29
+- id: BR-GIG-27
+  rule: Requester demand and supply of gigs and jobs can be reported together.
+  mechanism_type: VIEW
+  mechanism: vw_unified_demand UNION ALL view feeding analytics bridge.
+  tables:
+  - gig_request
+  - job_requirement
+  milestone: B29

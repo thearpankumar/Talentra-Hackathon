@@ -1,0 +1,2 @@
+# Non-reserved keywords that are legal but risky/ambiguous: lint WARNs. Prefer a qualified name (e.g. event_date, subscription_plan).
+date time timestamp year month day hour minute second comment action level role session plan count value text data user_type

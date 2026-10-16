@@ -1,0 +1,5736 @@
+module: master_data
+notes: |
+  # master_data - design decisions
+  **Scope.** Shared reference data for every module: geography (country > state_region > city > locality, postal_code, time_zone), language/i18n
+  (language, ui_label, ui_label_translation), currency, skill graph (skill_category, skill, skill_alias, skill_relation), education
+  (qualification_level lookup, qualification, field_of_study, institution, institution_alias), industry (tree + closure), roles
+  (job_category, job_role, job_role_alias, job_role_skill, job_function/seniority lookups), employer dedupe (employer_name_canonical/alias),
+  tax_id_type, and ~40 enumerations as lookups.
+
+  **Lookup vs rich master (D-03).** A table is a `lookups:` enumeration when it is a small closed set whose values drive behaviour or filters and
+  whose only attributes are code, i18n name, order, active (employment_type, work_type, gender, ... reason codes). It is a rich master when rows
+  carry their own attributes, hierarchy or volume (country, city, skill, qualification, industry, job_role, job_category, language, currency,
+  institution, tax_id_type). Consequence: FKs to a lookup use domain `enum_ref`, FKs to a rich master use `identifier` (lint enforced).
+  Registry tables owned: country, state_region, city, language, currency, skill, skill_category, qualification, industry, job_role,
+  job_category, employment_type, work_type, ui_label, ui_label_translation, geo_source, tax_id_type, document_type, gender, proficiency_level,
+  salary_period, verification_status, visibility_level, notification_channel, address_type.
+
+  **Delete policy.** Everything is `hard` with `is_active` retirement: reference rows are referenced by millions of history rows, so they are
+  never deleted (FKs are ON DELETE RESTRICT); retire via is_active=false. Merges (skill, job_role, institution, employer_name_canonical) use a
+  `merged_into_*_id` self-FK pointer instead of delete so old references keep resolving.
+
+  **i18n (docket rule group 7).**
+  * Supported UI languages (language.is_ui_supported): en (default), hi, ta, bn, es, ar (rtl). Seed `language` also holds content-only languages
+    (mr, te, kn, ml, gu, pa, ur, fr, de, ...) with is_ui_supported=false so resumes and language skills can reference them.
+  * Fallback chain: requested language -> language.fallback_language_id (e.g. ta -> en, hi -> en; regional dialects such as hi-IN -> hi -> en) ->
+    default language en -> ui_label.source_text. Every non-default language MUST declare a fallback (CHECK), the default one terminates the chain
+    (CHECK + partial unique index `is_default`), so resolution always ends. Cycles across rows (a->b->a) cannot be CHECKed in CRDB; a nightly
+    job and the language admin transaction walk the chain (BR-MST-04).
+  * Lookup display names: `name_i18n` JSONB {tag: text}, 'en' mandatory (CHECK). Rich masters also carry name_i18n. UI strings: ui_label
+    (key + source_text) and ui_label_translation unique (ui_label_id, language_id). Keys are never displayed.
+  * User-entered text is not translated here; modules record `language_id` next to it.
+
+  **Geography.** city.country_id plus composite FK (country_id, state_region_id) -> state_region(country_id, id) guarantees the state belongs
+  to the same country (MATCH SIMPLE skips it for city-states, which is why country_id has its own FK). Coordinates are DECIMAL(9,6) with range
+  CHECK and a mandatory geo_source_id (CHECK: coordinates present => source present). city.name_search is a STORED computed lower(ascii_name)
+  with a trigram GIN index (`USING GIN (name_search gin_trgm_ops)`, CockroachDB 22.2+) for typeahead; prefix search uses the B-tree
+  (country_id, name_search). India specifics: city_tier (Naukri/HRA style), state_region.gst_state_code (validates GSTIN prefix), postal_code
+  keeps many post offices per PIN. A `time_zone` table (IANA) lets locations/users display UTC timestamps correctly.
+
+  **Skills / roles / institutions / employers.** Free-text input is mapped to canonical rows: skill_alias, job_role_alias, institution_alias and
+  employer_name_alias are unique on (language, lower(alias)) so parsing is deterministic. Typeahead = trigram GIN on STORED lower() columns.
+  Skill graph edges live in skill_relation (related/parent/prerequisite/implies/substitute, optional strength 0..1) and job_role_skill gives
+  default role skills (required/preferred/nice_to_have). industry carries a parent pointer plus industry_closure (ancestor, descendant, distance)
+  so subtree filters are a single indexed join; closure is rebuilt by a job. job_category is shared with gigs (applies_to_jobs / applies_to_gigs).
+  employer_name_canonical lets candidate work history point at a canonical company before the company registers; organisation_id (registry table
+  owned by organisation_account) is filled once claimed and is unique-when-present.
+
+  **tax_id_type.** Per country: code, anchored validation_regex, min/max length, checksum lookup (none, luhn, mod_97, mod_11, mod_36 for GSTIN,
+  verhoeff for Aadhaar), mask_pattern, is_sensitive. CHECK: individual identifiers must be sensitive. Values are stored by the owning modules as
+  Sensitive (ciphertext/token + HMAC blind index); this table only validates. Examples to seed: IN gstin, IN pan, IN cin, IN tan, US ein, GB vat,
+  AE trn, DE ust_idnr.
+
+  **Deliberate omissions.** No religion, caste, disability, nationality-of-origin or ethnicity master: not needed to match candidates to jobs
+  and high legal risk (DPDP Act 2023, GDPR art. 9, EEOC/ADA). marital_status and gender are kept optional (Naukri collects them): hidden by default,
+  excluded from search/ranking; flagged in notes of the profile module. Gender includes non_binary/transgender/prefer_not_to_say (NALSA 2014).
+  Disability can be added later as a consented accessibility-accommodation table, not as a master.
+
+  **Competitor coverage.** LinkedIn: ~39-41k skills, 26 languages, ~374k aliases, >200k skill-to-skill links (LinkedIn Engineering blog 2022-23)
+  -> matched structurally by skill/skill_alias/skill_relation/language; 26 job functions, 10-level seniority, company-size bands, ~400 industries
+  (industry tree) matched. Naukri: functional area/role/industry tree, notice-period buckets, city tier, engagement type (permanent/contractual/
+  third-party payroll), marital status, key-skills -> matched (notice_period with max_days, engagement_basis, city_tier). Monster/Indeed: job type
+  list, salary period (hourly..annual), shift -> matched (salary_period, work_shift). We exceed them with: multilingual aliases, closure table,
+  canonical employers/institutions, per-country tax id validation and reason codes (rejection, withdrawal, block, report).
+
+  **Extension points.** New UI language = INSERT language row (is_ui_supported) + translations; no DDL. New enumeration = new lookup entry.
+  Taxonomy import (ESCO/O*NET/Lightcast) writes skill.external_taxonomy_ref + skill_taxonomy_source. Seed volumes (laptop): country ~250,
+  state_region ~4k, city ~150k (GeoNames cities >=1000 pop), postal_code ~200k, skill ~40k, skill_alias ~350k, job_role ~25k,
+  institution ~60k, employer_name_canonical ~500k; all low-write, so no hash-sharded indexes are needed (hash-sharding is for time-ordered high-volume tables).
+  Other modules' lookups (statuses, job/application states, plans) are NOT defined here to avoid duplicates.
+lookups:
+- name: employment_type
+  description: Contract/hours basis of a job or work-history entry (LinkedIn-style employment type list).
+  tier: '1'
+  milestones:
+  - B2
+  - B4
+  - B6
+  - B12
+  - B14
+  values:
+  - code: full_time
+    en: Full-time
+    hi: पूर्णकालिक
+    ta: முழு நேரம்
+    bn: পূর্ণকালীন
+    es: Tiempo completo
+    ar: دوام كامل
+    sort: 10
+  - code: part_time
+    en: Part-time
+    hi: अंशकालिक
+    ta: பகுதி நேரம்
+    bn: খণ্ডকালীন
+    es: Tiempo parcial
+    ar: دوام جزئي
+    sort: 20
+  - code: contract
+    en: Contract
+    hi: अनुबंध
+    ta: ஒப்பந்தம்
+    bn: চুক্তিভিত্তিক
+    es: Por contrato
+    ar: عقد
+    sort: 30
+  - code: temporary
+    en: Temporary
+    hi: अस्थायी
+    ta: தற்காலிகம்
+    bn: অস্থায়ী
+    es: Temporal
+    ar: مؤقت
+    sort: 40
+  - code: internship
+    en: Internship
+    hi: इंटर्नशिप
+    ta: பயிற்சிப் பணி
+    bn: ইন্টার্নশিপ
+    es: Prácticas
+    ar: تدريب
+    sort: 50
+  - code: apprenticeship
+    en: Apprenticeship
+    hi: शिक्षुता
+    ta: தொழில் பயிற்சி
+    bn: শিক্ষানবিশি
+    es: Aprendizaje
+    ar: تلمذة مهنية
+    sort: 60
+  - code: freelance
+    en: Freelance
+    hi: फ्रीलांस
+    ta: ஃப்ரீலான்ஸ்
+    bn: ফ্রিল্যান্স
+    es: Freelance
+    ar: عمل حر
+    sort: 70
+  - code: self_employed
+    en: Self-employed
+    hi: स्वरोज़गार
+    ta: சுயதொழில்
+    bn: স্বনিযুক্ত
+    es: Autónomo
+    ar: عمل لحسابه الخاص
+    sort: 80
+  - code: seasonal
+    en: Seasonal
+    hi: मौसमी
+    ta: பருவகால
+    bn: মৌসুমি
+    es: De temporada
+    ar: موسمي
+    sort: 90
+  - code: volunteer
+    en: Volunteer
+    hi: स्वयंसेवी
+    ta: தன்னார்வ
+    bn: স্বেচ্ছাসেবী
+    es: Voluntariado
+    ar: تطوع
+    sort: 100
+- name: engagement_basis
+  description: 'Payroll/engagement basis used in India (Naukri job type: permanent, contractual, third-party payroll).'
+  tier: '1'
+  milestones:
+  - B6
+  - B14
+  values:
+  - code: permanent
+    en: Permanent
+    hi: स्थायी
+    es: Indefinido
+    ar: دائم
+    sort: 10
+  - code: contractual
+    en: Contractual
+    hi: संविदात्मक
+    es: Contractual
+    ar: تعاقدي
+    sort: 20
+  - code: third_party_payroll
+    en: Third-party payroll
+    hi: तृतीय-पक्ष पेरोल
+    es: Nómina de terceros
+    ar: كشوف رواتب طرف ثالث
+    sort: 30
+- name: work_type
+  description: 'Workplace arrangement (LinkedIn workplace type: on-site, hybrid, remote).'
+  tier: '1'
+  milestones:
+  - B2
+  - B6
+  - B14
+  values:
+  - code: on_site
+    en: On-site
+    hi: ऑन-साइट
+    ta: ஆன்-சைட்
+    bn: সাইটে
+    es: Presencial
+    ar: في الموقع
+    sort: 10
+  - code: remote
+    en: Remote
+    hi: रिमोट
+    ta: தொலைதூரம்
+    bn: রিমোট
+    es: Remoto
+    ar: عن بُعد
+    sort: 20
+  - code: hybrid
+    en: Hybrid
+    hi: हाइब्रिड
+    ta: கலப்பு
+    bn: হাইব্রিড
+    es: Híbrido
+    ar: هجين
+    sort: 30
+  - code: field_work
+    en: Field work
+    hi: फ़ील्ड कार्य
+    ta: களப்பணி
+    bn: মাঠ পর্যায়ের কাজ
+    es: Trabajo de campo
+    ar: عمل ميداني
+    sort: 40
+- name: geo_source
+  description: Provenance of a coordinate pair (stated source required by docket rule group 3).
+  tier: '1'
+  milestones:
+  - B12
+  values:
+  - code: user_entered
+    en: User entered
+    hi: उपयोगकर्ता द्वारा दर्ज
+    sort: 10
+  - code: device_gps
+    en: Device GPS
+    hi: डिवाइस जीपीएस
+    sort: 20
+  - code: geocoded_provider
+    en: Geocoding provider
+    hi: जियोकोडिंग प्रदाता
+    sort: 30
+  - code: postal_centroid
+    en: Postal code centroid
+    hi: डाक कोड केंद्र
+    sort: 40
+  - code: city_centroid
+    en: City centroid
+    hi: शहर केंद्र
+    sort: 50
+  - code: manual_admin
+    en: Manual admin entry
+    hi: व्यवस्थापक द्वारा मैन्युअल प्रविष्टि
+    sort: 60
+  - code: imported_dataset
+    en: Imported dataset (GeoNames)
+    hi: आयातित डेटासेट (जियोनेम्स)
+    sort: 70
+- name: gender
+  description: Self-declared gender options; optional field, never used for ranking or matching.
+  tier: '1'
+  milestones:
+  - B4
+  - B12
+  values:
+  - code: male
+    en: Male
+    hi: पुरुष
+    ta: ஆண்
+    bn: পুরুষ
+    es: Masculino
+    ar: ذكر
+    sort: 10
+  - code: female
+    en: Female
+    hi: महिला
+    ta: பெண்
+    bn: মহিলা
+    es: Femenino
+    ar: أنثى
+    sort: 20
+  - code: non_binary
+    en: Non-binary
+    hi: नॉन-बाइनरी
+    ta: இருபால்
+    bn: নন-বাইনারি
+    es: No binario
+    ar: غير ثنائي
+    sort: 30
+  - code: transgender
+    en: Transgender
+    hi: ट्रांसजेंडर
+    ta: திருநங்கை
+    bn: ট্রান্সজেন্ডার
+    es: Transgénero
+    ar: متحول جنسيًا
+    sort: 40
+  - code: other
+    en: Other
+    hi: अन्य
+    ta: பிற
+    bn: অন্যান্য
+    es: Otro
+    ar: آخر
+    sort: 50
+  - code: prefer_not_to_say
+    en: Prefer not to say
+    hi: बताना नहीं चाहते
+    ta: குறிப்பிட விரும்பவில்லை
+    bn: বলতে চাই না
+    es: Prefiero no decirlo
+    ar: أفضل عدم الإفصاح
+    sort: 60
+- name: marital_status
+  description: Optional Naukri-style marital status; kept because Indian recruiters expect it, hidden by default and excluded from search/ranking.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: single
+    en: Single
+    hi: अविवाहित
+    es: Soltero/a
+    ar: أعزب
+    sort: 10
+  - code: married
+    en: Married
+    hi: विवाहित
+    es: Casado/a
+    ar: متزوج
+    sort: 20
+  - code: divorced
+    en: Divorced
+    hi: तलाकशुदा
+    es: Divorciado/a
+    ar: مطلق
+    sort: 30
+  - code: widowed
+    en: Widowed
+    hi: विधवा/विधुर
+    es: Viudo/a
+    ar: أرمل
+    sort: 40
+  - code: separated
+    en: Separated
+    hi: अलग रह रहे
+    es: Separado/a
+    ar: منفصل
+    sort: 50
+  - code: prefer_not_to_say
+    en: Prefer not to say
+    hi: बताना नहीं चाहते
+    es: Prefiero no decirlo
+    ar: أفضل عدم الإفصاح
+    sort: 60
+- name: proficiency_level
+  description: Skill proficiency scale (candidate_skill, gig worker skills).
+  tier: '1'
+  milestones:
+  - B4
+  - B12
+  values:
+  - code: beginner
+    en: Beginner
+    hi: शुरुआती
+    ta: தொடக்க நிலை
+    bn: প্রাথমিক
+    es: Principiante
+    ar: مبتدئ
+    sort: 10
+  - code: intermediate
+    en: Intermediate
+    hi: मध्यम
+    ta: இடைநிலை
+    bn: মধ্যবর্তী
+    es: Intermedio
+    ar: متوسط
+    sort: 20
+  - code: advanced
+    en: Advanced
+    hi: उन्नत
+    ta: மேம்பட்ட
+    bn: উন্নত
+    es: Avanzado
+    ar: متقدم
+    sort: 30
+  - code: expert
+    en: Expert
+    hi: विशेषज्ञ
+    ta: நிபுணர்
+    bn: বিশেষজ্ঞ
+    es: Experto
+    ar: خبير
+    sort: 40
+- name: language_proficiency_level
+  description: Spoken/written language proficiency scale (LinkedIn five-step scale, mapped to CEFR in notes).
+  tier: '1'
+  milestones:
+  - B12
+  values:
+  - code: elementary
+    en: Elementary proficiency
+    hi: प्रारंभिक दक्षता
+    es: Competencia elemental
+    ar: إتقان أولي
+    sort: 10
+  - code: limited_working
+    en: Limited working proficiency
+    hi: सीमित कार्य दक्षता
+    es: Competencia laboral limitada
+    ar: إتقان عملي محدود
+    sort: 20
+  - code: professional_working
+    en: Professional working proficiency
+    hi: व्यावसायिक कार्य दक्षता
+    es: Competencia profesional
+    ar: إتقان مهني
+    sort: 30
+  - code: full_professional
+    en: Full professional proficiency
+    hi: पूर्ण व्यावसायिक दक्षता
+    es: Competencia profesional plena
+    ar: إتقان مهني كامل
+    sort: 40
+  - code: native_bilingual
+    en: Native or bilingual proficiency
+    hi: मातृभाषा या द्विभाषी
+    es: Nativo o bilingüe
+    ar: لغة أم أو ثنائي اللغة
+    sort: 50
+- name: salary_period
+  description: Pay period a salary figure refers to.
+  tier: '1'
+  milestones:
+  - B6
+  - B14
+  - B26
+  values:
+  - code: hourly
+    en: Hourly
+    hi: प्रति घंटा
+    ta: மணிக்கு
+    bn: ঘণ্টাপ্রতি
+    es: Por hora
+    ar: بالساعة
+    sort: 10
+  - code: daily
+    en: Daily
+    hi: प्रतिदिन
+    ta: தினசரி
+    bn: দৈনিক
+    es: Diario
+    ar: يوميًا
+    sort: 20
+  - code: weekly
+    en: Weekly
+    hi: साप्ताहिक
+    ta: வாராந்திர
+    bn: সাপ্তাহিক
+    es: Semanal
+    ar: أسبوعيًا
+    sort: 30
+  - code: monthly
+    en: Monthly
+    hi: मासिक
+    ta: மாதாந்திர
+    bn: মাসিক
+    es: Mensual
+    ar: شهريًا
+    sort: 40
+  - code: annual
+    en: Annual
+    hi: वार्षिक
+    ta: ஆண்டு
+    bn: বার্ষিক
+    es: Anual
+    ar: سنويًا
+    sort: 50
+  - code: per_project
+    en: Per project
+    hi: प्रति परियोजना
+    ta: ஒரு திட்டத்திற்கு
+    bn: প্রকল্পপ্রতি
+    es: Por proyecto
+    ar: لكل مشروع
+    sort: 60
+- name: verification_status
+  description: Generic verification state for identities, documents, organisations, institutions and skills.
+  tier: '1'
+  milestones:
+  - B2
+  - B25
+  values:
+  - code: unverified
+    en: Unverified
+    hi: असत्यापित
+    ta: சரிபார்க்கப்படவில்லை
+    bn: যাচাই করা হয়নি
+    es: Sin verificar
+    ar: غير موثّق
+    sort: 10
+  - code: pending
+    en: Pending
+    hi: लंबित
+    ta: நிலுவையில்
+    bn: মুলতুবি
+    es: Pendiente
+    ar: قيد الانتظار
+    sort: 20
+  - code: verified
+    en: Verified
+    hi: सत्यापित
+    ta: சரிபார்க்கப்பட்டது
+    bn: যাচাইকৃত
+    es: Verificado
+    ar: موثّق
+    sort: 30
+  - code: rejected
+    en: Rejected
+    hi: अस्वीकृत
+    ta: நிராகரிக்கப்பட்டது
+    bn: প্রত্যাখ্যাত
+    es: Rechazado
+    ar: مرفوض
+    sort: 40
+  - code: expired
+    en: Expired
+    hi: समाप्त
+    ta: காலாவதியானது
+    bn: মেয়াদোত্তীর্ণ
+    es: Caducado
+    ar: منتهي الصلاحية
+    sort: 50
+  - code: revoked
+    en: Revoked
+    hi: रद्द
+    ta: ரத்து செய்யப்பட்டது
+    bn: প্রত্যাহার করা হয়েছে
+    es: Revocado
+    ar: ملغى
+    sort: 60
+- name: visibility_level
+  description: Who may see a profile section or contact detail (privacy settings).
+  tier: '1'
+  milestones:
+  - B4
+  - B12
+  values:
+  - code: private
+    en: Only me
+    hi: केवल मैं
+    ta: நான் மட்டும்
+    bn: শুধু আমি
+    es: Solo yo
+    ar: أنا فقط
+    sort: 10
+  - code: applied_employers_only
+    en: Employers I applied to
+    hi: जिन नियोक्ताओं को आवेदन किया
+    ta: நான் விண்ணப்பித்த நிறுவனங்கள்
+    bn: যাদের কাছে আবেদন করেছি
+    es: Empleadores a los que apliqué
+    ar: أصحاب العمل الذين تقدمت إليهم
+    sort: 20
+  - code: verified_recruiters
+    en: Verified recruiters
+    hi: सत्यापित रिक्रूटर
+    ta: சரிபார்க்கப்பட்ட ஆட்சேர்ப்பாளர்கள்
+    bn: যাচাইকৃত রিক্রুটার
+    es: Reclutadores verificados
+    ar: المُوظِّفون الموثّقون
+    sort: 30
+  - code: registered_users
+    en: Registered users
+    hi: पंजीकृत उपयोगकर्ता
+    ta: பதிவு செய்த பயனர்கள்
+    bn: নিবন্ধিত ব্যবহারকারী
+    es: Usuarios registrados
+    ar: المستخدمون المسجلون
+    sort: 40
+  - code: public
+    en: Public
+    hi: सार्वजनिक
+    ta: பொது
+    bn: সর্বজনীন
+    es: Público
+    ar: عام
+    sort: 50
+- name: notification_channel
+  description: Delivery channel for notifications and alerts.
+  tier: '1'
+  milestones:
+  - B12
+  values:
+  - code: email
+    en: Email
+    hi: ईमेल
+    ta: மின்னஞ்சல்
+    bn: ইমেইল
+    es: Correo electrónico
+    ar: البريد الإلكتروني
+    sort: 10
+  - code: sms
+    en: SMS
+    hi: एसएमएस
+    ta: எஸ்எம்எஸ்
+    bn: এসএমএস
+    es: SMS
+    ar: رسالة نصية
+    sort: 20
+  - code: push
+    en: Push notification
+    hi: पुश सूचना
+    ta: புஷ் அறிவிப்பு
+    bn: পুশ নোটিফিকেশন
+    es: Notificación push
+    ar: إشعار فوري
+    sort: 30
+  - code: whatsapp
+    en: WhatsApp
+    hi: व्हाट्सऐप
+    ta: வாட்ஸ்அப்
+    bn: হোয়াটসঅ্যাপ
+    es: WhatsApp
+    ar: واتساب
+    sort: 40
+  - code: in_app
+    en: In-app
+    hi: ऐप में
+    ta: பயன்பாட்டில்
+    bn: অ্যாপের ভেতরে
+    es: En la aplicación
+    ar: داخل التطبيق
+    sort: 50
+- name: address_type
+  description: Role of an address (candidate home, organisation registered office, billing...).
+  tier: '1'
+  milestones:
+  - B12
+  - B25
+  values:
+  - code: home
+    en: Home
+    hi: घर
+    es: Domicilio
+    ar: المنزل
+    sort: 10
+  - code: permanent
+    en: Permanent address
+    hi: स्थायी पता
+    es: Dirección permanente
+    ar: العنوان الدائم
+    sort: 20
+  - code: current
+    en: Current address
+    hi: वर्तमान पता
+    es: Dirección actual
+    ar: العنوان الحالي
+    sort: 30
+  - code: work
+    en: Work
+    hi: कार्यालय
+    es: Trabajo
+    ar: العمل
+    sort: 40
+  - code: registered_office
+    en: Registered office
+    hi: पंजीकृत कार्यालय
+    es: Domicilio social
+    ar: المكتب المسجل
+    sort: 50
+  - code: branch
+    en: Branch office
+    hi: शाखा कार्यालय
+    es: Sucursal
+    ar: فرع
+    sort: 60
+  - code: billing
+    en: Billing
+    hi: बिलिंग
+    es: Facturación
+    ar: الفوترة
+    sort: 70
+  - code: correspondence
+    en: Correspondence
+    hi: पत्राचार
+    es: Correspondencia
+    ar: المراسلات
+    sort: 80
+- name: document_type
+  description: Kinds of uploaded documents (candidate, organisation, verification).
+  tier: '1'
+  milestones:
+  - B12
+  - B25
+  values:
+  - code: resume
+    en: Resume
+    hi: रिज़्यूमे
+    es: Currículum
+    ar: السيرة الذاتية
+    sort: 10
+  - code: cover_letter
+    en: Cover letter
+    hi: कवर लेटर
+    es: Carta de presentación
+    ar: خطاب التقديم
+    sort: 20
+  - code: passport
+    en: Passport
+    hi: पासपोर्ट
+    es: Pasaporte
+    ar: جواز السفر
+    sort: 30
+  - code: national_id
+    en: National ID
+    hi: राष्ट्रीय पहचान पत्र
+    es: Documento nacional de identidad
+    ar: بطاقة الهوية الوطنية
+    sort: 40
+  - code: driving_licence
+    en: Driving licence
+    hi: ड्राइविंग लाइसेंस
+    es: Licencia de conducir
+    ar: رخصة القيادة
+    sort: 50
+  - code: degree_certificate
+    en: Degree certificate
+    hi: डिग्री प्रमाणपत्र
+    es: Título académico
+    ar: شهادة التخرج
+    sort: 60
+  - code: marksheet
+    en: Mark sheet
+    hi: अंकपत्र
+    es: Boletín de calificaciones
+    ar: كشف الدرجات
+    sort: 70
+  - code: experience_letter
+    en: Experience letter
+    hi: अनुभव पत्र
+    es: Carta de experiencia
+    ar: شهادة خبرة
+    sort: 80
+  - code: relieving_letter
+    en: Relieving letter
+    hi: कार्यमुक्ति पत्र
+    es: Carta de relevo
+    ar: خطاب إخلاء الطرف
+    sort: 90
+  - code: offer_letter
+    en: Offer letter
+    hi: प्रस्ताव पत्र
+    es: Carta de oferta
+    ar: خطاب العرض
+    sort: 100
+  - code: payslip
+    en: Payslip
+    hi: वेतन पर्ची
+    es: Nómina
+    ar: قسيمة الراتب
+    sort: 110
+  - code: certification
+    en: Professional certificate
+    hi: व्यावसायिक प्रमाणपत्र
+    es: Certificado profesional
+    ar: شهادة مهنية
+    sort: 120
+  - code: portfolio
+    en: Portfolio
+    hi: पोर्टफोलियो
+    es: Portafolio
+    ar: ملف الأعمال
+    sort: 130
+  - code: profile_photo
+    en: Profile photo
+    hi: प्रोफ़ाइल फ़ोटो
+    es: Foto de perfil
+    ar: صورة الملف الشخصي
+    sort: 140
+  - code: video_introduction
+    en: Video introduction
+    hi: वीडियो परिचय
+    es: Presentación en video
+    ar: مقدمة بالفيديو
+    sort: 150
+  - code: company_registration_certificate
+    en: Company registration certificate
+    hi: कंपनी पंजीकरण प्रमाणपत्र
+    es: Certificado de registro de empresa
+    ar: شهادة تسجيل الشركة
+    sort: 160
+  - code: tax_registration_certificate
+    en: Tax registration certificate
+    hi: कर पंजीकरण प्रमाणपत्र
+    es: Certificado de registro fiscal
+    ar: شهادة التسجيل الضريبي
+    sort: 170
+  - code: address_proof
+    en: Address proof
+    hi: पते का प्रमाण
+    es: Comprobante de domicilio
+    ar: إثبات العنوان
+    sort: 180
+  - code: authorisation_letter
+    en: Authorisation letter
+    hi: प्राधिकरण पत्र
+    es: Carta de autorización
+    ar: خطاب تفويض
+    sort: 190
+- name: seniority_level
+  description: Seniority of a job role or position (LinkedIn seniority levels).
+  tier: '1'
+  milestones:
+  - B6
+  - B14
+  values:
+  - code: intern
+    en: Intern
+    hi: इंटर्न
+    es: Pasante
+    ar: متدرب
+    sort: 10
+  - code: entry
+    en: Entry level
+    hi: प्रवेश स्तर
+    es: Nivel inicial
+    ar: مستوى مبتدئ
+    sort: 20
+  - code: associate
+    en: Associate
+    hi: सहयोगी
+    es: Asociado
+    ar: مساعد
+    sort: 30
+  - code: mid
+    en: Mid level
+    hi: मध्य स्तर
+    es: Nivel intermedio
+    ar: مستوى متوسط
+    sort: 40
+  - code: senior
+    en: Senior
+    hi: वरिष्ठ
+    es: Sénior
+    ar: أول
+    sort: 50
+  - code: lead
+    en: Lead
+    hi: लीड
+    es: Líder
+    ar: قائد فريق
+    sort: 60
+  - code: manager
+    en: Manager
+    hi: प्रबंधक
+    es: Gerente
+    ar: مدير
+    sort: 70
+  - code: director
+    en: Director
+    hi: निदेशक
+    es: Director
+    ar: مدير إدارة
+    sort: 80
+  - code: vice_president
+    en: Vice president
+    hi: उपाध्यक्ष
+    es: Vicepresidente
+    ar: نائب الرئيس
+    sort: 90
+  - code: c_suite
+    en: C-suite
+    hi: सी-स्तरीय कार्यकारी
+    es: Alta dirección
+    ar: الإدارة التنفيذية العليا
+    sort: 100
+  - code: owner_partner
+    en: Owner or partner
+    hi: मालिक या भागीदार
+    es: Propietario o socio
+    ar: مالك أو شريك
+    sort: 110
+  - code: mid_senior
+    en: Mid-Senior level
+    sort: 40
+  - code: executive
+    en: Executive
+    sort: 60
+- name: job_function
+  description: Flat list of job functions (LinkedIn publishes 26 job functions).
+  tier: '1'
+  milestones:
+  - B6
+  - B14
+  values:
+  - code: accounting
+    en: Accounting
+    hi: लेखा
+    es: Contabilidad
+    sort: 10
+  - code: administrative
+    en: Administrative
+    hi: प्रशासनिक
+    es: Administrativo
+    sort: 20
+  - code: arts_design
+    en: Arts and design
+    hi: कला और डिज़ाइन
+    es: Arte y diseño
+    sort: 30
+  - code: business_development
+    en: Business development
+    hi: व्यवसाय विकास
+    es: Desarrollo de negocio
+    sort: 40
+  - code: community_social
+    en: Community and social services
+    hi: समुदाय और सामाजिक सेवाएँ
+    es: Servicios sociales y comunitarios
+    sort: 50
+  - code: consulting
+    en: Consulting
+    hi: परामर्श
+    es: Consultoría
+    sort: 60
+  - code: education
+    en: Education
+    hi: शिक्षा
+    es: Educación
+    sort: 70
+  - code: engineering
+    en: Engineering
+    hi: इंजीनियरिंग
+    es: Ingeniería
+    sort: 80
+  - code: entrepreneurship
+    en: Entrepreneurship
+    hi: उद्यमिता
+    es: Emprendimiento
+    sort: 90
+  - code: finance
+    en: Finance
+    hi: वित्त
+    es: Finanzas
+    sort: 100
+  - code: healthcare
+    en: Healthcare
+    hi: स्वास्थ्य सेवा
+    es: Salud
+    sort: 110
+  - code: human_resources
+    en: Human resources
+    hi: मानव संसाधन
+    es: Recursos humanos
+    sort: 120
+  - code: information_technology
+    en: Information technology
+    hi: सूचना प्रौद्योगिकी
+    es: Tecnologías de la información
+    sort: 130
+  - code: legal
+    en: Legal
+    hi: कानूनी
+    es: Jurídico
+    sort: 140
+  - code: marketing
+    en: Marketing
+    hi: विपणन
+    es: Marketing
+    sort: 150
+  - code: media_communications
+    en: Media and communications
+    hi: मीडिया और संचार
+    es: Medios y comunicación
+    sort: 160
+  - code: military_protective
+    en: Military and protective services
+    hi: सैन्य और सुरक्षा सेवाएँ
+    es: Servicios militares y de protección
+    sort: 170
+  - code: operations
+    en: Operations
+    hi: संचालन
+    es: Operaciones
+    sort: 180
+  - code: product_management
+    en: Product management
+    hi: उत्पाद प्रबंधन
+    es: Gestión de producto
+    sort: 190
+  - code: program_project_management
+    en: Program and project management
+    hi: कार्यक्रम और परियोजना प्रबंधन
+    es: Gestión de programas y proyectos
+    sort: 200
+  - code: purchasing
+    en: Purchasing
+    hi: क्रय
+    es: Compras
+    sort: 210
+  - code: quality_assurance
+    en: Quality assurance
+    hi: गुणवत्ता आश्वासन
+    es: Control de calidad
+    sort: 220
+  - code: real_estate
+    en: Real estate
+    hi: रियल एस्टेट
+    es: Inmobiliario
+    sort: 230
+  - code: research
+    en: Research
+    hi: अनुसंधान
+    es: Investigación
+    sort: 240
+  - code: sales
+    en: Sales
+    hi: बिक्री
+    es: Ventas
+    sort: 250
+  - code: customer_success_support
+    en: Customer success and support
+    hi: ग्राहक सफलता और सहायता
+    es: Atención al cliente
+    sort: 260
+- name: notice_period
+  description: Candidate notice period buckets (Naukri-style filter); max_days supports numeric filtering.
+  tier: '1'
+  milestones:
+  - B4
+  - B12
+  values:
+  - code: immediate
+    en: Immediate
+    hi: तुरंत
+    es: Inmediato
+    ar: فوري
+    max_days: 0
+    sort: 10
+  - code: up_to_15_days
+    en: 15 days or less
+    hi: 15 दिन या कम
+    es: 15 días o menos
+    ar: 15 يومًا أو أقل
+    max_days: 15
+    sort: 20
+  - code: one_month
+    en: 1 month
+    hi: 1 महीना
+    es: 1 mes
+    ar: شهر واحد
+    max_days: 30
+    sort: 30
+  - code: two_months
+    en: 2 months
+    hi: 2 महीने
+    es: 2 meses
+    ar: شهران
+    max_days: 60
+    sort: 40
+  - code: three_months
+    en: 3 months
+    hi: 3 महीने
+    es: 3 meses
+    ar: 3 أشهر
+    max_days: 90
+    sort: 50
+  - code: more_than_three_months
+    en: More than 3 months
+    hi: 3 महीने से अधिक
+    es: Más de 3 meses
+    ar: أكثر من 3 أشهر
+    max_days: null
+    sort: 60
+  - code: serving_notice
+    en: Currently serving notice
+    hi: वर्तमान में नोटिस अवधि में
+    es: Cumpliendo preaviso
+    ar: يعمل فترة الإشعار
+    max_days: null
+    sort: 70
+  extra_columns:
+  - name: max_days
+    type: INT4
+    domain: quantity
+    sens: Public
+    desc: Upper bound of the bucket in days, for numeric filtering.
+    'null': true
+    null_why: NULL = open-ended or not a duration.
+  constraints:
+  - name: ck_notice_period_max_days
+    type: check
+    expr: max_days IS NULL OR max_days >= 0
+    desc: Non-negative days.
+- name: work_shift
+  description: Shift pattern preference or requirement.
+  tier: X
+  milestones:
+  - B6
+  - B14
+  - B26
+  values:
+  - code: day
+    en: Day shift
+    hi: दिन की पाली
+    es: Turno de día
+    ar: وردية نهارية
+    sort: 10
+  - code: night
+    en: Night shift
+    hi: रात की पाली
+    es: Turno de noche
+    ar: وردية ليلية
+    sort: 20
+  - code: rotational
+    en: Rotational
+    hi: घूर्णी
+    es: Rotativo
+    ar: متناوب
+    sort: 30
+  - code: flexible
+    en: Flexible
+    hi: लचीला
+    es: Flexible
+    ar: مرن
+    sort: 40
+  - code: split
+    en: Split shift
+    hi: विभाजित पाली
+    es: Turno partido
+    ar: وردية مقسمة
+    sort: 50
+  - code: weekend
+    en: Weekend only
+    hi: केवल सप्ताहांत
+    es: Solo fines de semana
+    ar: عطلة نهاية الأسبوع فقط
+    sort: 60
+- name: rejection_reason
+  description: Employer-side reason when rejecting an application (shown to candidate as feedback category).
+  tier: '1'
+  milestones:
+  - B6
+  - B14
+  values:
+  - code: skills_mismatch
+    en: Skills do not match
+    hi: कौशल मेल नहीं खाते
+    es: Habilidades no coinciden
+    ar: المهارات غير مطابقة
+    sort: 10
+  - code: experience_insufficient
+    en: Insufficient experience
+    hi: अपर्याप्त अनुभव
+    es: Experiencia insuficiente
+    ar: خبرة غير كافية
+    sort: 20
+  - code: overqualified
+    en: Overqualified
+    hi: अत्यधिक योग्य
+    es: Sobrecualificado
+    ar: مؤهل أكثر من اللازم
+    sort: 30
+  - code: salary_expectation_high
+    en: Salary expectation too high
+    hi: वेतन अपेक्षा अधिक
+    es: Expectativa salarial alta
+    ar: توقعات الراتب مرتفعة
+    sort: 40
+  - code: notice_period_long
+    en: Notice period too long
+    hi: नोटिस अवधि लंबी
+    es: Preaviso demasiado largo
+    ar: فترة الإشعار طويلة
+    sort: 50
+  - code: location_mismatch
+    en: Location mismatch
+    hi: स्थान मेल नहीं खाता
+    es: Ubicación no coincide
+    ar: الموقع غير مناسب
+    sort: 60
+  - code: failed_assessment
+    en: Failed assessment
+    hi: आकलन में असफल
+    es: No superó la evaluación
+    ar: لم يجتز التقييم
+    sort: 70
+  - code: failed_interview
+    en: Failed interview
+    hi: साक्षात्कार में असफल
+    es: No superó la entrevista
+    ar: لم يجتز المقابلة
+    sort: 80
+  - code: position_filled
+    en: Position filled
+    hi: पद भर चुका है
+    es: Puesto cubierto
+    ar: تم شغل الوظيفة
+    sort: 90
+  - code: position_cancelled
+    en: Position cancelled
+    hi: पद रद्द
+    es: Puesto cancelado
+    ar: أُلغيت الوظيفة
+    sort: 100
+  - code: incomplete_profile
+    en: Incomplete profile
+    hi: अधूरी प्रोफ़ाइल
+    es: Perfil incompleto
+    ar: ملف شخصي غير مكتمل
+    sort: 110
+  - code: background_check_failed
+    en: Background check failed
+    hi: पृष्ठभूमि जांच असफल
+    es: Verificación de antecedentes fallida
+    ar: فشل التحقق من الخلفية
+    sort: 120
+  - code: duplicate_application
+    en: Duplicate application
+    hi: दोहरा आवेदन
+    es: Solicitud duplicada
+    ar: طلب مكرر
+    sort: 130
+  - code: other
+    en: Other
+    hi: अन्य
+    es: Otro
+    ar: آخر
+    sort: 140
+  - code: salary_expectation
+    en: Salary expectation too high
+    sort: 40
+  - code: notice_period
+    en: Notice period too long
+    sort: 50
+  - code: not_responding
+    en: Candidate not responding
+    sort: 110
+- name: withdrawal_reason
+  description: Candidate-side reason for withdrawing an application or declining an offer.
+  tier: '1'
+  milestones:
+  - B6
+  - B14
+  values:
+  - code: accepted_other_offer
+    en: Accepted another offer
+    hi: दूसरा प्रस्ताव स्वीकार किया
+    es: Acepté otra oferta
+    ar: قبلت عرضًا آخر
+    sort: 10
+  - code: salary_not_suitable
+    en: Salary not suitable
+    hi: वेतन उपयुक्त नहीं
+    es: Salario no adecuado
+    ar: الراتب غير مناسب
+    sort: 20
+  - code: location_not_suitable
+    en: Location not suitable
+    hi: स्थान उपयुक्त नहीं
+    es: Ubicación no adecuada
+    ar: الموقع غير مناسب
+    sort: 30
+  - code: role_not_suitable
+    en: Role not a fit
+    hi: भूमिका उपयुक्त नहीं
+    es: Puesto no adecuado
+    ar: الدور غير مناسب
+    sort: 40
+  - code: personal_reasons
+    en: Personal reasons
+    hi: व्यक्तिगत कारण
+    es: Motivos personales
+    ar: أسباب شخصية
+    sort: 50
+  - code: no_longer_looking
+    en: No longer looking
+    hi: अब खोज नहीं रहे
+    es: Ya no busco empleo
+    ar: لم أعد أبحث
+    sort: 60
+  - code: process_too_long
+    en: Process too long
+    hi: प्रक्रिया बहुत लंबी
+    es: Proceso demasiado largo
+    ar: العملية طويلة جدًا
+    sort: 70
+  - code: other
+    en: Other
+    hi: अन्य
+    es: Otro
+    ar: آخر
+    sort: 80
+  - code: not_interested
+    en: No longer interested
+    sort: 20
+  - code: salary
+    en: Salary mismatch
+    sort: 30
+  - code: location
+    en: Location
+    sort: 40
+  - code: applied_by_mistake
+    en: Applied by mistake
+    sort: 50
+- name: block_reason
+  description: Reason recorded when one party blocks/blacklists another (administration blocking lists).
+  tier: '1'
+  milestones:
+  - B24
+  - B33
+  values:
+  - code: spam
+    en: Spam
+    hi: स्पैम
+    es: Spam
+    ar: بريد مزعج
+    sort: 10
+  - code: harassment
+    en: Harassment
+    hi: उत्पीड़न
+    es: Acoso
+    ar: مضايقة
+    sort: 20
+  - code: fake_profile
+    en: Fake profile
+    hi: फ़र्ज़ी प्रोफ़ाइल
+    es: Perfil falso
+    ar: ملف شخصي مزيّف
+    sort: 30
+  - code: fraudulent_job
+    en: Fraudulent job or scam
+    hi: धोखाधड़ी वाली नौकरी
+    es: Oferta fraudulenta
+    ar: وظيفة احتيالية
+    sort: 40
+  - code: asks_for_money
+    en: Asks candidates for money
+    hi: उम्मीदवारों से पैसे माँगना
+    es: Solicita dinero a candidatos
+    ar: يطلب أموالًا من المرشحين
+    sort: 50
+  - code: irrelevant_contact
+    en: Irrelevant contact
+    hi: अप्रासंगिक संपर्क
+    es: Contacto irrelevante
+    ar: تواصل غير ذي صلة
+    sort: 60
+  - code: policy_violation
+    en: Policy violation
+    hi: नीति उल्लंघन
+    es: Incumplimiento de políticas
+    ar: مخالفة السياسات
+    sort: 70
+  - code: legal_order
+    en: Legal order
+    hi: कानूनी आदेश
+    es: Orden legal
+    ar: أمر قانوني
+    sort: 80
+  - code: employer_preference
+    en: Employer preference
+    hi: नियोक्ता की पसंद
+    es: Preferencia del empleador
+    ar: تفضيل صاحب العمل
+    sort: 90
+  - code: other
+    en: Other
+    hi: अन्य
+    es: Otro
+    ar: آخر
+    sort: 100
+  - code: not_interested
+    en: Not interested
+    sort: 10
+  - code: current_employer
+    en: Current employer
+    sort: 40
+  - code: fake_listing
+    en: Fake listing or company
+    sort: 50
+  - code: privacy
+    en: Privacy
+    sort: 60
+- name: report_reason
+  description: Reason a user gives when reporting content (job, post, profile, message).
+  tier: '1'
+  milestones:
+  - B24
+  values:
+  - code: inappropriate_content
+    en: Inappropriate content
+    hi: अनुचित सामग्री
+    es: Contenido inapropiado
+    ar: محتوى غير لائق
+    sort: 10
+  - code: misleading_information
+    en: Misleading information
+    hi: भ्रामक जानकारी
+    es: Información engañosa
+    ar: معلومات مضللة
+    sort: 20
+  - code: discrimination
+    en: Discriminatory content
+    hi: भेदभावपूर्ण सामग्री
+    es: Contenido discriminatorio
+    ar: محتوى تمييزي
+    sort: 30
+  - code: duplicate_listing
+    en: Duplicate listing
+    hi: दोहरी सूची
+    es: Anuncio duplicado
+    ar: إعلان مكرر
+    sort: 40
+  - code: suspected_scam
+    en: Suspected scam
+    hi: संदिग्ध धोखाधड़ी
+    es: Posible estafa
+    ar: اشتباه في احتيال
+    sort: 50
+  - code: copyright
+    en: Copyright infringement
+    hi: कॉपीराइट उल्लंघन
+    es: Infracción de derechos de autor
+    ar: انتهاك حقوق النشر
+    sort: 60
+  - code: privacy_violation
+    en: Privacy violation
+    hi: गोपनीयता उल्लंघन
+    es: Violación de privacidad
+    ar: انتهاك الخصوصية
+    sort: 70
+  - code: hate_speech
+    en: Hate speech
+    hi: घृणास्पद भाषण
+    es: Discurso de odio
+    ar: خطاب كراهية
+    sort: 80
+  - code: spam
+    en: Spam
+    hi: स्पैम
+    es: Spam
+    ar: بريد مزعج
+    sort: 90
+  - code: other
+    en: Other
+    hi: अन्य
+    es: Otro
+    ar: آخر
+    sort: 100
+  - code: harassment
+    en: Harassment
+    sort: 20
+    hi: उत्पीड़न
+  - code: hate
+    en: Hate speech
+    sort: 30
+    hi: घृणास्पद भाषण
+  - code: misinformation
+    en: Misinformation
+    sort: 40
+    hi: गलत जानकारी
+  - code: scam_fraud
+    en: Scam or fraud
+    sort: 50
+    hi: धोखाधड़ी
+  - code: adult
+    en: Adult content
+    sort: 60
+    hi: वयस्क सामग्री
+  - code: off_topic
+    en: Off topic
+    sort: 70
+    hi: विषय से बाहर
+  - code: impersonation
+    en: Impersonation
+    sort: 80
+    hi: प्रतिरूपण
+- name: qualification_level
+  description: Education level ladder (ISCED-aligned) used by qualification and education filters.
+  tier: '1'
+  milestones:
+  - B4
+  - B12
+  values:
+  - code: no_formal_education
+    en: No formal education
+    hi: कोई औपचारिक शिक्षा नहीं
+    es: Sin educación formal
+    ar: بدون تعليم رسمي
+    sort: 10
+  - code: primary
+    en: Primary school
+    hi: प्राथमिक
+    es: Primaria
+    ar: ابتدائي
+    sort: 20
+  - code: lower_secondary
+    en: Lower secondary (Class 10)
+    hi: माध्यमिक (कक्षा 10)
+    es: Secundaria básica
+    ar: إعدادي
+    sort: 30
+  - code: upper_secondary
+    en: Upper secondary (Class 12)
+    hi: उच्चतर माध्यमिक (कक्षा 12)
+    es: Bachillerato
+    ar: ثانوي
+    sort: 40
+  - code: diploma_vocational
+    en: Diploma or vocational
+    hi: डिप्लोमा या व्यावसायिक
+    es: Diploma o formación profesional
+    ar: دبلوم أو تدريب مهني
+    sort: 50
+  - code: bachelor
+    en: Bachelor's degree
+    hi: स्नातक
+    es: Grado
+    ar: بكالوريوس
+    sort: 60
+  - code: postgraduate_diploma
+    en: Postgraduate diploma
+    hi: स्नातकोत्तर डिप्लोमा
+    es: Diploma de posgrado
+    ar: دبلوم دراسات عليا
+    sort: 70
+  - code: master
+    en: Master's degree
+    hi: स्नातकोत्तर
+    es: Máster
+    ar: ماجستير
+    sort: 80
+  - code: doctorate
+    en: Doctorate
+    hi: डॉक्टरेट
+    es: Doctorado
+    ar: دكتوراه
+    sort: 90
+  - code: postdoctoral
+    en: Post-doctoral
+    hi: पोस्ट-डॉक्टरल
+    es: Posdoctorado
+    ar: ما بعد الدكتوراه
+    sort: 100
+- name: education_mode
+  description: Mode of study of a qualification.
+  tier: '1'
+  milestones:
+  - B12
+  values:
+  - code: full_time
+    en: Full-time
+    hi: पूर्णकालिक
+    es: Tiempo completo
+    sort: 10
+  - code: part_time
+    en: Part-time
+    hi: अंशकालिक
+    es: Tiempo parcial
+    sort: 20
+  - code: distance
+    en: Distance learning
+    hi: दूरस्थ शिक्षा
+    es: Educación a distancia
+    sort: 30
+  - code: online
+    en: Online
+    hi: ऑनलाइन
+    es: En línea
+    sort: 40
+  - code: executive
+    en: Executive programme
+    hi: कार्यकारी कार्यक्रम
+    es: Programa ejecutivo
+    sort: 50
+- name: institution_type
+  description: Type of education institution.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: university
+    en: University
+    hi: विश्वविद्यालय
+    sort: 10
+  - code: college
+    en: College
+    hi: महाविद्यालय
+    sort: 20
+  - code: school
+    en: School
+    hi: विद्यालय
+    sort: 30
+  - code: national_institute
+    en: National institute
+    hi: राष्ट्रीय संस्थान
+    sort: 40
+  - code: polytechnic
+    en: Polytechnic or ITI
+    hi: पॉलिटेक्निक या आईटीआई
+    sort: 50
+  - code: online_platform
+    en: Online learning platform
+    hi: ऑनलाइन शिक्षण मंच
+    sort: 60
+  - code: training_provider
+    en: Training provider
+    hi: प्रशिक्षण प्रदाता
+    sort: 70
+  - code: research_institute
+    en: Research institute
+    hi: अनुसंधान संस्थान
+    sort: 80
+- name: accreditation_status
+  description: Accreditation state of an institution.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: accredited
+    en: Accredited
+    hi: मान्यता प्राप्त
+    sort: 10
+  - code: provisionally_accredited
+    en: Provisionally accredited
+    hi: अनंतिम मान्यता
+    sort: 20
+  - code: accreditation_lapsed
+    en: Accreditation lapsed
+    hi: मान्यता समाप्त
+    sort: 30
+  - code: not_accredited
+    en: Not accredited
+    hi: मान्यता प्राप्त नहीं
+    sort: 40
+- name: skill_type
+  description: Classification of a skill entry.
+  tier: '1'
+  milestones:
+  - B12
+  values:
+  - code: technical
+    en: Technical skill
+    hi: तकनीकी कौशल
+    es: Habilidad técnica
+    sort: 10
+  - code: soft
+    en: Soft skill
+    hi: सॉफ्ट स्किल
+    es: Habilidad blanda
+    sort: 20
+  - code: tool_software
+    en: Tool or software
+    hi: उपकरण या सॉफ़्टवेयर
+    es: Herramienta o software
+    sort: 30
+  - code: domain_knowledge
+    en: Domain knowledge
+    hi: क्षेत्रीय ज्ञान
+    es: Conocimiento del dominio
+    sort: 40
+  - code: language_skill
+    en: Language skill
+    hi: भाषा कौशल
+    es: Habilidad lingüística
+    sort: 50
+  - code: certification_skill
+    en: Certification
+    hi: प्रमाणन
+    es: Certificación
+    sort: 60
+- name: skill_taxonomy_source
+  description: Origin of a skill entry or of its external taxonomy reference.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: internal
+    en: Internal curation
+    hi: आंतरिक संकलन
+    sort: 10
+  - code: esco
+    en: ESCO
+    hi: ईएससीओ
+    sort: 20
+  - code: onet
+    en: O*NET
+    hi: ओ*नेट
+    sort: 30
+  - code: lightcast
+    en: Lightcast
+    hi: लाइटकास्ट
+    sort: 40
+  - code: user_suggested
+    en: User suggested
+    hi: उपयोगकर्ता द्वारा सुझाया गया
+    sort: 50
+- name: skill_relation_type
+  description: Edge type between two skills in the skill graph.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: related
+    en: Related
+    hi: संबंधित
+    sort: 10
+  - code: parent
+    en: Parent skill
+    hi: मूल कौशल
+    sort: 20
+  - code: prerequisite
+    en: Prerequisite
+    hi: पूर्वापेक्षा
+    sort: 30
+  - code: implies
+    en: Implies
+    hi: अर्थ रखता है
+    sort: 40
+  - code: substitute
+    en: Substitute
+    hi: विकल्प
+    sort: 50
+- name: skill_importance
+  description: How important a skill is for a role (job_role_skill).
+  tier: X
+  milestones:
+  - B6
+  values:
+  - code: required
+    en: Required
+    hi: आवश्यक
+    es: Obligatorio
+    sort: 10
+  - code: preferred
+    en: Preferred
+    hi: वरीय
+    es: Preferido
+    sort: 20
+  - code: nice_to_have
+    en: Nice to have
+    hi: वांछनीय
+    es: Deseable
+    sort: 30
+- name: alias_kind
+  description: Kind of alias recorded for skills, roles, institutions and employers.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: synonym
+    en: Synonym
+    hi: पर्यायवाची
+    sort: 10
+  - code: abbreviation
+    en: Abbreviation
+    hi: संक्षिप्त रूप
+    sort: 20
+  - code: misspelling
+    en: Common misspelling
+    hi: सामान्य वर्तनी त्रुटि
+    sort: 30
+  - code: former_name
+    en: Former name
+    hi: पूर्व नाम
+    sort: 40
+  - code: translation
+    en: Translation
+    hi: अनुवाद
+    sort: 50
+  - code: transliteration
+    en: Transliteration
+    hi: लिप्यंतरण
+    sort: 60
+- name: subdivision_type
+  description: Administrative type of a state_region (state, union territory, province...).
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: state
+    en: State
+    hi: राज्य
+    sort: 10
+  - code: union_territory
+    en: Union territory
+    hi: केंद्र शासित प्रदेश
+    sort: 20
+  - code: province
+    en: Province
+    hi: प्रांत
+    sort: 30
+  - code: region
+    en: Region
+    hi: क्षेत्र
+    sort: 40
+  - code: territory
+    en: Territory
+    hi: क्षेत्राधिकार
+    sort: 50
+  - code: emirate
+    en: Emirate
+    hi: अमीरात
+    sort: 60
+  - code: prefecture
+    en: Prefecture
+    hi: प्रीफेक्चर
+    sort: 70
+  - code: county
+    en: County
+    hi: काउंटी
+    sort: 80
+- name: place_type
+  description: Settlement class of a city row.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: metropolis
+    en: Metropolis
+    hi: महानगर
+    sort: 10
+  - code: city
+    en: City
+    hi: शहर
+    sort: 20
+  - code: town
+    en: Town
+    hi: कस्बा
+    sort: 30
+  - code: census_town
+    en: Census town
+    hi: जनगणना कस्बा
+    sort: 40
+  - code: village
+    en: Village
+    hi: गाँव
+    sort: 50
+- name: text_direction
+  description: Script writing direction of a language.
+  tier: '1'
+  milestones:
+  - B2
+  values:
+  - code: ltr
+    en: Left to right
+    hi: बाएँ से दाएँ
+    ar: من اليسار إلى اليمين
+    sort: 10
+  - code: rtl
+    en: Right to left
+    hi: दाएँ से बाएँ
+    ar: من اليمين إلى اليسار
+    sort: 20
+- name: industry_scheme
+  description: Classification scheme an industry node maps to.
+  tier: X
+  milestones:
+  - B2
+  values:
+  - code: internal
+    en: Internal
+    hi: आंतरिक
+    sort: 10
+  - code: nic_2008
+    en: NIC 2008 (India)
+    hi: एनआईसी 2008
+    sort: 20
+  - code: naics_2022
+    en: NAICS 2022
+    hi: नैक्स 2022
+    sort: 30
+  - code: isic_rev4
+    en: ISIC Rev. 4
+    hi: आईएसआईसी रेव. 4
+    sort: 40
+  - code: gics
+    en: GICS
+    hi: जीआईसीएस
+    sort: 50
+- name: tax_id_subject
+  description: Whom a tax or registration identifier type applies to.
+  tier: '1'
+  milestones:
+  - B25
+  values:
+  - code: individual
+    en: Individual
+    hi: व्यक्ति
+    sort: 10
+  - code: organisation
+    en: Organisation
+    hi: संगठन
+    sort: 20
+  - code: both
+    en: Individual or organisation
+    hi: व्यक्ति या संगठन
+    sort: 30
+- name: tax_id_checksum
+  description: Checksum algorithm used to validate a tax id after regex match.
+  tier: '1'
+  milestones:
+  - B25
+  values:
+  - code: none
+    en: No checksum
+    hi: कोई चेकसम नहीं
+    sort: 10
+  - code: luhn
+    en: Luhn
+    hi: लुह्न
+    sort: 20
+  - code: mod_97
+    en: ISO 7064 MOD 97-10
+    hi: मॉड 97-10
+    sort: 30
+  - code: mod_11
+    en: Modulus 11
+    hi: मॉड्यूलस 11
+    sort: 40
+  - code: mod_36
+    en: Modulus 36 (GSTIN)
+    hi: मॉड्यूलस 36 (जीएसटीआईएन)
+    sort: 50
+  - code: verhoeff
+    en: Verhoeff
+    hi: वर्हॉफ़
+    sort: 60
+- name: ui_label_context
+  description: Surface where a UI string appears (drives translation workflow and length limits).
+  tier: '1'
+  milestones:
+  - B2
+  values:
+  - code: web_candidate
+    en: Candidate web app
+    hi: उम्मीदवार वेब ऐप
+    sort: 10
+  - code: web_employer
+    en: Employer web app
+    hi: नियोक्ता वेब ऐप
+    sort: 20
+  - code: mobile_app
+    en: Mobile app
+    hi: मोबाइल ऐप
+    sort: 30
+  - code: email_template
+    en: Email template
+    hi: ईमेल टेम्पलेट
+    sort: 40
+  - code: sms_template
+    en: SMS template
+    hi: एसएमएस टेम्पलेट
+    sort: 50
+  - code: notification
+    en: Notification
+    hi: सूचना
+    sort: 60
+  - code: error_message
+    en: Error message
+    hi: त्रुटि संदेश
+    sort: 70
+  - code: legal_text
+    en: Legal text
+    hi: कानूनी पाठ
+    sort: 80
+  - code: admin_console
+    en: Admin console
+    hi: एडमिन कंसोल
+    sort: 90
+- name: translation_status
+  description: Workflow state of a ui_label_translation.
+  tier: '1'
+  milestones:
+  - B2
+  values:
+  - code: machine_translated
+    en: Machine translated
+    hi: मशीन अनुवादित
+    sort: 10
+  - code: human_translated
+    en: Human translated
+    hi: मानव अनुवादित
+    sort: 20
+  - code: reviewed
+    en: Reviewed
+    hi: समीक्षित
+    sort: 30
+  - code: approved
+    en: Approved
+    hi: अनुमोदित
+    sort: 40
+  - code: outdated
+    en: Outdated (source changed)
+    hi: पुराना (स्रोत बदला)
+    sort: 50
+- name: company_size_band
+  description: Employee-count band of an organisation (LinkedIn company size bands).
+  tier: X
+  milestones:
+  - B25
+  values:
+  - code: size_1
+    en: 1 employee
+    hi: 1 कर्मचारी
+    sort: 10
+  - code: size_2_10
+    en: 2-10 employees
+    hi: 2-10 कर्मचारी
+    sort: 20
+  - code: size_11_50
+    en: 11-50 employees
+    hi: 11-50 कर्मचारी
+    sort: 30
+  - code: size_51_200
+    en: 51-200 employees
+    hi: 51-200 कर्मचारी
+    sort: 40
+  - code: size_201_500
+    en: 201-500 employees
+    hi: 201-500 कर्मचारी
+    sort: 50
+  - code: size_501_1000
+    en: 501-1,000 employees
+    hi: 501-1,000 कर्मचारी
+    sort: 60
+  - code: size_1001_5000
+    en: 1,001-5,000 employees
+    hi: 1,001-5,000 कर्मचारी
+    sort: 70
+  - code: size_5001_10000
+    en: 5,001-10,000 employees
+    hi: 5,001-10,000 कर्मचारी
+    sort: 80
+  - code: size_10001_plus
+    en: 10,001+ employees
+    hi: 10,001+ कर्मचारी
+    sort: 90
+- name: phone_type
+  description: Kind of phone number.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: mobile
+    en: Mobile
+    hi: मोबाइल
+    es: Móvil
+    sort: 10
+  - code: landline
+    en: Landline
+    hi: लैंडलाइन
+    es: Fijo
+    sort: 20
+  - code: toll_free
+    en: Toll-free
+    hi: टोल-फ्री
+    es: Línea gratuita
+    sort: 30
+  - code: voip
+    en: VoIP
+    hi: वीओआईपी
+    es: VoIP
+    sort: 40
+  - code: whatsapp
+    en: WhatsApp-enabled mobile
+    hi: व्हाट्सऐप मोबाइल
+    sort: 30
+- name: social_link_type
+  description: Kind of external profile link.
+  tier: X
+  milestones:
+  - B12
+  values:
+  - code: linkedin
+    en: LinkedIn
+    hi: लिंक्डइन
+    sort: 10
+  - code: github
+    en: GitHub
+    hi: गिटहब
+    sort: 20
+  - code: stackoverflow
+    en: Stack Overflow
+    hi: स्टैक ओवरफ़्लो
+    sort: 30
+  - code: behance
+    en: Behance
+    hi: बिहांस
+    sort: 40
+  - code: twitter_x
+    en: X (Twitter)
+    hi: एक्स (ट्विटर)
+    sort: 50
+  - code: personal_website
+    en: Personal website
+    hi: व्यक्तिगत वेबसाइट
+    sort: 60
+  - code: other
+    en: Other
+    hi: अन्य
+    sort: 70
+tables:
+- name: time_zone
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: IANA time zone catalogue used for display (store timestamps in UTC, show in zone).
+  columns:
+  - name: iana_name
+    type: STRING(64)
+    domain: time_zone
+    sens: Public
+    desc: IANA tz database name, e.g. Asia/Kolkata.
+    'null': false
+  - name: display_name
+    type: STRING(100)
+    domain: free_text
+    sens: Public
+    desc: English display label, e.g. India Standard Time.
+    'null': false
+  - name: standard_utc_offset_minutes
+    type: INT4
+    domain: quantity
+    sens: Public
+    desc: Standard (non-DST) offset from UTC in minutes, e.g. 330.
+    'null': false
+  - name: observes_dst
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True when the zone shifts for daylight saving time.
+    'null': false
+    default: 'false'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired/aliased zone, kept for old rows.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_time_zone_iana_name
+    type: unique
+    columns:
+    - iana_name
+    desc: Natural key.
+  - name: ck_time_zone_offset_range
+    type: check
+    expr: standard_utc_offset_minutes BETWEEN -720 AND 840
+    desc: Real-world UTC offsets.
+  - name: ck_time_zone_iana_format
+    type: check
+    expr: iana_name ~ '^[A-Za-z0-9_+/-]{1,64}$'
+    desc: IANA identifier characters only.
+- name: currency
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B12
+  - B14
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: ISO 4217 currency; minor_unit drives rounding of every money column system-wide.
+  columns:
+  - name: currency_code
+    type: STRING(3)
+    domain: currency_code
+    sens: Public
+    desc: ISO 4217 alphabetic code, e.g. INR.
+    'null': false
+  - name: iso_numeric
+    type: STRING(3)
+    domain: free_text
+    sens: Public
+    desc: ISO 4217 numeric code, e.g. 356.
+    'null': false
+  - name: display_name
+    type: STRING(100)
+    domain: free_text
+    sens: Public
+    desc: English currency name.
+    'null': false
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: symbol
+    type: STRING(8)
+    domain: free_text
+    sens: Public
+    desc: Display symbol, e.g. the rupee sign.
+    'null': false
+  - name: minor_unit
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: 'ISO 4217 minor-unit exponent: digits after the decimal point (JPY 0, INR 2, KWD 3).'
+    'null': false
+  - name: is_billable
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True when invoices and wallet balances may be denominated in this currency.
+    'null': false
+    default: 'false'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired currency (e.g. replaced by euro), kept for history.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_currency_currency_code
+    type: unique
+    columns:
+    - currency_code
+    desc: Natural key.
+  - name: uq_currency_iso_numeric
+    type: unique
+    columns:
+    - iso_numeric
+    desc: ISO numeric is unique.
+  - name: ck_currency_code_format
+    type: check
+    expr: currency_code ~ '^[A-Z]{3}$'
+    desc: Three upper-case letters.
+  - name: ck_currency_numeric_format
+    type: check
+    expr: iso_numeric ~ '^[0-9]{3}$'
+    desc: Three digits.
+  - name: ck_currency_minor_unit_range
+    type: check
+    expr: minor_unit BETWEEN 0 AND 4
+    desc: ISO 4217 exponent 0-4.
+  - name: ck_currency_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+- name: language
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: 'Languages known to the platform: UI languages, resume/content languages, proficiency languages. Drives i18n fallback.'
+  columns:
+  - name: language_tag
+    type: STRING(35)
+    domain: language_tag
+    sens: Public
+    desc: BCP 47 tag, e.g. en, hi, pt-BR; primary key of the i18n system.
+    'null': false
+  - name: iso639_1
+    type: STRING(2)
+    domain: free_text
+    sens: Public
+    desc: ISO 639-1 code.
+    'null': true
+    null_why: NULL = language has no ISO 639-1 two-letter code (only 639-3).
+  - name: iso639_3
+    type: STRING(3)
+    domain: free_text
+    sens: Public
+    desc: ISO 639-3 three-letter code.
+    'null': false
+  - name: display_name
+    type: STRING(100)
+    domain: free_text
+    sens: Public
+    desc: English name of the language.
+    'null': false
+  - name: native_name
+    type: STRING(100)
+    domain: free_text
+    sens: Public
+    desc: Name in the language itself (autonym), e.g. Hindi in Devanagari.
+    'null': false
+  - name: script_code
+    type: STRING(4)
+    domain: free_text
+    sens: Public
+    desc: ISO 15924 script, e.g. Latn, Deva, Arab.
+    'null': false
+  - name: text_direction_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Writing direction (ltr/rtl) for layout mirroring.
+    'null': false
+  - name: fallback_language_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Next language to try when a translation is missing; chain ends at the default language (en).
+    'null': true
+    null_why: NULL only for the default language (end of fallback chain).
+  - name: is_ui_supported
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True when the UI is translated into this language (selectable in preferences).
+    'null': false
+    default: 'false'
+  - name: is_default
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True for the single platform default language (en); end of every fallback chain.
+    'null': false
+    default: 'false'
+  - name: is_content_supported
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True when users may tag resumes/job text with this language.
+    'null': false
+    default: 'true'
+  - name: sort_order
+    type: INT4
+    domain: quantity
+    sens: Public
+    desc: Display order in language pickers.
+    'null': false
+    default: '0'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired language, kept for history.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_language_language_tag
+    type: unique
+    columns:
+    - language_tag
+    desc: Natural key.
+  - name: ck_language_tag_format
+    type: check
+    expr: language_tag ~ '^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$'
+    desc: BCP 47 shape.
+  - name: ck_language_fallback_not_self
+    type: check
+    expr: fallback_language_id IS NULL OR fallback_language_id <> id
+    desc: A language cannot fall back to itself.
+  - name: ck_language_default_is_root
+    type: check
+    expr: NOT is_default OR (is_ui_supported AND fallback_language_id IS NULL)
+    desc: Default language is UI-supported and terminates the chain.
+  - name: ck_language_nondefault_has_fallback
+    type: check
+    expr: is_default OR fallback_language_id IS NOT NULL
+    desc: Every non-default language declares a fallback, so the chain always reaches the default.
+  indexes:
+  - name: uq_language_is_default
+    columns:
+    - is_default
+    desc: Exactly one default language (partial unique).
+    unique: true
+    where: is_default
+  - name: idx_language_is_ui_supported_sort_order
+    columns:
+    - is_ui_supported
+    - sort_order
+    desc: UI language picker.
+    where: is_ui_supported AND is_active
+  - name: idx_language_text_direction_id
+    columns:
+    - text_direction_id
+    desc: Supports FK fk_language_text_direction_id (join and delete checks).
+  - name: idx_language_fallback_language_id
+    columns:
+    - fallback_language_id
+    desc: Supports FK fk_language_fallback_language_id (join and delete checks).
+  fks:
+  - name: fk_language_text_direction_id
+    columns:
+    - text_direction_id
+    ref: text_direction
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Writing direction (ltr/rtl) for layout mirroring.
+  - name: fk_language_fallback_language_id
+    columns:
+    - fallback_language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Next language to try when a translation is missing; chain ends at the default language (en).
+- name: country
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B12
+  - B25
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: ISO 3166-1 country with telephony, currency, language, privacy-regime and operating-market flags.
+  columns:
+  - name: iso2_code
+    type: STRING(2)
+    domain: code
+    sens: Public
+    desc: ISO 3166-1 alpha-2, e.g. IN.
+    'null': false
+  - name: iso3_code
+    type: STRING(3)
+    domain: code
+    sens: Public
+    desc: ISO 3166-1 alpha-3, e.g. IND.
+    'null': false
+  - name: iso_numeric_code
+    type: STRING(3)
+    domain: code
+    sens: Public
+    desc: ISO 3166-1 numeric, e.g. 356.
+    'null': false
+  - name: display_name
+    type: STRING(100)
+    domain: free_text
+    sens: Public
+    desc: English short name.
+    'null': false
+  - name: native_name
+    type: STRING(100)
+    domain: free_text
+    sens: Public
+    desc: Official/native name; may use non-Latin script.
+    'null': false
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: calling_code
+    type: STRING(6)
+    domain: code
+    sens: Public
+    desc: International dialling prefix digits without plus, e.g. 91 (shared codes such as 1 allowed).
+    'null': false
+  - name: continent_code
+    type: STRING(2)
+    domain: free_text
+    sens: Public
+    desc: Continent code AF, AN, AS, EU, NA, OC, SA.
+    'null': false
+  - name: postal_code_regex
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Regex a postal code must match.
+    'null': true
+    null_why: NULL = country has no postal codes or format not curated.
+  - name: is_eea
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True for EU/EEA/UK-style GDPR jurisdictions (drives consent defaults).
+    'null': false
+    default: 'false'
+  - name: is_operating_market
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True when employers/candidates may register in this country.
+    'null': false
+    default: 'false'
+  - name: centroid_latitude
+    type: DECIMAL(9,6)
+    domain: latitude
+    sens: Public
+    desc: Country centroid latitude (WGS84, 6 decimals ~ 0.1 m).
+    'null': true
+    null_why: NULL = centroid not curated.
+  - name: centroid_longitude
+    type: DECIMAL(9,6)
+    domain: longitude
+    sens: Public
+    desc: Country centroid longitude (WGS84).
+    'null': true
+    null_why: NULL = centroid not curated.
+  - name: geo_source_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Source of the centroid coordinates.
+    'null': true
+    null_why: NULL when no centroid stored.
+  - name: default_currency_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Currency pre-selected for this country.
+    'null': false
+  - name: default_language_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Language pre-selected for this country.
+    'null': true
+    null_why: NULL where no single dominant language is configured.
+  - name: default_time_zone_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Time zone pre-selected; countries with several zones keep the capital's.
+    'null': true
+    null_why: NULL if country spans many zones with no capital default.
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired (e.g. dissolved country), kept for history.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_country_iso2_code
+    type: unique
+    columns:
+    - iso2_code
+    desc: ISO alpha-2 natural key.
+  - name: uq_country_iso3_code
+    type: unique
+    columns:
+    - iso3_code
+    desc: ISO alpha-3 natural key.
+  - name: uq_country_iso_numeric_code
+    type: unique
+    columns:
+    - iso_numeric_code
+    desc: ISO numeric natural key.
+  - name: ck_country_iso2_format
+    type: check
+    expr: iso2_code ~ '^[A-Z]{2}$'
+    desc: Two upper-case letters.
+  - name: ck_country_iso3_format
+    type: check
+    expr: iso3_code ~ '^[A-Z]{3}$'
+    desc: Three upper-case letters.
+  - name: ck_country_calling_code_format
+    type: check
+    expr: calling_code ~ '^[1-9][0-9]{0,5}$'
+    desc: E.164 country calling code digits.
+  - name: ck_country_centroid_latitude_range
+    type: check
+    expr: centroid_latitude IS NULL OR centroid_latitude BETWEEN -90 AND 90
+    desc: Latitude range.
+  - name: ck_country_centroid_longitude_range
+    type: check
+    expr: centroid_longitude IS NULL OR centroid_longitude BETWEEN -180 AND 180
+    desc: Longitude range.
+  - name: ck_country_centroid_pair
+    type: check
+    expr: (centroid_latitude IS NULL) = (centroid_longitude IS NULL)
+    desc: Both or neither coordinate.
+  - name: ck_country_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_country_calling_code
+    columns:
+    - calling_code
+    desc: 'Phone input: find countries by dialling prefix.'
+  - name: idx_country_display_name
+    columns:
+    - display_name
+    desc: Alphabetical country picker.
+    where: is_active
+  - name: idx_country_is_operating_market_display_name
+    columns:
+    - is_operating_market
+    - display_name
+    desc: Operating-market picker.
+    where: is_operating_market
+  - name: idx_country_geo_source_id
+    columns:
+    - geo_source_id
+    desc: Supports FK fk_country_geo_source_id (join and delete checks).
+  - name: idx_country_default_currency_id
+    columns:
+    - default_currency_id
+    desc: Supports FK fk_country_default_currency_id (join and delete checks).
+  - name: idx_country_default_language_id
+    columns:
+    - default_language_id
+    desc: Supports FK fk_country_default_language_id (join and delete checks).
+  - name: idx_country_default_time_zone_id
+    columns:
+    - default_time_zone_id
+    desc: Supports FK fk_country_default_time_zone_id (join and delete checks).
+  fks:
+  - name: fk_country_geo_source_id
+    columns:
+    - geo_source_id
+    ref: geo_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Source of the centroid coordinates.
+  - name: fk_country_default_currency_id
+    columns:
+    - default_currency_id
+    ref: currency
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Currency pre-selected for this country.
+  - name: fk_country_default_language_id
+    columns:
+    - default_language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Language pre-selected for this country.
+  - name: fk_country_default_time_zone_id
+    columns:
+    - default_time_zone_id
+    ref: time_zone
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Time zone pre-selected; countries with several zones keep the capital's.
+- name: country_language
+  kind: link
+  delete_policy: hard
+  volume: low
+  tier: X
+  milestones:
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Languages spoken in a country (official/primary flags) used to preselect resume and UI languages.
+  columns:
+  - name: country_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Owning country.
+    'null': false
+  - name: language_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Language spoken.
+    'null': false
+  - name: is_official
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Official language of the country.
+    'null': false
+    default: 'false'
+  - name: is_primary
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Most widely used language (one per country).
+    'null': false
+    default: 'false'
+  constraints:
+  - name: uq_country_language_country_id_language_id
+    type: unique
+    columns:
+    - country_id
+    - language_id
+    desc: A language is listed once per country.
+  indexes:
+  - name: uq_country_language_country_id
+    columns:
+    - country_id
+    desc: At most one primary language per country.
+    unique: true
+    where: is_primary
+  - name: idx_country_language_language_id
+    columns:
+    - language_id
+    desc: 'Reverse lookup: countries using a language.'
+  fks:
+  - name: fk_country_language_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Owning country.
+  - name: fk_country_language_language_id
+    columns:
+    - language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Language spoken.
+- name: state_region
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B12
+  - B25
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: First-level administrative division (state, union territory, province) of a country.
+  columns:
+  - name: country_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Country the division belongs to.
+    'null': false
+  - name: subdivision_type_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Administrative type (state, UT, province...).
+    'null': false
+  - name: subdivision_code
+    type: STRING(10)
+    domain: code
+    sens: Public
+    desc: ISO 3166-2 suffix, e.g. KA for IN-KA.
+    'null': false
+  - name: display_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: English name.
+    'null': false
+  - name: native_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Local-script name.
+    'null': true
+    null_why: NULL = same as English or not curated.
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: gst_state_code
+    type: STRING(2)
+    domain: free_text
+    sens: Public
+    desc: India GST two-digit state code used in GSTIN prefix validation.
+    'null': true
+    null_why: NULL outside India (GST state code does not exist).
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired division.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_state_region_country_id_subdivision_code
+    type: unique
+    columns:
+    - country_id
+    - subdivision_code
+    desc: ISO 3166-2 code unique within country.
+  - name: uq_state_region_country_id_id
+    type: unique
+    columns:
+    - country_id
+    - id
+    desc: Target of composite FK from city so a city's state belongs to the same country.
+  - name: ck_state_region_gst_code_format
+    type: check
+    expr: gst_state_code IS NULL OR gst_state_code ~ '^[0-9]{2}$'
+    desc: Two digits.
+  - name: ck_state_region_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_state_region_country_id_display_name
+    columns:
+    - country_id
+    - display_name
+    desc: State picker per country.
+    where: is_active
+  - name: idx_state_region_subdivision_type_id
+    columns:
+    - subdivision_type_id
+    desc: Supports FK fk_state_region_subdivision_type_id (join and delete checks).
+  fks:
+  - name: fk_state_region_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Country the division belongs to.
+  - name: fk_state_region_subdivision_type_id
+    columns:
+    - subdivision_type_id
+    ref: subdivision_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Administrative type (state, UT, province...).
+- name: city
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B2
+  - B6
+  - B12
+  - B14
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: City/town/village place used for candidate location, job location and search filters (GeoNames-aligned).
+  columns:
+  - name: country_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Country (always set; also enforced equal to the state's country via composite FK).
+    'null': false
+  - name: state_region_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: State/UT; composite FK (country_id,state_region_id) keeps it in the same country.
+    'null': true
+    null_why: NULL for city-states (e.g. Singapore) and places without a first-level division.
+  - name: place_type_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Settlement class.
+    'null': false
+  - name: time_zone_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Time zone of the place.
+    'null': true
+    null_why: NULL = inherit the country default time zone.
+  - name: geo_source_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Stated source of the coordinates.
+    'null': true
+    null_why: NULL when the city has no coordinates yet.
+  - name: display_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Name as shown in English.
+    'null': false
+  - name: ascii_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Transliterated ASCII name for search and sorting.
+    'null': false
+  - name: native_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Local-script name.
+    'null': true
+    null_why: NULL = same as display_name.
+  - name: name_search
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased ascii_name, STORED computed for prefix and trigram search.
+    'null': false
+    computed: lower(ascii_name)
+    stored: true
+  - name: geoname_ref
+    type: STRING(20)
+    domain: code
+    sens: Public
+    desc: GeoNames id (external reference, not a DB key).
+    'null': true
+    null_why: NULL = place not mapped to GeoNames.
+  - name: population
+    type: INT8
+    domain: quantity
+    sens: Public
+    desc: Population estimate for ranking suggestions.
+    'null': true
+    null_why: NULL = unknown (not zero).
+  - name: latitude
+    type: DECIMAL(9,6)
+    domain: latitude
+    sens: Public
+    desc: City centre latitude (WGS84, 6 decimals).
+    'null': true
+    null_why: NULL = coordinates not known.
+  - name: longitude
+    type: DECIMAL(9,6)
+    domain: longitude
+    sens: Public
+    desc: City centre longitude (WGS84, 6 decimals).
+    'null': true
+    null_why: NULL = coordinates not known.
+  - name: city_tier
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: India city tier 1-3 used by salary/HRA-style filters.
+    'null': true
+    null_why: NULL = tier not applicable (outside India) or unclassified.
+  - name: is_metro
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Metropolitan hub shown in 'popular cities' shortcuts.
+    'null': false
+    default: 'false'
+  - name: is_popular
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Pinned in location pickers.
+    'null': false
+    default: 'false'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired/merged place.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_city_country_id_state_region_id_ascii_name
+    type: unique
+    columns:
+    - country_id
+    - state_region_id
+    - ascii_name
+    desc: No two cities share a name inside a state.
+  - name: ck_city_latitude_range
+    type: check
+    expr: latitude IS NULL OR latitude BETWEEN -90 AND 90
+    desc: Latitude range.
+  - name: ck_city_longitude_range
+    type: check
+    expr: longitude IS NULL OR longitude BETWEEN -180 AND 180
+    desc: Longitude range.
+  - name: ck_city_coordinate_pair
+    type: check
+    expr: (latitude IS NULL) = (longitude IS NULL)
+    desc: Both or neither coordinate.
+  - name: ck_city_geo_source_when_coordinates
+    type: check
+    expr: latitude IS NULL OR geo_source_id IS NOT NULL
+    desc: Stated source required whenever coordinates exist.
+  - name: ck_city_tier_range
+    type: check
+    expr: city_tier IS NULL OR city_tier BETWEEN 1 AND 3
+    desc: Tier 1-3.
+  - name: ck_city_population_nonneg
+    type: check
+    expr: population IS NULL OR population >= 0
+    desc: Population non-negative.
+  indexes:
+  - name: uq_city_country_id_ascii_name
+    columns:
+    - country_id
+    - ascii_name
+    desc: No duplicate state-less city per country.
+    unique: true
+    where: state_region_id IS NULL
+  - name: uq_city_geoname_ref
+    columns:
+    - geoname_ref
+    desc: GeoNames id unique when present.
+    unique: true
+    where: geoname_ref IS NOT NULL
+  - name: idx_city_name_search
+    columns:
+    - name_search
+    desc: CRDB trigram GIN index for typeahead substring/fuzzy search (pg_trgm opclass, v22.2+).
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_city_country_id_name_search
+    columns:
+    - country_id
+    - name_search
+    desc: Prefix typeahead within a country.
+    where: is_active
+  - name: idx_city_state_region_id_display_name
+    columns:
+    - state_region_id
+    - display_name
+    desc: Cities of a state.
+    where: is_active
+  - name: idx_city_is_popular_country_id
+    columns:
+    - is_popular
+    - country_id
+    desc: Popular-city shortcuts.
+    where: is_popular
+  - name: idx_city_place_type_id
+    columns:
+    - place_type_id
+    desc: Supports FK fk_city_place_type_id (join and delete checks).
+  - name: idx_city_time_zone_id
+    columns:
+    - time_zone_id
+    desc: Supports FK fk_city_time_zone_id (join and delete checks).
+  - name: idx_city_geo_source_id
+    columns:
+    - geo_source_id
+    desc: Supports FK fk_city_geo_source_id (join and delete checks).
+  fks:
+  - name: fk_city_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Country (always set; also enforced equal to the state's country via composite FK).
+  - name: fk_city_state_region_id
+    columns:
+    - state_region_id
+    ref: state_region
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: State/UT; composite FK (country_id,state_region_id) keeps it in the same country.
+  - name: fk_city_place_type_id
+    columns:
+    - place_type_id
+    ref: place_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Settlement class.
+  - name: fk_city_time_zone_id
+    columns:
+    - time_zone_id
+    ref: time_zone
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Time zone of the place.
+  - name: fk_city_geo_source_id
+    columns:
+    - geo_source_id
+    ref: geo_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Stated source of the coordinates.
+  - name: fk_city_country_state
+    columns:
+    - country_id
+    - state_region_id
+    ref: state_region
+    ref_columns:
+    - country_id
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: 'State must belong to the same country (MATCH SIMPLE: skipped when state is NULL).'
+- name: locality
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B12
+  - B14
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Neighbourhood/area within a city (e.g. Koramangala) for fine-grained job and address search.
+  columns:
+  - name: city_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Parent city.
+    'null': false
+  - name: display_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: English area name.
+    'null': false
+  - name: ascii_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: ASCII form for search.
+    'null': false
+  - name: name_search
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased ascii_name for typeahead.
+    'null': false
+    computed: lower(ascii_name)
+    stored: true
+  - name: latitude
+    type: DECIMAL(9,6)
+    domain: latitude
+    sens: Public
+    desc: Area centroid latitude.
+    'null': true
+    null_why: NULL = not known.
+  - name: longitude
+    type: DECIMAL(9,6)
+    domain: longitude
+    sens: Public
+    desc: Area centroid longitude.
+    'null': true
+    null_why: NULL = not known.
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired area.
+    'null': false
+    default: 'true'
+  - name: geo_source_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Source of coordinates.
+    'null': true
+    null_why: NULL when no coordinates.
+  constraints:
+  - name: uq_locality_city_id_ascii_name
+    type: unique
+    columns:
+    - city_id
+    - ascii_name
+    desc: Area name unique within a city.
+  - name: ck_locality_latitude_range
+    type: check
+    expr: latitude IS NULL OR latitude BETWEEN -90 AND 90
+    desc: Latitude range.
+  - name: ck_locality_longitude_range
+    type: check
+    expr: longitude IS NULL OR longitude BETWEEN -180 AND 180
+    desc: Longitude range.
+  - name: ck_locality_coordinate_pair
+    type: check
+    expr: (latitude IS NULL) = (longitude IS NULL)
+    desc: Both or neither.
+  indexes:
+  - name: idx_locality_name_search
+    columns:
+    - name_search
+    desc: Trigram typeahead.
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_locality_geo_source_id
+    columns:
+    - geo_source_id
+    desc: Supports FK fk_locality_geo_source_id (join and delete checks).
+  fks:
+  - name: fk_locality_city_id
+    columns:
+    - city_id
+    ref: city
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Parent city.
+  - name: fk_locality_geo_source_id
+    columns:
+    - geo_source_id
+    ref: geo_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Source of coordinates.
+- name: postal_code
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B12
+  - B25
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Postal/PIN/ZIP code to area mapping (India PIN has many post offices per code).
+  columns:
+  - name: country_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Country the code belongs to.
+    'null': false
+  - name: city_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: City the code serves.
+    'null': true
+    null_why: NULL = code spans several cities or city not resolved.
+  - name: locality_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Primary locality of the code.
+    'null': true
+    null_why: NULL = not resolved to a locality.
+  - name: postal_code
+    type: STRING(12)
+    domain: code
+    sens: Public
+    desc: Postal code as printed, normalised upper-case without spaces.
+    'null': false
+  - name: area_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Post office/area name distinguishing rows sharing a code.
+    'null': false
+  - name: latitude
+    type: DECIMAL(9,6)
+    domain: latitude
+    sens: Public
+    desc: Postal area centroid latitude.
+    'null': true
+    null_why: NULL = not known.
+  - name: longitude
+    type: DECIMAL(9,6)
+    domain: longitude
+    sens: Public
+    desc: Postal area centroid longitude.
+    'null': true
+    null_why: NULL = not known.
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = discontinued code.
+    'null': false
+    default: 'true'
+  - name: geo_source_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Source of coordinates.
+    'null': true
+    null_why: NULL when no coordinates.
+  constraints:
+  - name: uq_postal_code_country_id_postal_code_area_name
+    type: unique
+    columns:
+    - country_id
+    - postal_code
+    - area_name
+    desc: A code/area pair is stored once per country.
+  - name: ck_postal_code_latitude_range
+    type: check
+    expr: latitude IS NULL OR latitude BETWEEN -90 AND 90
+    desc: Latitude range.
+  - name: ck_postal_code_longitude_range
+    type: check
+    expr: longitude IS NULL OR longitude BETWEEN -180 AND 180
+    desc: Longitude range.
+  - name: ck_postal_code_coordinate_pair
+    type: check
+    expr: (latitude IS NULL) = (longitude IS NULL)
+    desc: Both or neither.
+  indexes:
+  - name: idx_postal_code_country_id_postal_code
+    columns:
+    - country_id
+    - postal_code
+    desc: Postal code lookup (autofill city/state).
+  - name: idx_postal_code_city_id
+    columns:
+    - city_id
+    desc: Supports FK fk_postal_code_city_id (join and delete checks).
+  - name: idx_postal_code_locality_id
+    columns:
+    - locality_id
+    desc: Supports FK fk_postal_code_locality_id (join and delete checks).
+  - name: idx_postal_code_geo_source_id
+    columns:
+    - geo_source_id
+    desc: Supports FK fk_postal_code_geo_source_id (join and delete checks).
+  fks:
+  - name: fk_postal_code_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Country the code belongs to.
+  - name: fk_postal_code_city_id
+    columns:
+    - city_id
+    ref: city
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: City the code serves.
+  - name: fk_postal_code_locality_id
+    columns:
+    - locality_id
+    ref: locality
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Primary locality of the code.
+  - name: fk_postal_code_geo_source_id
+    columns:
+    - geo_source_id
+    ref: geo_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Source of coordinates.
+- name: skill_category
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Hierarchical grouping of skills (e.g. IT > Databases); depth-limited tree.
+  columns:
+  - name: parent_skill_category_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Parent node.
+    'null': true
+    null_why: NULL = root category.
+  - name: slug
+    type: STRING(100)
+    domain: code
+    sens: Public
+    desc: Stable URL-safe identifier.
+    'null': false
+  - name: display_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: English name.
+    'null': false
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: depth
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: Tree depth, root = 1 (max 4).
+    'null': false
+  - name: sort_order
+    type: INT4
+    domain: quantity
+    sens: Public
+    desc: Order among siblings.
+    'null': false
+    default: '0'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_skill_category_slug
+    type: unique
+    columns:
+    - slug
+    desc: Natural key.
+  - name: ck_skill_category_depth_range
+    type: check
+    expr: depth BETWEEN 1 AND 4
+    desc: Depth limit keeps tree browsable.
+  - name: ck_skill_category_parent_not_self
+    type: check
+    expr: parent_skill_category_id IS NULL OR parent_skill_category_id <> id
+    desc: No self-parent.
+  - name: ck_skill_category_root_depth
+    type: check
+    expr: (parent_skill_category_id IS NULL) = (depth = 1)
+    desc: Depth 1 iff root.
+  - name: ck_skill_category_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_skill_category_parent_skill_category_id_sort_order
+    columns:
+    - parent_skill_category_id
+    - sort_order
+    desc: Children listing.
+  fks:
+  - name: fk_skill_category_parent_skill_category_id
+    columns:
+    - parent_skill_category_id
+    ref: skill_category
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Parent node.
+- name: skill
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B2
+  - B4
+  - B12
+  - B14
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Canonical skill entity (LinkedIn Skills Graph / Naukri key-skills style); free-text skills are mapped to it.
+  columns:
+  - name: skill_category_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Primary category.
+    'null': false
+  - name: skill_type_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Technical/soft/tool classification.
+    'null': false
+  - name: skill_taxonomy_source_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Origin of the entry.
+    'null': false
+  - name: merged_into_skill_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Survivor when this skill was de-duplicated; readers follow the pointer.
+    'null': true
+    null_why: NULL = skill not merged.
+  - name: slug
+    type: STRING(100)
+    domain: code
+    sens: Public
+    desc: Stable URL-safe identifier.
+    'null': false
+  - name: canonical_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Preferred English display name, e.g. PostgreSQL.
+    'null': false
+  - name: canonical_name_lower
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased canonical_name; case-insensitive uniqueness and typeahead.
+    'null': false
+    computed: lower(canonical_name)
+    stored: true
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: description
+    type: STRING(500)
+    domain: free_text
+    sens: Public
+    desc: Short definition shown in tooltips.
+    'null': true
+    null_why: NULL = no description curated.
+  - name: external_taxonomy_ref
+    type: STRING(100)
+    domain: code
+    sens: Public
+    desc: Id/URI in the external taxonomy (ESCO URI, O*NET code).
+    'null': true
+    null_why: NULL = internal skill with no external mapping.
+  - name: is_assessable
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True when a skill test exists (Naukri/LinkedIn skill assessments).
+    'null': false
+    default: 'false'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired from pickers; kept for history.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_skill_slug
+    type: unique
+    columns:
+    - slug
+    desc: Natural key.
+  - name: uq_skill_canonical_name_lower
+    type: unique
+    columns:
+    - canonical_name_lower
+    desc: One canonical skill per case-insensitive name.
+  - name: ck_skill_merge_not_self
+    type: check
+    expr: merged_into_skill_id IS NULL OR merged_into_skill_id <> id
+    desc: No self-merge.
+  - name: ck_skill_merged_inactive
+    type: check
+    expr: merged_into_skill_id IS NULL OR NOT is_active
+    desc: A merged skill is inactive.
+  - name: ck_skill_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_skill_canonical_name_lower
+    columns:
+    - canonical_name_lower
+    desc: Trigram GIN for skill typeahead/fuzzy match.
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_skill_skill_category_id_canonical_name_lower
+    columns:
+    - skill_category_id
+    - canonical_name_lower
+    desc: Browse skills by category.
+    where: is_active
+  - name: uq_skill_external_taxonomy_ref
+    columns:
+    - external_taxonomy_ref
+    desc: External taxonomy join, unique when present.
+    unique: true
+    where: external_taxonomy_ref IS NOT NULL
+  - name: idx_skill_skill_type_id
+    columns:
+    - skill_type_id
+    desc: Supports FK fk_skill_skill_type_id (join and delete checks).
+  - name: idx_skill_skill_taxonomy_source_id
+    columns:
+    - skill_taxonomy_source_id
+    desc: Supports FK fk_skill_skill_taxonomy_source_id (join and delete checks).
+  - name: idx_skill_merged_into_skill_id
+    columns:
+    - merged_into_skill_id
+    desc: Supports FK fk_skill_merged_into_skill_id (join and delete checks).
+  fks:
+  - name: fk_skill_skill_category_id
+    columns:
+    - skill_category_id
+    ref: skill_category
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Primary category.
+  - name: fk_skill_skill_type_id
+    columns:
+    - skill_type_id
+    ref: skill_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Technical/soft/tool classification.
+  - name: fk_skill_skill_taxonomy_source_id
+    columns:
+    - skill_taxonomy_source_id
+    ref: skill_taxonomy_source
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Origin of the entry.
+  - name: fk_skill_merged_into_skill_id
+    columns:
+    - merged_into_skill_id
+    ref: skill
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Survivor when this skill was de-duplicated; readers follow the pointer.
+- name: skill_alias
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Synonyms, abbreviations, misspellings and translations resolving to a skill (LinkedIn keeps ~9 aliases/skill).
+  columns:
+  - name: skill_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Skill the alias resolves to.
+    'null': false
+  - name: language_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Language of the alias.
+    'null': false
+  - name: alias_kind_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Alias type.
+    'null': false
+  - name: alias_text
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Alias as written.
+    'null': false
+  - name: alias_lower
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased alias for matching.
+    'null': false
+    computed: lower(alias_text)
+    stored: true
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = alias withdrawn.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_skill_alias_language_id_alias_lower
+    type: unique
+    columns:
+    - language_id
+    - alias_lower
+    desc: An alias resolves to exactly one skill per language (deterministic parsing).
+  indexes:
+  - name: idx_skill_alias_skill_id
+    columns:
+    - skill_id
+    desc: Aliases of a skill.
+  - name: idx_skill_alias_alias_lower
+    columns:
+    - alias_lower
+    desc: Trigram fuzzy match of resume tokens.
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_skill_alias_alias_kind_id
+    columns:
+    - alias_kind_id
+    desc: Supports FK fk_skill_alias_alias_kind_id (join and delete checks).
+  fks:
+  - name: fk_skill_alias_skill_id
+    columns:
+    - skill_id
+    ref: skill
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Skill the alias resolves to.
+  - name: fk_skill_alias_language_id
+    columns:
+    - language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Language of the alias.
+  - name: fk_skill_alias_alias_kind_id
+    columns:
+    - alias_kind_id
+    ref: alias_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Alias type.
+- name: skill_relation
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Directed edges of the skill graph (related, prerequisite, implies, substitute).
+  columns:
+  - name: skill_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Source skill.
+    'null': false
+  - name: related_skill_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Target skill.
+    'null': false
+  - name: skill_relation_type_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Edge type.
+    'null': false
+  - name: strength
+    type: DECIMAL(4,3)
+    domain: ratio
+    sens: Public
+    desc: Association strength 0..1 (co-occurrence or curated).
+    'null': true
+    null_why: NULL = unweighted curated edge.
+  constraints:
+  - name: uq_skill_relation_skill_id_related_skill_id_skill_relation_type_id
+    type: unique
+    columns:
+    - skill_id
+    - related_skill_id
+    - skill_relation_type_id
+    desc: One edge per type.
+  - name: ck_skill_relation_no_self_edge
+    type: check
+    expr: skill_id <> related_skill_id
+    desc: No self loops.
+  - name: ck_skill_relation_strength_range
+    type: check
+    expr: strength IS NULL OR strength BETWEEN 0 AND 1
+    desc: Ratio 0..1.
+  indexes:
+  - name: idx_skill_relation_related_skill_id
+    columns:
+    - related_skill_id
+    desc: Reverse traversal.
+  - name: idx_skill_relation_skill_relation_type_id
+    columns:
+    - skill_relation_type_id
+    desc: Supports FK fk_skill_relation_skill_relation_type_id (join and delete checks).
+  fks:
+  - name: fk_skill_relation_skill_id
+    columns:
+    - skill_id
+    ref: skill
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Source skill.
+  - name: fk_skill_relation_related_skill_id
+    columns:
+    - related_skill_id
+    ref: skill
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Target skill.
+  - name: fk_skill_relation_skill_relation_type_id
+    columns:
+    - skill_relation_type_id
+    ref: skill_relation_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Edge type.
+- name: qualification
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B4
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Degree/diploma catalogue (B.Tech, MBA, ITI...) with level and typical duration.
+  columns:
+  - name: qualification_level_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Education level ladder position.
+    'null': false
+  - name: country_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Country where the qualification is awarded.
+    'null': true
+    null_why: NULL = international/global qualification.
+  - name: slug
+    type: STRING(100)
+    domain: code
+    sens: Public
+    desc: Stable identifier.
+    'null': false
+  - name: canonical_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Full English name, e.g. Bachelor of Technology.
+    'null': false
+  - name: abbreviation
+    type: STRING(30)
+    domain: free_text
+    sens: Public
+    desc: Common short form, e.g. B.Tech.
+    'null': true
+    null_why: NULL = no common abbreviation.
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: typical_duration_months
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: Normal programme length in months.
+    'null': true
+    null_why: NULL = variable/unknown.
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_qualification_slug
+    type: unique
+    columns:
+    - slug
+    desc: Natural key.
+  - name: ck_qualification_duration_positive
+    type: check
+    expr: typical_duration_months IS NULL OR typical_duration_months > 0
+    desc: Positive duration.
+  - name: ck_qualification_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_qualification_qualification_level_id_canonical_name
+    columns:
+    - qualification_level_id
+    - canonical_name
+    desc: Degrees per level picker.
+    where: is_active
+  - name: idx_qualification_country_id
+    columns:
+    - country_id
+    desc: Country filter.
+  fks:
+  - name: fk_qualification_qualification_level_id
+    columns:
+    - qualification_level_id
+    ref: qualification_level
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Education level ladder position.
+  - name: fk_qualification_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Country where the qualification is awarded.
+- name: field_of_study
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: X
+  milestones:
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Specialisation/major (Computer Science, Marketing) aligned to ISCED-F; paired with qualification in education rows.
+  columns:
+  - name: parent_field_of_study_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Broader field.
+    'null': true
+    null_why: NULL = top-level field.
+  - name: slug
+    type: STRING(100)
+    domain: code
+    sens: Public
+    desc: Stable identifier.
+    'null': false
+  - name: canonical_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: English name.
+    'null': false
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: isced_f_code
+    type: STRING(6)
+    domain: code
+    sens: Public
+    desc: ISCED-F 2013 code, e.g. 0613.
+    'null': true
+    null_why: NULL = no ISCED-F mapping.
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_field_of_study_slug
+    type: unique
+    columns:
+    - slug
+    desc: Natural key.
+  - name: ck_field_of_study_parent_not_self
+    type: check
+    expr: parent_field_of_study_id IS NULL OR parent_field_of_study_id <> id
+    desc: No self-parent.
+  - name: ck_field_of_study_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_field_of_study_parent_field_of_study_id
+    columns:
+    - parent_field_of_study_id
+    desc: Children listing.
+  fks:
+  - name: fk_field_of_study_parent_field_of_study_id
+    columns:
+    - parent_field_of_study_id
+    ref: field_of_study
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Broader field.
+- name: institution
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B4
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Canonical university/college/school used to normalise free-text education entries (LinkedIn schools, Naukri institute list).
+  columns:
+  - name: institution_type_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Kind of institution.
+    'null': false
+  - name: country_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Country of main campus.
+    'null': false
+  - name: state_region_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: State of main campus.
+    'null': true
+    null_why: NULL = unknown or not applicable (online providers).
+  - name: city_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: City of main campus.
+    'null': true
+    null_why: NULL = unknown or fully online.
+  - name: accreditation_status_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Accreditation state.
+    'null': true
+    null_why: NULL = accreditation not assessed.
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Curation/verification state of the record.
+    'null': false
+  - name: merged_into_institution_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Survivor after duplicate merge.
+    'null': true
+    null_why: NULL = not merged.
+  - name: canonical_name
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Official English name.
+    'null': false
+  - name: name_search
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased canonical_name for typeahead.
+    'null': false
+    computed: lower(canonical_name)
+    stored: true
+  - name: short_name
+    type: STRING(50)
+    domain: free_text
+    sens: Public
+    desc: Acronym, e.g. IIT Madras.
+    'null': true
+    null_why: NULL = no common acronym.
+  - name: website_url
+    type: STRING(500)
+    domain: url
+    sens: Public
+    desc: Official website.
+    'null': true
+    null_why: NULL = unknown.
+  - name: ror_ref
+    type: STRING(30)
+    domain: code
+    sens: Public
+    desc: Research Organization Registry id (external).
+    'null': true
+    null_why: NULL = not in ROR.
+  - name: national_registry_ref
+    type: STRING(50)
+    domain: code
+    sens: Public
+    desc: Regulator code (e.g. AISHE/UGC id).
+    'null': true
+    null_why: NULL = not registered/unknown.
+  - name: established_year
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: Founding year.
+    'null': true
+    null_why: NULL = unknown.
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = closed/merged.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_institution_country_id_name_search
+    type: unique
+    columns:
+    - country_id
+    - name_search
+    desc: One canonical row per country and name.
+  - name: ck_institution_not_self_merge
+    type: check
+    expr: merged_into_institution_id IS NULL OR merged_into_institution_id <> id
+    desc: No self-merge.
+  - name: ck_institution_established_year_range
+    type: check
+    expr: established_year IS NULL OR established_year BETWEEN 800 AND 2200
+    desc: Plausible year.
+  indexes:
+  - name: idx_institution_name_search
+    columns:
+    - name_search
+    desc: Trigram typeahead.
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: uq_institution_ror_ref
+    columns:
+    - ror_ref
+    desc: ROR id unique when present.
+    unique: true
+    where: ror_ref IS NOT NULL
+  - name: idx_institution_city_id
+    columns:
+    - city_id
+    desc: Institutions per city.
+  - name: idx_institution_institution_type_id
+    columns:
+    - institution_type_id
+    desc: Supports FK fk_institution_institution_type_id (join and delete checks).
+  - name: idx_institution_state_region_id
+    columns:
+    - state_region_id
+    desc: Supports FK fk_institution_state_region_id (join and delete checks).
+  - name: idx_institution_accreditation_status_id
+    columns:
+    - accreditation_status_id
+    desc: Supports FK fk_institution_accreditation_status_id (join and delete checks).
+  - name: idx_institution_verification_status_id
+    columns:
+    - verification_status_id
+    desc: Supports FK fk_institution_verification_status_id (join and delete checks).
+  - name: idx_institution_merged_into_institution_id
+    columns:
+    - merged_into_institution_id
+    desc: Supports FK fk_institution_merged_into_institution_id (join and delete checks).
+  fks:
+  - name: fk_institution_institution_type_id
+    columns:
+    - institution_type_id
+    ref: institution_type
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Kind of institution.
+  - name: fk_institution_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Country of main campus.
+  - name: fk_institution_state_region_id
+    columns:
+    - state_region_id
+    ref: state_region
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: State of main campus.
+  - name: fk_institution_city_id
+    columns:
+    - city_id
+    ref: city
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: City of main campus.
+  - name: fk_institution_accreditation_status_id
+    columns:
+    - accreditation_status_id
+    ref: accreditation_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Accreditation state.
+  - name: fk_institution_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Curation/verification state of the record.
+  - name: fk_institution_merged_into_institution_id
+    columns:
+    - merged_into_institution_id
+    ref: institution
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Survivor after duplicate merge.
+- name: institution_alias
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Alternative names of an institution (acronyms, former names, regional spellings) for dedupe of free text.
+  columns:
+  - name: institution_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Canonical institution.
+    'null': false
+  - name: alias_kind_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Alias type.
+    'null': false
+  - name: alias_text
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Alias as written.
+    'null': false
+  - name: alias_lower
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased alias.
+    'null': false
+    computed: lower(alias_text)
+    stored: true
+  constraints:
+  - name: uq_institution_alias_alias_lower
+    type: unique
+    columns:
+    - alias_lower
+    desc: An alias resolves to one institution.
+  indexes:
+  - name: idx_institution_alias_institution_id
+    columns:
+    - institution_id
+    desc: Aliases per institution.
+  - name: idx_institution_alias_alias_kind_id
+    columns:
+    - alias_kind_id
+    desc: Supports FK fk_institution_alias_alias_kind_id (join and delete checks).
+  fks:
+  - name: fk_institution_alias_institution_id
+    columns:
+    - institution_id
+    ref: institution
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Canonical institution.
+  - name: fk_institution_alias_alias_kind_id
+    columns:
+    - alias_kind_id
+    ref: alias_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Alias type.
+- name: industry
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B12
+  - B25
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Industry taxonomy tree (LinkedIn ~400 industries, Naukri industry list) with mappings to NIC/NAICS/ISIC.
+  columns:
+  - name: parent_industry_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Parent node.
+    'null': true
+    null_why: NULL = top-level sector.
+  - name: industry_scheme_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Classification scheme of classification_ref.
+    'null': false
+  - name: slug
+    type: STRING(100)
+    domain: code
+    sens: Public
+    desc: Stable identifier.
+    'null': false
+  - name: canonical_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: English name.
+    'null': false
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: depth
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: Tree depth, root = 1 (max 4).
+    'null': false
+  - name: classification_ref
+    type: STRING(20)
+    domain: code
+    sens: Public
+    desc: Code in the scheme, e.g. NAICS 541511.
+    'null': true
+    null_why: NULL = no official code (internal node).
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_industry_slug
+    type: unique
+    columns:
+    - slug
+    desc: Natural key.
+  - name: ck_industry_depth_range
+    type: check
+    expr: depth BETWEEN 1 AND 4
+    desc: Depth limit.
+  - name: ck_industry_parent_not_self
+    type: check
+    expr: parent_industry_id IS NULL OR parent_industry_id <> id
+    desc: No self-parent.
+  - name: ck_industry_root_depth
+    type: check
+    expr: (parent_industry_id IS NULL) = (depth = 1)
+    desc: Depth 1 iff root.
+  - name: ck_industry_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_industry_parent_industry_id_canonical_name
+    columns:
+    - parent_industry_id
+    - canonical_name
+    desc: Children listing.
+  - name: idx_industry_industry_scheme_id_classification_ref
+    columns:
+    - industry_scheme_id
+    - classification_ref
+    desc: Crosswalk lookup by official code.
+    where: classification_ref IS NOT NULL
+  fks:
+  - name: fk_industry_parent_industry_id
+    columns:
+    - parent_industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Parent node.
+  - name: fk_industry_industry_scheme_id
+    columns:
+    - industry_scheme_id
+    ref: industry_scheme
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Classification scheme of classification_ref.
+- name: industry_closure
+  kind: bridge
+  delete_policy: hard
+  volume: low
+  tier: X
+  milestones:
+  - B12
+  retention: Rebuilt by job when industry changes; derived, no independent retention.
+  description: Transitive closure of the industry tree (ancestor, descendant, distance) so 'all IT sub-industries' is one indexed lookup.
+  columns:
+  - name: ancestor_industry_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Ancestor node (equals descendant at distance 0).
+    'null': false
+  - name: descendant_industry_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Descendant node.
+    'null': false
+  - name: distance
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: Edges between ancestor and descendant (0 = self).
+    'null': false
+  constraints:
+  - name: uq_industry_closure_ancestor_industry_id_descendant_industry_id
+    type: unique
+    columns:
+    - ancestor_industry_id
+    - descendant_industry_id
+    desc: One closure row per pair.
+  - name: ck_industry_closure_distance_range
+    type: check
+    expr: distance BETWEEN 0 AND 3
+    desc: Matches max depth 4.
+  indexes:
+  - name: idx_industry_closure_descendant_industry_id
+    columns:
+    - descendant_industry_id
+    desc: Find ancestors of a node.
+  fks:
+  - name: fk_industry_closure_ancestor_industry_id
+    columns:
+    - ancestor_industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Ancestor node (equals descendant at distance 0).
+  - name: fk_industry_closure_descendant_industry_id
+    columns:
+    - descendant_industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Descendant node.
+- name: job_category
+  kind: entity
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B2
+  - B6
+  - B26
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Job/gig category tree shared by job requirements and gig requests (D-15).
+  columns:
+  - name: parent_job_category_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Parent category.
+    'null': true
+    null_why: NULL = root category.
+  - name: slug
+    type: STRING(100)
+    domain: code
+    sens: Public
+    desc: Stable identifier.
+    'null': false
+  - name: display_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: English name.
+    'null': false
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: depth
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: Tree depth, root = 1 (max 3).
+    'null': false
+  - name: applies_to_jobs
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Selectable on job requirements.
+    'null': false
+    default: 'true'
+  - name: applies_to_gigs
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Selectable on gig requests.
+    'null': false
+    default: 'false'
+  - name: sort_order
+    type: INT4
+    domain: quantity
+    sens: Public
+    desc: Sibling order.
+    'null': false
+    default: '0'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_job_category_slug
+    type: unique
+    columns:
+    - slug
+    desc: Natural key.
+  - name: ck_job_category_depth_range
+    type: check
+    expr: depth BETWEEN 1 AND 3
+    desc: Depth limit.
+  - name: ck_job_category_parent_not_self
+    type: check
+    expr: parent_job_category_id IS NULL OR parent_job_category_id <> id
+    desc: No self-parent.
+  - name: ck_job_category_root_depth
+    type: check
+    expr: (parent_job_category_id IS NULL) = (depth = 1)
+    desc: Depth 1 iff root.
+  - name: ck_job_category_applies_somewhere
+    type: check
+    expr: applies_to_jobs OR applies_to_gigs
+    desc: Must serve jobs or gigs.
+  - name: ck_job_category_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_job_category_parent_job_category_id_sort_order
+    columns:
+    - parent_job_category_id
+    - sort_order
+    desc: Children listing.
+  fks:
+  - name: fk_job_category_parent_job_category_id
+    columns:
+    - parent_job_category_id
+    ref: job_category
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Parent category.
+- name: job_role
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B2
+  - B4
+  - B6
+  - B12
+  - B14
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Canonical job title/role (Naukri 'role', LinkedIn standardized title) used for normalising titles and search.
+  columns:
+  - name: job_category_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Category the role belongs to.
+    'null': false
+  - name: job_function_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: LinkedIn-style job function.
+    'null': false
+  - name: seniority_level_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Default seniority.
+    'null': true
+    null_why: NULL = role spans several seniority levels.
+  - name: default_industry_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Typical industry.
+    'null': true
+    null_why: NULL = cross-industry role.
+  - name: merged_into_job_role_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Survivor after duplicate merge.
+    'null': true
+    null_why: NULL = not merged.
+  - name: slug
+    type: STRING(100)
+    domain: code
+    sens: Public
+    desc: Stable identifier.
+    'null': false
+  - name: canonical_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Standard English title.
+    'null': false
+  - name: canonical_name_lower
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased canonical_name.
+    'null': false
+    computed: lower(canonical_name)
+    stored: true
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: occupation_ref
+    type: STRING(20)
+    domain: code
+    sens: Public
+    desc: O*NET-SOC / ISCO-08 code.
+    'null': true
+    null_why: NULL = no standard occupation mapping.
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_job_role_slug
+    type: unique
+    columns:
+    - slug
+    desc: Natural key.
+  - name: uq_job_role_canonical_name_lower
+    type: unique
+    columns:
+    - canonical_name_lower
+    desc: One canonical title per case-insensitive name.
+  - name: ck_job_role_merge_not_self
+    type: check
+    expr: merged_into_job_role_id IS NULL OR merged_into_job_role_id <> id
+    desc: No self-merge.
+  - name: ck_job_role_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_job_role_canonical_name_lower
+    columns:
+    - canonical_name_lower
+    desc: Trigram typeahead for job title.
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_job_role_job_category_id_canonical_name_lower
+    columns:
+    - job_category_id
+    - canonical_name_lower
+    desc: Roles per category.
+    where: is_active
+  - name: idx_job_role_job_function_id
+    columns:
+    - job_function_id
+    desc: Roles per function.
+  - name: idx_job_role_seniority_level_id
+    columns:
+    - seniority_level_id
+    desc: Supports FK fk_job_role_seniority_level_id (join and delete checks).
+  - name: idx_job_role_default_industry_id
+    columns:
+    - default_industry_id
+    desc: Supports FK fk_job_role_default_industry_id (join and delete checks).
+  - name: idx_job_role_merged_into_job_role_id
+    columns:
+    - merged_into_job_role_id
+    desc: Supports FK fk_job_role_merged_into_job_role_id (join and delete checks).
+  fks:
+  - name: fk_job_role_job_category_id
+    columns:
+    - job_category_id
+    ref: job_category
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Category the role belongs to.
+  - name: fk_job_role_job_function_id
+    columns:
+    - job_function_id
+    ref: job_function
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: LinkedIn-style job function.
+  - name: fk_job_role_seniority_level_id
+    columns:
+    - seniority_level_id
+    ref: seniority_level
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Default seniority.
+  - name: fk_job_role_default_industry_id
+    columns:
+    - default_industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Typical industry.
+  - name: fk_job_role_merged_into_job_role_id
+    columns:
+    - merged_into_job_role_id
+    ref: job_role
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Survivor after duplicate merge.
+- name: job_role_alias
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Title variants (SDE II, Software Engineer 2) resolving to a canonical job_role.
+  columns:
+  - name: job_role_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Canonical role.
+    'null': false
+  - name: language_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Language of the alias.
+    'null': false
+  - name: alias_kind_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Alias type.
+    'null': false
+  - name: alias_text
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Title as written.
+    'null': false
+  - name: alias_lower
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased alias.
+    'null': false
+    computed: lower(alias_text)
+    stored: true
+  constraints:
+  - name: uq_job_role_alias_language_id_alias_lower
+    type: unique
+    columns:
+    - language_id
+    - alias_lower
+    desc: A title variant resolves to one role per language.
+  indexes:
+  - name: idx_job_role_alias_job_role_id
+    columns:
+    - job_role_id
+    desc: Aliases per role.
+  - name: idx_job_role_alias_alias_lower
+    columns:
+    - alias_lower
+    desc: Trigram match.
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_job_role_alias_alias_kind_id
+    columns:
+    - alias_kind_id
+    desc: Supports FK fk_job_role_alias_alias_kind_id (join and delete checks).
+  fks:
+  - name: fk_job_role_alias_job_role_id
+    columns:
+    - job_role_id
+    ref: job_role
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Canonical role.
+  - name: fk_job_role_alias_language_id
+    columns:
+    - language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Language of the alias.
+  - name: fk_job_role_alias_alias_kind_id
+    columns:
+    - alias_kind_id
+    ref: alias_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Alias type.
+- name: job_role_skill
+  kind: link
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B6
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Typical skills of a role with importance, used to suggest skills on job posts and profiles.
+  columns:
+  - name: job_role_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Role.
+    'null': false
+  - name: skill_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Skill.
+    'null': false
+  - name: skill_importance_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Required/preferred/nice-to-have.
+    'null': false
+  constraints:
+  - name: uq_job_role_skill_job_role_id_skill_id
+    type: unique
+    columns:
+    - job_role_id
+    - skill_id
+    desc: A skill is listed once per role.
+  indexes:
+  - name: idx_job_role_skill_skill_id
+    columns:
+    - skill_id
+    desc: Roles requiring a skill.
+  - name: idx_job_role_skill_skill_importance_id
+    columns:
+    - skill_importance_id
+    desc: Supports FK fk_job_role_skill_skill_importance_id (join and delete checks).
+  fks:
+  - name: fk_job_role_skill_job_role_id
+    columns:
+    - job_role_id
+    ref: job_role
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Role.
+  - name: fk_job_role_skill_skill_id
+    columns:
+    - skill_id
+    ref: skill
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Skill.
+  - name: fk_job_role_skill_skill_importance_id
+    columns:
+    - skill_importance_id
+    ref: skill_importance
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Required/preferred/nice-to-have.
+- name: employer_name_canonical
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B4
+  - B12
+  - B25
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Canonical company names for de-duplicating free-text employer names in work history before an organisation claims a page.
+  columns:
+  - name: organisation_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Claimed organisation account, once the company registers.
+    'null': true
+    null_why: NULL = employer known only from candidate-entered history (unclaimed).
+  - name: country_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Headquarters country.
+    'null': true
+    null_why: NULL = unknown.
+  - name: industry_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Primary industry.
+    'null': true
+    null_why: NULL = unknown.
+  - name: company_size_band_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Size band.
+    'null': true
+    null_why: NULL = unknown.
+  - name: verification_status_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Curation/verification state.
+    'null': false
+  - name: merged_into_employer_name_canonical_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Survivor after duplicate merge.
+    'null': true
+    null_why: NULL = not merged.
+  - name: canonical_name
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Normalised legal-or-brand name.
+    'null': false
+  - name: name_search
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased canonical_name.
+    'null': false
+    computed: lower(canonical_name)
+    stored: true
+  - name: website_domain
+    type: STRING(253)
+    domain: free_text
+    sens: Public
+    desc: Registrable web domain, e.g. example.com (strong dedupe signal).
+    'null': true
+    null_why: NULL = unknown.
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = merged/defunct.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_employer_name_canonical_country_id_name_search
+    type: unique
+    columns:
+    - country_id
+    - name_search
+    desc: One canonical row per country and name.
+  - name: ck_employer_name_canonical_not_self_merge
+    type: check
+    expr: merged_into_employer_name_canonical_id IS NULL OR merged_into_employer_name_canonical_id <> id
+    desc: No self-merge.
+  indexes:
+  - name: uq_employer_name_canonical_name_search
+    columns:
+    - name_search
+    desc: No duplicate canonical row when country is unknown.
+    unique: true
+    where: country_id IS NULL
+  - name: uq_employer_name_canonical_website_domain
+    columns:
+    - website_domain
+    desc: Domain dedupe, unique when present.
+    unique: true
+    where: website_domain IS NOT NULL
+  - name: uq_employer_name_canonical_organisation_id
+    columns:
+    - organisation_id
+    desc: One canonical row per claimed organisation.
+    unique: true
+    where: organisation_id IS NOT NULL
+  - name: idx_employer_name_canonical_name_search
+    columns:
+    - name_search
+    desc: Trigram typeahead.
+    inverted: true
+    opclass: gin_trgm_ops
+  - name: idx_employer_name_canonical_industry_id
+    columns:
+    - industry_id
+    desc: Supports FK fk_employer_name_canonical_industry_id (join and delete checks).
+  - name: idx_employer_name_canonical_company_size_band_id
+    columns:
+    - company_size_band_id
+    desc: Supports FK fk_employer_name_canonical_company_size_band_id (join and delete checks).
+  - name: idx_employer_name_canonical_verification_status_id
+    columns:
+    - verification_status_id
+    desc: Supports FK fk_employer_name_canonical_verification_status_id (join and delete checks).
+  - name: idx_employer_name_canonical_merged_into_employer_name_canonical_id
+    columns:
+    - merged_into_employer_name_canonical_id
+    desc: Supports FK fk_employer_name_canonical_merged_into_employer_name_canonical_id (join and delete checks).
+  fks:
+  - name: fk_employer_name_canonical_organisation_id
+    columns:
+    - organisation_id
+    ref: organisation
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Claimed organisation account, once the company registers.
+  - name: fk_employer_name_canonical_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Headquarters country.
+  - name: fk_employer_name_canonical_industry_id
+    columns:
+    - industry_id
+    ref: industry
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Primary industry.
+  - name: fk_employer_name_canonical_company_size_band_id
+    columns:
+    - company_size_band_id
+    ref: company_size_band
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Size band.
+  - name: fk_employer_name_canonical_verification_status_id
+    columns:
+    - verification_status_id
+    ref: verification_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Curation/verification state.
+  - name: fk_employer_name_canonical_merged_into_employer_name_canonical_id
+    columns:
+    - merged_into_employer_name_canonical_id
+    ref: employer_name_canonical
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Survivor after duplicate merge.
+- name: employer_name_alias
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: X
+  milestones:
+  - B12
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Variant spellings (TCS, Tata Consultancy Services Ltd.) mapped to a canonical employer.
+  columns:
+  - name: employer_name_canonical_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Canonical employer.
+    'null': false
+  - name: alias_kind_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Alias type.
+    'null': false
+  - name: alias_text
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Alias as written.
+    'null': false
+  - name: alias_lower
+    type: STRING(200)
+    domain: free_text
+    sens: Public
+    desc: Lower-cased alias.
+    'null': false
+    computed: lower(alias_text)
+    stored: true
+  constraints:
+  - name: uq_employer_name_alias_alias_lower
+    type: unique
+    columns:
+    - alias_lower
+    desc: An alias resolves to one employer.
+  indexes:
+  - name: idx_employer_name_alias_employer_name_canonical_id
+    columns:
+    - employer_name_canonical_id
+    desc: Aliases per employer.
+  - name: idx_employer_name_alias_alias_kind_id
+    columns:
+    - alias_kind_id
+    desc: Supports FK fk_employer_name_alias_alias_kind_id (join and delete checks).
+  fks:
+  - name: fk_employer_name_alias_employer_name_canonical_id
+    columns:
+    - employer_name_canonical_id
+    ref: employer_name_canonical
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Canonical employer.
+  - name: fk_employer_name_alias_alias_kind_id
+    columns:
+    - alias_kind_id
+    ref: alias_kind
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Alias type.
+- name: tax_id_type
+  kind: config
+  delete_policy: hard
+  volume: low
+  tier: '1'
+  milestones:
+  - B25
+  - B31
+  retention: 'Reference data: retired via is_active, never deleted; changes audited via created/updated columns; no personal data.'
+  description: Tax/registration identifier types per country (GSTIN, PAN, EIN, VAT) with validation rules; values themselves are stored elsewhere as Sensitive tokens.
+  columns:
+  - name: country_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Country that issues the identifier.
+    'null': false
+  - name: tax_id_subject_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Whether it identifies individuals, organisations or both.
+    'null': false
+  - name: tax_id_checksum_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Checksum applied after the regex.
+    'null': false
+  - name: code
+    type: STRING(40)
+    domain: code
+    sens: Public
+    desc: Stable code, e.g. gstin, pan, ein, vat.
+    'null': false
+  - name: display_name
+    type: STRING(150)
+    domain: free_text
+    sens: Public
+    desc: English label, e.g. Goods and Services Tax Identification Number.
+    'null': false
+  - name: name_i18n
+    type: JSONB
+    domain: json
+    sens: Public
+    desc: 'Display name per UI language {language_tag: text}; must contain ''en''; fallback chain applied by the application.'
+    'null': false
+  - name: validation_regex
+    type: STRING(500)
+    domain: free_text
+    sens: Public
+    desc: Format regex (anchored) applied to the normalised value before storage.
+    'null': false
+  - name: format_example
+    type: STRING(60)
+    domain: free_text
+    sens: Public
+    desc: Synthetic example (never a real id) shown as input hint.
+    'null': false
+  - name: mask_pattern
+    type: STRING(40)
+    domain: free_text
+    sens: Public
+    desc: Display mask, e.g. XXXXXX####X.
+    'null': true
+    null_why: NULL = id never displayed even masked.
+  - name: min_length
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: Minimum normalised length.
+    'null': false
+  - name: max_length
+    type: INT2
+    domain: quantity
+    sens: Public
+    desc: Maximum normalised length.
+    'null': false
+  - name: is_sensitive
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Value is Sensitive (tokenised/encrypted, masked on display). Always true for individual identifiers.
+    'null': false
+    default: 'true'
+  - name: is_individual_identifier
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: True when the id identifies a natural person (e.g. PAN, SSN, Aadhaar).
+    'null': false
+    default: 'false'
+  - name: is_required_for_organisation
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Organisation must supply it to become verified in this country.
+    'null': false
+    default: 'false'
+  - name: is_api_verifiable
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: A registration/tax verification integration can validate it.
+    'null': false
+    default: 'false'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = retired type.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_tax_id_type_country_id_code
+    type: unique
+    columns:
+    - country_id
+    - code
+    desc: Code unique per country.
+  - name: ck_tax_id_type_length_order
+    type: check
+    expr: min_length <= max_length AND min_length > 0
+    desc: Length range sane.
+  - name: ck_tax_id_type_individual_is_sensitive
+    type: check
+    expr: NOT is_individual_identifier OR is_sensitive
+    desc: Personal identifiers must be treated as Sensitive.
+  - name: ck_tax_id_type_code_format
+    type: check
+    expr: code ~ '^[a-z0-9_]+$'
+    desc: Lowercase snake_case.
+  - name: ck_tax_id_type_name_i18n_en
+    type: check
+    expr: name_i18n ? 'en'
+    desc: Default language present.
+  indexes:
+  - name: idx_tax_id_type_tax_id_subject_id
+    columns:
+    - tax_id_subject_id
+    desc: Filter by subject.
+  - name: idx_tax_id_type_tax_id_checksum_id
+    columns:
+    - tax_id_checksum_id
+    desc: Supports FK fk_tax_id_type_tax_id_checksum_id (join and delete checks).
+  fks:
+  - name: fk_tax_id_type_country_id
+    columns:
+    - country_id
+    ref: country
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Country that issues the identifier.
+  - name: fk_tax_id_type_tax_id_subject_id
+    columns:
+    - tax_id_subject_id
+    ref: tax_id_subject
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Whether it identifies individuals, organisations or both.
+  - name: fk_tax_id_type_tax_id_checksum_id
+    columns:
+    - tax_id_checksum_id
+    ref: tax_id_checksum
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Checksum applied after the regex.
+- name: ui_label
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B2
+  retention: Keys retired via is_active, never deleted; source text history in audit columns.
+  description: UI string key with the source (default-language) text; keys are never shown to users.
+  columns:
+  - name: ui_label_context_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Surface where the string appears.
+    'null': false
+  - name: label_key
+    type: STRING(150)
+    domain: ui_label_key
+    sens: Public
+    desc: Dotted key, e.g. candidate.profile.save_button.
+    'null': false
+  - name: source_text
+    type: STRING(2000)
+    domain: free_text
+    sens: Public
+    desc: Authoritative default-language (en) text; final fallback when no translation exists.
+    'null': false
+  - name: translator_note
+    type: STRING(500)
+    domain: free_text
+    sens: Public
+    desc: Context/length hint for translators.
+    'null': true
+    null_why: NULL = no guidance needed.
+  - name: max_length
+    type: INT4
+    domain: quantity
+    sens: Public
+    desc: Maximum rendered length, e.g. SMS segment limit.
+    'null': true
+    null_why: NULL = no limit.
+  - name: has_placeholders
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: Text contains ICU placeholders/plurals that every translation must preserve.
+    'null': false
+    default: 'false'
+  - name: is_active
+    type: BOOL
+    domain: boolean
+    sens: Public
+    desc: False = no longer used by any screen.
+    'null': false
+    default: 'true'
+  constraints:
+  - name: uq_ui_label_label_key
+    type: unique
+    columns:
+    - label_key
+    desc: Natural key.
+  - name: ck_ui_label_key_format
+    type: check
+    expr: label_key ~ '^[a-z0-9_.]+$'
+    desc: Lowercase dotted snake_case.
+  - name: ck_ui_label_max_length_positive
+    type: check
+    expr: max_length IS NULL OR max_length > 0
+    desc: Positive limit.
+  indexes:
+  - name: idx_ui_label_ui_label_context_id_label_key
+    columns:
+    - ui_label_context_id
+    - label_key
+    desc: Export per surface.
+    where: is_active
+  fks:
+  - name: fk_ui_label_ui_label_context_id
+    columns:
+    - ui_label_context_id
+    ref: ui_label_context
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Surface where the string appears.
+- name: ui_label_translation
+  kind: entity
+  delete_policy: hard
+  volume: medium
+  tier: '1'
+  milestones:
+  - B2
+  retention: Retained while the label exists; superseded text kept via updated_* only (no version history).
+  description: 'One row per (label, language). Fallback: requested language -> language.fallback_language_id chain -> default ''en'' -> ui_label.source_text.'
+  columns:
+  - name: ui_label_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Translated label.
+    'null': false
+  - name: language_id
+    type: UUID
+    domain: identifier
+    sens: Public
+    desc: Target language.
+    'null': false
+  - name: translation_status_id
+    type: UUID
+    domain: enum_ref
+    sens: Public
+    desc: Workflow state.
+    'null': false
+  - name: translated_text
+    type: STRING(2000)
+    domain: free_text
+    sens: Public
+    desc: Translated text in the target language (UTF-8).
+    'null': false
+  - name: reviewed_at
+    type: TIMESTAMPTZ
+    domain: timestamp
+    sens: Public
+    desc: When a reviewer approved the text.
+    'null': true
+    null_why: NULL = not yet reviewed.
+  constraints:
+  - name: uq_ui_label_translation_ui_label_id_language_id
+    type: unique
+    columns:
+    - ui_label_id
+    - language_id
+    desc: Exactly one translation per label and language.
+  indexes:
+  - name: idx_ui_label_translation_language_id_translation_status_id
+    columns:
+    - language_id
+    - translation_status_id
+    desc: Translation coverage/outdated reports per language.
+  - name: idx_ui_label_translation_translation_status_id
+    columns:
+    - translation_status_id
+    desc: Supports FK fk_ui_label_translation_translation_status_id (join and delete checks).
+  fks:
+  - name: fk_ui_label_translation_ui_label_id
+    columns:
+    - ui_label_id
+    ref: ui_label
+    ref_columns:
+    - id
+    on_delete: CASCADE
+    on_update: RESTRICT
+    desc: Translated label.
+  - name: fk_ui_label_translation_language_id
+    columns:
+    - language_id
+    ref: language
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Target language.
+  - name: fk_ui_label_translation_translation_status_id
+    columns:
+    - translation_status_id
+    ref: translation_status
+    ref_columns:
+    - id
+    on_delete: RESTRICT
+    on_update: RESTRICT
+    desc: Workflow state.
+business_rules:
+- id: BR-MST-01
+  rule: Every enumeration is a lookup table with code, name_i18n, sort_order, is_active; no CHECK-IN lists or free-text enums.
+  mechanism_type: FK
+  mechanism: Consumers declare `<lookup>_id UUID NOT NULL REFERENCES <lookup>(id) ON DELETE RESTRICT`; lookup unique(code) + CHECK code ~ '^[a-z0-9_]+$'.
+  tables:
+  - employment_type
+  - work_type
+  - gender
+  - proficiency_level
+  milestone: B12
+- id: BR-MST-02
+  rule: 'Reference rows are retired, never deleted: history keeps resolving.'
+  mechanism_type: FK
+  mechanism: All FKs to master tables are ON DELETE RESTRICT; the application role has no DELETE grant on master tables (GRANT SELECT, INSERT, UPDATE only); retirement = is_active=false. Pickers use partial
+    indexes WHERE is_active.
+  tables:
+  - country
+  - city
+  - skill
+  - job_role
+  - qualification
+  - industry
+  milestone: B20
+- id: BR-MST-03
+  rule: Names are unique case-insensitively where a canonical row exists, so typeahead and parsing are deterministic.
+  mechanism_type: UNIQUE
+  mechanism: STORED computed column lower(name) + UNIQUE constraint (skill.canonical_name_lower, job_role.canonical_name_lower, institution (country_id,name_search), employer_name_canonical (country_id,name_search)
+    + partial unique WHERE country_id IS NULL); alias tables UNIQUE (language_id, alias_lower).
+  tables:
+  - skill
+  - job_role
+  - institution
+  - employer_name_canonical
+  - skill_alias
+  - job_role_alias
+  milestone: B20
+- id: BR-MST-04
+  rule: 'i18n fallback always terminates at the default language: requested -> language.fallback_language_id chain -> en -> ui_label.source_text.'
+  mechanism_type: CHECK
+  mechanism: 'language: CHECK (is_default OR fallback_language_id IS NOT NULL), CHECK (NOT is_default OR (is_ui_supported AND fallback_language_id IS NULL)), CHECK (fallback_language_id <> id), partial
+    UNIQUE INDEX on (is_default) WHERE is_default (exactly one default). Longer cycles (a->b->a) are rejected by the admin transaction that walks the chain (recursive CTE) before COMMIT and re-verified
+    by a nightly JOB.'
+  tables:
+  - language
+  milestone: B20
+- id: BR-MST-05
+  rule: One translation per UI label and language; labels have a default-language source text.
+  mechanism_type: UNIQUE
+  mechanism: UNIQUE (ui_label_id, language_id) on ui_label_translation; ui_label.source_text NOT NULL; ui_label_translation FK to language and ui_label (ON DELETE CASCADE from label). Coverage JOB flags
+    missing/outdated rows via translation_status.
+  tables:
+  - ui_label
+  - ui_label_translation
+  milestone: B20
+- id: BR-MST-06
+  rule: Lookup and master display names must contain the default language en.
+  mechanism_type: CHECK
+  mechanism: CHECK (name_i18n ? 'en') on every lookup and on rich masters carrying name_i18n (JSONB key-exists operator supported by CockroachDB).
+  tables:
+  - country
+  - skill
+  - industry
+  - job_category
+  milestone: B20
+- id: BR-MST-07
+  rule: Tax identifier types define a validation regex and length range per country; values are validated before storage; individual identifiers are always Sensitive.
+  mechanism_type: CHECK
+  mechanism: tax_id_type UNIQUE (country_id, code); CHECK (min_length <= max_length AND min_length > 0); CHECK (NOT is_individual_identifier OR is_sensitive). Consumers validate value ~ validation_regex
+    and checksum (tax_id_checksum) in the write path, store ciphertext/token + HMAC blind index only.
+  tables:
+  - tax_id_type
+  milestone: B31
+- id: BR-MST-08
+  rule: 'No sentinel values: unknown is NULL with a stated meaning, never 0/''''/''NA''/''unknown''.'
+  mechanism_type: CHECK
+  mechanism: Nullable columns carry null_why in this dictionary; no lookup contains an 'unknown' or 'n/a' value (use NULL FK or an explicit not_applicable code where the module defines one); city.population/city_tier/institution.established_year
+    are NULL when unknown, with CHECK ranges that reject 0 sentinels (population >= 0 with NULL=unknown; tier 1..3).
+  tables:
+  - city
+  - institution
+  - country
+  milestone: B20
+- id: BR-MST-09
+  rule: Coordinates always state their source and come as a complete pair.
+  mechanism_type: CHECK
+  mechanism: CHECK ranges (lat -90..90, lon -180..180), CHECK ((latitude IS NULL) = (longitude IS NULL)), CHECK (latitude IS NULL OR geo_source_id IS NOT NULL) with FK geo_source_id -> geo_source.
+  tables:
+  - country
+  - city
+  - locality
+  - postal_code
+  milestone: B20
+- id: BR-MST-10
+  rule: A city's state belongs to the same country as the city.
+  mechanism_type: FK
+  mechanism: 'UNIQUE (country_id, id) on state_region; composite FK city (country_id, state_region_id) -> state_region (country_id, id) ON UPDATE RESTRICT (MATCH SIMPLE: skipped for NULL state); separate
+    FK city.country_id -> country.'
+  tables:
+  - city
+  - state_region
+  milestone: B20
+- id: BR-MST-11
+  rule: Hierarchies are acyclic and depth-limited; roots have depth 1.
+  mechanism_type: CHECK
+  mechanism: CHECK (parent_id IS NULL OR parent_id <> id), CHECK ((parent_id IS NULL) = (depth = 1)), CHECK (depth BETWEEN 1 AND n); child depth = parent depth + 1 enforced in the admin write transaction
+    (SELECT parent FOR UPDATE); industry_closure rebuilt by JOB with CHECK distance 0..3.
+  tables:
+  - skill_category
+  - industry
+  - job_category
+  - industry_closure
+  - field_of_study
+  milestone: B20
+- id: BR-MST-12
+  rule: Merged duplicates keep a pointer to the survivor and are inactive; no self-merge.
+  mechanism_type: CHECK
+  mechanism: merged_into_<x>_id self-FK ON DELETE RESTRICT, CHECK (merged_into_<x>_id <> id), CHECK (merged_into_skill_id IS NULL OR NOT is_active); merge runs in one txn that repoints consumers (candidate_skill
+    etc.) then sets the pointer; chains are flattened by JOB.
+  tables:
+  - skill
+  - job_role
+  - institution
+  - employer_name_canonical
+  milestone: B20
+- id: BR-MST-13
+  rule: Exactly one default language and at most one primary language per country.
+  mechanism_type: PARTIAL_UNIQUE
+  mechanism: 'language: UNIQUE INDEX uq_language_is_default (is_default) WHERE is_default; country_language: UNIQUE INDEX uq_country_language_country_id (country_id) WHERE is_primary.'
+  tables:
+  - language
+  - country_language
+  milestone: B20
+- id: BR-MST-14
+  rule: Currency minor units drive money rounding; money columns elsewhere are DECIMAL(18,4) with a currency_id FK.
+  mechanism_type: CHECK
+  mechanism: currency.minor_unit CHECK BETWEEN 0 AND 4; currency_code CHECK ~ '^[A-Z]{3}$'; UNIQUE(currency_code), UNIQUE(iso_numeric); application rounds to minor_unit before ledger writes.
+  tables:
+  - currency
+  milestone: B20
+- id: BR-MST-15
+  rule: A job_category is usable by jobs and/or gigs, never neither.
+  mechanism_type: CHECK
+  mechanism: CHECK (applies_to_jobs OR applies_to_gigs) on job_category; job/gig pickers filter on the flag via partial predicate.
+  tables:
+  - job_category
+  milestone: B26
+- id: BR-MST-16
+  rule: Master data is written only by the admin role; reads are open to all application roles.
+  mechanism_type: PRIVILEGE
+  mechanism: GRANT SELECT on master tables to app roles; INSERT/UPDATE only to role master_admin; no DELETE grant; every change audited via updated_by/updated_at and audit_event.
+  tables:
+  - country
+  - skill
+  - language
+  - ui_label
+  milestone: B33
+- id: BR-MST-17
+  rule: Aliases and canonical names are normalised before comparison; one alias resolves to one entity per language.
+  mechanism_type: UNIQUE
+  mechanism: alias_lower STORED computed lower(alias_text); UNIQUE (language_id, alias_lower) on skill_alias and job_role_alias; UNIQUE (alias_lower) on institution_alias and employer_name_alias; trigram
+    GIN indexes (alias_lower gin_trgm_ops) for fuzzy match.
+  tables:
+  - skill_alias
+  - job_role_alias
+  - institution_alias
+  - employer_name_alias
+  milestone: B20
+- id: BR-MST-18
+  rule: Sensitive demographic attributes (gender, marital_status) are optional, hidden by default and never used for ranking; no religion/caste/disability masters exist.
+  mechanism_type: APP_LAYER
+  mechanism: Consumers store these as nullable enum_ref FKs with default visibility private (visibility_level); search/ranking services exclude the columns; documented as a deliberate omission. Consumer
+    tables classify the columns Personal/Sensitive.
+  tables:
+  - gender
+  - marital_status
+  - visibility_level
+  milestone: B12
