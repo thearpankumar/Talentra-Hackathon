@@ -3,3 +3,5 @@
 **/certs-public/
 **/logs/
 *.key
+!infra/monitoring/grafana/dashboards/Logs/
+!infra/monitoring/grafana/dashboards/Logs/**

@@ -65,7 +65,7 @@ SELECT (get_byte(decode(replace(p_request::STRING, '-', ''), 'hex'), 0) % 32)::I
 -- row_hash = SHA-256(prev_hash || canonical field list)
 CREATE OR REPLACE FUNCTION fn_audit_row_hash(p_prev BYTES, p_id UUID, p_occurred TIMESTAMPTZ, p_actor UUID, p_actor_type UUID,
   p_action UUID, p_entity_type UUID, p_entity_ref UUID, p_outcome UUID, p_request UUID, p_chain INT2, p_seq INT8)
-RETURNS BYTES LANGUAGE SQL IMMUTABLE AS $$
+RETURNS BYTES LANGUAGE SQL STABLE AS $$
 SELECT digest(
   coalesce(p_prev, '\x'::BYTES) || convert_to(concat_ws('|', p_id::STRING,
      (extract(epoch FROM p_occurred) * 1000000)::INT8::STRING, coalesce(p_actor::STRING, ''), p_actor_type::STRING,

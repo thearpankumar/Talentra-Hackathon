@@ -322,7 +322,7 @@ LANGUAGE plpgsql AS $$
 DECLARE v_found UUID; v_deadline TIMESTAMPTZ; v_ext INT4; v_submitted TIMESTAMPTZ;
 BEGIN
   SELECT id, deadline_at, time_extension_seconds, submitted_at INTO v_found, v_deadline, v_ext, v_submitted
-    FROM assessment_session WHERE id = p_session_id AND deleted_at IS NULL FOR UPDATE;
+    FROM assessment_session WHERE id = p_session_id FOR UPDATE;
   IF v_found IS NULL THEN
     RAISE EXCEPTION 'BR-LRN-14: assessment_session % not found', p_session_id USING ERRCODE = '55000';
   END IF;
@@ -342,7 +342,7 @@ CREATE OR REPLACE FUNCTION fn_assert_not_blocked(p_a UUID, p_b UUID) RETURNS BOO
 LANGUAGE plpgsql AS $$
 DECLARE v_x UUID;
 BEGIN
-  SELECT id INTO v_x FROM user_block WHERE effective_to IS NULL AND deleted_at IS NULL
+  SELECT id INTO v_x FROM user_block WHERE effective_to IS NULL
      AND ((blocker_app_user_id = p_a AND blocked_app_user_id = p_b) OR (blocker_app_user_id = p_b AND blocked_app_user_id = p_a)) LIMIT 1;
   IF v_x IS NOT NULL THEN
     RAISE EXCEPTION 'BR-NET-06: users % and % are blocked from each other', p_a, p_b USING ERRCODE = '42501';
@@ -378,7 +378,7 @@ DECLARE
   v_req UUID; v_rec UUID; v_pending BOOL; v_origin UUID; v_conn UUID; v_lo UUID; v_hi UUID; v_ok BOOL;
 BEGIN
   SELECT requester_app_user_id, recipient_app_user_id, is_pending, connection_origin_id INTO v_req, v_rec, v_pending, v_origin
-    FROM connection_request WHERE id = p_request_id AND deleted_at IS NULL FOR UPDATE;
+    FROM connection_request WHERE id = p_request_id FOR UPDATE;
   IF v_req IS NULL THEN
     RAISE EXCEPTION 'BR-NET-04: connection_request % not found', p_request_id USING ERRCODE = '55000';
   END IF;
@@ -438,7 +438,7 @@ BEGIN
   SELECT id INTO v_wait FROM event_rsvp_status WHERE code = 'waitlisted';
   IF p_status = 'going' AND v_cap IS NOT NULL THEN
     SELECT COALESCE(sum(1 + guest_count), 0) INTO v_taken FROM event_rsvp
-     WHERE event_id = p_event_id AND event_rsvp_status_id = v_going AND attendee_app_user_id <> p_user AND deleted_at IS NULL;
+     WHERE event_id = p_event_id AND event_rsvp_status_id = v_going AND attendee_app_user_id <> p_user;
     IF v_taken + 1 + p_guests > v_cap THEN
       v_final := 'waitlisted';
     END IF;
@@ -450,9 +450,9 @@ BEGIN
   -- a freed seat promotes waitlisted attendees in arrival order while they fit
   IF v_cap IS NOT NULL AND p_status <> 'going' THEN
     LOOP
-      SELECT COALESCE(sum(1 + guest_count), 0) INTO v_taken FROM event_rsvp WHERE event_id = p_event_id AND event_rsvp_status_id = v_going AND deleted_at IS NULL;
+      SELECT COALESCE(sum(1 + guest_count), 0) INTO v_taken FROM event_rsvp WHERE event_id = p_event_id AND event_rsvp_status_id = v_going;
       SELECT id, 1 + guest_count INTO v_cand, v_seats FROM event_rsvp
-       WHERE event_id = p_event_id AND event_rsvp_status_id = v_wait AND deleted_at IS NULL ORDER BY responded_at, id LIMIT 1;
+       WHERE event_id = p_event_id AND event_rsvp_status_id = v_wait ORDER BY responded_at, id LIMIT 1;
       EXIT WHEN v_cand IS NULL OR v_taken + v_seats > v_cap;
       UPDATE event_rsvp SET event_rsvp_status_id = v_going, updated_at = now() WHERE id = v_cand;
     END LOOP;
@@ -556,7 +556,7 @@ BEGIN
     RAISE EXCEPTION 'BR-PRF-04: candidate_profile % not found', p_candidate USING ERRCODE = '55000';
   END IF;
   SELECT phone, phone_country_id, verified_at INTO v_phone, v_country, v_verified FROM candidate_contact_phone
-   WHERE id = p_phone_row AND candidate_profile_id = p_candidate AND deleted_at IS NULL FOR UPDATE;
+   WHERE id = p_phone_row AND candidate_profile_id = p_candidate FOR UPDATE;
   IF v_phone IS NULL THEN
     RAISE EXCEPTION 'BR-PRF-04: phone row % does not belong to candidate %', p_phone_row, p_candidate USING ERRCODE = '55000';
   END IF;
@@ -575,7 +575,7 @@ BEGIN
     RAISE EXCEPTION 'BR-PRF-04: candidate_profile % not found', p_candidate USING ERRCODE = '55000';
   END IF;
   SELECT email, verified_at INTO v_email, v_verified FROM candidate_contact_email
-   WHERE id = p_email_row AND candidate_profile_id = p_candidate AND deleted_at IS NULL FOR UPDATE;
+   WHERE id = p_email_row AND candidate_profile_id = p_candidate FOR UPDATE;
   IF v_email IS NULL THEN
     RAISE EXCEPTION 'BR-PRF-04: email row % does not belong to candidate %', p_email_row, p_candidate USING ERRCODE = '55000';
   END IF;

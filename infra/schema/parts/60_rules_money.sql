@@ -32,9 +32,9 @@
 CREATE OR REPLACE FUNCTION fn_wallet_row_hash(p_prev BYTES, p_wallet_id UUID, p_seq INT8, p_type_id UUID, p_delta INT8,
   p_balance_after INT8, p_key TEXT, p_created_at TIMESTAMPTZ, p_actor UUID) RETURNS BYTES
 LANGUAGE SQL AS $$
-  SELECT sha256(COALESCE(p_prev, ''::BYTES) || convert_to(concat_ws('|', p_wallet_id::TEXT, p_seq::TEXT, p_type_id::TEXT,
+  SELECT digest(COALESCE(p_prev, ''::BYTES) || convert_to(concat_ws('|', p_wallet_id::TEXT, p_seq::TEXT, p_type_id::TEXT,
     p_delta::TEXT, p_balance_after::TEXT, p_key, to_char(p_created_at AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISSUS'),
-    COALESCE(p_actor::TEXT, '')), 'UTF8'))
+    COALESCE(p_actor::TEXT, '')), 'UTF8'), 'sha256')
 $$;
 -- @@
 -- ---------------------------------------------------------------------------------------------------------------------
