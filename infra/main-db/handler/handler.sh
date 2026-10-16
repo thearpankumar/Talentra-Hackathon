@@ -104,7 +104,7 @@ SELECT 'ALTER VIEW ' || quote_ident(schemaname) || '.' || quote_ident(viewname) 
 SELECT 'GRANT ' || string_agg(privilege_type, ',') || ' ON DATABASE ' || quote_ident(database_name) || ' TO ' || quote_ident(grantee) FROM [SHOW GRANTS ON DATABASE $DB] WHERE grantee NOT IN ('root','admin','public') GROUP BY database_name, grantee;
 SELECT 'GRANT ' || string_agg(privilege_type, ',') || ' ON SCHEMA ' || quote_ident(schema_name) || ' TO ' || quote_ident(grantee) FROM [SHOW GRANTS ON SCHEMA public] WHERE grantee NOT IN ('root','admin','public') GROUP BY schema_name, grantee;
 SELECT 'GRANT ' || string_agg(privilege_type, ',') || ' ON TABLE ' || quote_ident(table_schema) || '.' || quote_ident(table_name) || ' TO ' || quote_ident(grantee) FROM information_schema.table_privileges WHERE grantee NOT IN ('root','admin','public') AND table_schema NOT IN ('pg_catalog','information_schema','crdb_internal','pg_extension') GROUP BY table_schema, table_name, grantee;
-" 2>/dev/null | grep -E '^(CREATE|GRANT|ALTER) ' || true
+" 2>/dev/null | grep -E '^(CREATE|GRANT|ALTER) ' | grep -v -E '^GRANT admin TO ' || true   # backup_admin has no ADMIN OPTION on admin; talentra_admin is made admin by the backup bootstrap
 }
 
 apply_acl() {
