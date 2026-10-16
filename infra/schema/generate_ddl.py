@@ -400,6 +400,7 @@ def main():
     write_file(outdir, "50_views_masked.sql", mstm)
     stats["masked_views"] = len(mnames)
     bstm, bnames = business_views(m, warnings)
+    bstm = [re.sub(r"(?m)^CREATE FUNCTION ", "CREATE OR REPLACE FUNCTION ", x) for x in bstm]  # re-apply must be idempotent
     write_file(outdir, "52_views_business.sql", bstm)
     stats["business_views"] = len(bnames)
     view_names = set(mnames) | set(bnames)

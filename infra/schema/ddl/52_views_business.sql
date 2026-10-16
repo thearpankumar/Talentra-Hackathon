@@ -505,7 +505,7 @@ JOIN recruiter_organisation_mapping m ON m.organisation_id = c.ancestor_organisa
 JOIN organisation o ON o.id = m.organisation_id AND o.deleted_at IS NULL
      AND o.organisation_status_id = (SELECT id FROM organisation_status WHERE code = 'active')
 WHERE jr.deleted_at IS NULL;
-CREATE FUNCTION fn_recruiter_job_requirement(p_viewer_app_user_id UUID) RETURNS SETOF vw_recruiter_job_requirement
+CREATE OR REPLACE FUNCTION fn_recruiter_job_requirement(p_viewer_app_user_id UUID) RETURNS SETOF vw_recruiter_job_requirement
 LANGUAGE SQL STABLE AS $$ SELECT * FROM vw_recruiter_job_requirement WHERE viewer_app_user_id = p_viewer_app_user_id $$;
 -- @@
 CREATE OR REPLACE VIEW vw_organisation_public AS
