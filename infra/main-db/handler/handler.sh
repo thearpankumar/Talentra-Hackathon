@@ -28,8 +28,8 @@ url() { # user pass host port
 }
 MAIN_URL="$(url "${MAIN_SQL_USER:-talentra_backup}" "${MAIN_SQL_PASSWORD:-}" "$MAIN_HOST" "$MAIN_PORT" ${MAIN_CA:-/certs/main-ca.crt})"
 BK_URL="$(url "${BACKUP_SQL_USER:-backup_admin}" "${BACKUP_SQL_PASSWORD:-}" "$BK_HOST" "$BK_PORT" ${BACKUP_CA:-/certs/backup-ca.crt})"
-msql() { cockroach sql --url "$MAIN_URL" "$@"; }
-bsql() { cockroach sql --url "$BK_URL" "$@"; }
+msql() { COCKROACH_URL="$MAIN_URL" cockroach sql "$@"; }   # URL via env, not argv (argv is world-readable in ps)
+bsql() { COCKROACH_URL="$BK_URL" cockroach sql "$@"; }
 
 # record op kind status start_epoch detail [size_bytes]
 rec() {
