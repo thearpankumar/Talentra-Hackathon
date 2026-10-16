@@ -1,0 +1,37 @@
+version: 1
+defaults: {batch_size: 5000, workers: 4}
+scenarios:
+  - id: smoke_bangalore_it_freshers
+    name: Bangalore IT freshers, heavy Java
+    description: Metro IT freshers in Bangalore with heavy Java skills
+    tags: [metro, it, freshers, java]
+    seed: 7
+    locale_mix: {en_IN: 0.7, hi_IN: 0.2, ta_IN: 0.1}
+    duplicate_rate: 0.03
+    null_rate: 0.08
+    date_range: {start: 2024-01-01, end: 2025-12-31}
+    tables:
+      - table: users
+        record_count: 12000
+        constants: {role: candidate}
+      - table: candidate_profile
+        record_count: 12000
+        fields:
+          years_experience: {dist: exponential, params: {scale: 1.2}, min: 0, max: 4, round: 1}
+          expected_salary_min: {dist: lognormal, params: {mu: 13.4, sigma: 0.35}, round: 2}
+      - table: candidate_skill
+        record_count: 30000
+        fk:
+          candidate_profile_id: {scope: scenario, skew: uniform}
+      - table: employer
+        record_count: 800
+        fields: {size_band: {dist: categorical, weights: {"11-50": 0.4, "51-200": 0.3, "201-1000": 0.2, "1-10": 0.1}}}
+      - table: job_requirement
+        record_count: 4000
+        fk:
+          employer_id: {scope: scenario, skew: zipf, alpha: 1.2}
+      - table: application
+        record_count: 20000
+        fk:
+          job_requirement_id: {scope: scenario, skew: zipf, alpha: 1.1}
+          candidate_profile_id: {scope: scenario, skew: pareto, alpha: 1.5}

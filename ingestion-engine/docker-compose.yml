@@ -1,0 +1,19 @@
+# Single-node insecure CockroachDB for local ingestion development.
+# SQL port: host 26357 -> container 26257 ; Admin UI: host 8089 -> 8080
+services:
+  crdb:
+    image: cockroachdb/cockroach:latest-v25.2
+    container_name: talentra_ingest_crdb
+    command: start-single-node --insecure --cache=.25 --max-sql-memory=.25
+    ports:
+      - "26357:26257"
+      - "8089:8080"
+    volumes:
+      - crdb_data:/cockroach/cockroach-data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health?ready=1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+volumes:
+  crdb_data:

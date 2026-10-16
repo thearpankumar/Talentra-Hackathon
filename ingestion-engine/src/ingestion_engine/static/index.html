@@ -1,0 +1,656 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Talentra Ingestion Engine</title>
+<style>
+:root{--bg:#f4f6f9;--panel:#fff;--text:#1c2430;--muted:#6a7585;--border:#dde2ea;--accent:#2f6fed;--accent-t:#fff;--ok:#1a8f4c;--warn:#b7791f;--bad:#c53030;--addbg:#e6f6ea;--delbg:#fdeaea;--code:#f0f3f8;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#10141a;--panel:#181e27;--text:#e3e8ef;--muted:#8d99aa;--border:#2a3340;--accent:#5b8dff;--accent-t:#0b1020;--ok:#4cc380;--warn:#e0a84a;--bad:#f07272;--addbg:#14301f;--delbg:#3a1c1f;--code:#10151c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
+header h1{font-size:18px;margin:0}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;border:1px solid var(--border);color:var(--muted)}
+.badge.ok{color:var(--ok);border-color:var(--ok)}.badge.bad{color:var(--bad);border-color:var(--bad)}
+nav.tabs{display:none;background:var(--panel);border-bottom:1px solid var(--border)}
+nav.tabs button{flex:1;padding:10px;border:0;background:none;color:var(--muted);font-weight:600;border-bottom:2px solid transparent;cursor:pointer}
+nav.tabs button.active{color:var(--accent);border-color:var(--accent)}
+main{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;padding:14px;align-items:start}
+section.col{display:flex;flex-direction:column;gap:14px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:0}
+.card h2{font-size:14px;margin:0 0 10px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+button,select,input,textarea{font:inherit;color:var(--text)}
+button.btn{padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--panel);cursor:pointer}
+button.btn:hover:not(:disabled){border-color:var(--accent)}
+button.btn:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);color:var(--accent-t);border-color:var(--accent)}
+button.danger{color:var(--bad)}
+input,select,textarea{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 8px}
+textarea{width:100%}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.row.grow>*:first-child{flex:1;min-width:0}
+.muted{color:var(--muted)}.small{font-size:12px}
+.mono,pre,textarea.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+#chatlog{height:380px;overflow:auto;display:flex;flex-direction:column;gap:8px;padding:4px;border:1px solid var(--border);border-radius:8px;background:var(--bg);margin-bottom:8px}
+.msg{padding:8px 10px;border-radius:8px;max-width:92%;white-space:pre-wrap;word-wrap:break-word}
+.msg.user{align-self:flex-end;background:var(--accent);color:var(--accent-t)}
+.msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
+.msg.tool{align-self:flex-start;background:var(--code);color:var(--muted);font-size:12px}
+details.chip{display:inline-block;margin:4px 4px 0 0;border:1px solid var(--border);border-radius:999px;padding:1px 8px;font-size:12px;background:var(--code);color:var(--text);white-space:normal}
+details.chip pre{margin:4px 0;white-space:pre-wrap;word-break:break-all}
+.spinner{width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;display:inline-block;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+.diff{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;border:1px solid var(--border);border-radius:6px;overflow:auto;max-height:260px;background:var(--code);margin:6px 0}
+.diff div{padding:0 8px;white-space:pre}
+.diff .add{background:var(--addbg);color:var(--ok)}.diff .del{background:var(--delbg);color:var(--bad)}.diff .hunk{color:var(--muted)}
+.proposal{border:1px solid var(--border);border-radius:8px;padding:8px;margin:6px 0;background:var(--panel)}
+.issues{color:var(--bad);margin:6px 0;padding-left:18px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--border);vertical-align:top;word-break:break-word}
+th{color:var(--muted);font-weight:600}
+tr.click{cursor:pointer}tr.click:hover,tr.sel{background:var(--code)}
+.tablewrap{overflow:auto;max-height:240px}
+.bar{height:8px;background:var(--code);border-radius:4px;overflow:hidden;border:1px solid var(--border)}
+.bar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+.bar.big{height:14px}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;background:var(--code);color:var(--muted);border:1px solid var(--border)}
+.pill.running{color:var(--accent);border-color:var(--accent)}.pill.completed{color:var(--ok);border-color:var(--ok)}
+.pill.failed,.pill.cancelled{color:var(--bad);border-color:var(--bad)}.pill.paused,.pill.interrupted{color:var(--warn);border-color:var(--warn)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px;margin:10px 0}
+.stats div{background:var(--code);border-radius:6px;padding:6px 8px}.stats b{display:block;font-size:15px}
+.scen{margin:8px 0}.scen .hd{display:flex;justify-content:space-between;gap:8px;cursor:pointer;margin-bottom:3px}
+.scen .tbls{margin:6px 0 6px 14px}
+.evlist{max-height:160px;overflow:auto;font-size:12px;border:1px solid var(--border);border-radius:6px;padding:4px 8px;background:var(--code)}
+.evlist .error,.evlist .err{color:var(--bad)}.evlist .warning,.evlist .warn{color:var(--warn)}
+#toasts{position:fixed;right:14px;bottom:14px;display:flex;flex-direction:column;gap:8px;z-index:100;max-width:min(420px,90vw)}
+.toast{background:var(--bad);color:#fff;padding:9px 12px;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.3);white-space:pre-wrap;word-break:break-word}
+.toast.info{background:var(--ok)}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:50;padding:14px}
+.modal{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;max-width:760px;width:100%;max-height:90vh;overflow:auto}
+.modal h3{margin:0 0 10px}
+.finding{border:1px solid var(--border);border-radius:8px;padding:8px;margin:8px 0}
+.finding label{margin-right:14px}
+@media (max-width:1000px){
+ nav.tabs{display:flex}
+ main{grid-template-columns:1fr}
+ section.col{display:none}section.col.active{display:flex}
+ #chatlog{height:50vh}
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Talentra Ingestion Engine</h1>
+  <span id="llmBadge" class="badge">LLM: checking...</span>
+</header>
+<nav class="tabs" id="tabs">
+  <button data-tab="A" class="active">Chat</button>
+  <button data-tab="B">Config</button>
+  <button data-tab="C">Runs</button>
+</nav>
+<main>
+  <!-- A: chat -->
+  <section class="col active" id="colA">
+    <div class="card">
+      <h2>Assistant</h2>
+      <div id="chatlog"></div>
+      <div class="row grow">
+        <textarea id="chatInput" rows="2" placeholder="Ask about or change the config... (Enter to send, Shift+Enter for newline)"></textarea>
+        <button class="btn primary" id="chatSend">Send</button>
+      </div>
+      <div id="chatWait" class="muted small" style="display:none;margin-top:6px"><span class="spinner"></span> Thinking...</div>
+    </div>
+    <div class="card">
+      <h2>Pending proposals</h2>
+      <div id="pending"><span class="muted small">None</span></div>
+    </div>
+    <div class="card">
+      <h2>Generate scenarios</h2>
+      <div class="row">
+        <label class="small">Count <input id="genCount" type="number" min="1" value="10" style="width:70px"></label>
+        <input id="genTheme" type="text" placeholder="Theme (e.g. healthcare)" style="flex:1;min-width:120px">
+        <button class="btn" id="genBtn">Generate</button>
+      </div>
+      <div id="genOut"></div>
+    </div>
+  </section>
+
+  <!-- B: config -->
+  <section class="col" id="colB">
+    <div class="card">
+      <h2>Active config <span id="cfgVer" class="muted small"></span></h2>
+      <div class="tablewrap" id="summary"></div>
+      <div id="cfgIssues"></div>
+      <textarea id="cfgText" class="mono" rows="18" spellcheck="false" style="margin-top:8px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <select id="cfgFmt"><option value="yaml">YAML</option><option value="json">JSON</option></select>
+        <input id="cfgNote" type="text" placeholder="Note" style="flex:1;min-width:100px">
+        <button class="btn primary" id="cfgSave">Save as new version</button>
+        <button class="btn" id="cfgReload">Reload</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Saved versions</h2>
+      <div class="tablewrap" id="versions"></div>
+      <div id="verView" style="display:none;margin-top:8px">
+        <div class="row" style="justify-content:space-between">
+          <b id="verTitle" class="small"></b>
+          <button class="btn primary" id="verUse">Use this config</button>
+        </div>
+        <pre id="verContent" class="diff" style="padding:6px;white-space:pre;max-height:300px"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- C: runs -->
+  <section class="col" id="colC">
+    <div class="card">
+      <h2>Run control</h2>
+      <div class="row">
+        <label class="small">Workers <input id="optWorkers" type="number" min="1" value="4" style="width:64px"></label>
+        <label class="small">Batch size <input id="optBatch" type="number" min="1" value="10000" style="width:90px"></label>
+        <button class="btn primary" id="btnStart">Start ingest</button>
+      </div>
+      <div id="precheckIssues"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="btnPause">Pause</button>
+        <button class="btn" id="btnResume">Resume</button>
+        <button class="btn" id="btnCancel">Cancel</button>
+        <button class="btn danger" id="btnPurge">Purge</button>
+        <button class="btn" id="btnReport">Report</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Live progress <span id="curRun" class="muted small"></span></h2>
+      <div id="progress"><span class="muted small">No run selected.</span></div>
+    </div>
+    <div class="card">
+      <h2>Run history</h2>
+      <div class="tablewrap" id="history"></div>
+    </div>
+    <div class="card">
+      <h2>Ingested scenarios ledger</h2>
+      <div class="tablewrap" id="ledger"></div>
+    </div>
+  </section>
+</main>
+<div id="toasts"></div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+
+/* ---------- helpers ---------- */
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  if (attrs) for (const k of Object.keys(attrs)) {
+    const v = attrs[k];
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k === 'style') e.style.cssText = v;
+    else e.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const c of kids.flat()) {
+    if (c == null || c === false) continue;
+    e.appendChild(typeof c === 'object' ? c : document.createTextNode(String(c)));
+  }
+  return e;
+}
+function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); return n; }
+function toast(msg, info) {
+  const t = el('div', { class: 'toast' + (info ? ' info' : '') }, String(msg));
+  $('toasts').appendChild(t);
+  setTimeout(() => t.remove(), info ? 3000 : 7000);
+}
+function detailMsg(d) {
+  if (d == null) return 'Unknown error';
+  if (typeof d === 'string') return d;
+  if (Array.isArray(d)) return d.map(detailMsg).join('; ');
+  if (d.detail !== undefined) return detailMsg(d.detail);
+  if (d.issues) return d.issues.join('; ');
+  if (d.message) return String(d.message);
+  if (d.findings) return 'Conflicting scenarios found';
+  try { return JSON.stringify(d); } catch (e) { return String(d); }
+}
+class ApiError extends Error { constructor(status, body) { super(detailMsg(body)); this.status = status; this.body = body; } }
+async function api(path, opts, quiet) {
+  opts = opts || {};
+  const init = { method: opts.method || 'GET', headers: {} };
+  if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
+  try {
+    const r = await fetch(path, init);
+    let data = null;
+    const txt = await r.text();
+    if (txt) { try { data = JSON.parse(txt); } catch (e) { data = txt; } }
+    if (!r.ok) throw new ApiError(r.status, data);
+    return data;
+  } catch (e) {
+    if (!quiet && !(e instanceof ApiError && opts.silentStatus && opts.silentStatus.includes(e.status))) toast(e.message || e);
+    throw e;
+  }
+}
+const post = (p, body, o) => api(p, Object.assign({ method: 'POST', body: body === undefined ? {} : body }, o || {}));
+function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+function fmtTime(s) {
+  if (s == null || !isFinite(s)) return '-';
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h + ':' + String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+}
+function fmtDate(v) {
+  if (v == null) return '-';
+  const d = new Date(typeof v === 'number' ? v * 1000 : v);
+  return isNaN(d) ? String(v) : d.toLocaleString();
+}
+const fmtNum = (n) => (n == null || isNaN(n)) ? '-' : Number(n).toLocaleString();
+const pct = (d, p) => p > 0 ? Math.min(100, 100 * d / p) : 0;
+function issuesEl(list) {
+  if (!list || !list.length) return el('span');
+  return el('ul', { class: 'issues' }, list.map((i) => el('li', null, i)));
+}
+function bar(d, p, big) { const i = el('i'); i.style.width = pct(d, p) + '%'; return el('div', { class: 'bar' + (big ? ' big' : '') }, i); }
+
+/* ---------- tabs ---------- */
+$('tabs').addEventListener('click', (e) => {
+  const t = e.target.closest('button'); if (!t) return;
+  for (const b of $('tabs').children) b.classList.toggle('active', b === t);
+  for (const c of ['A', 'B', 'C']) $('col' + c).classList.toggle('active', c === t.dataset.tab);
+});
+
+/* ---------- LLM status ---------- */
+async function loadLlm() {
+  const b = $('llmBadge');
+  try {
+    const s = await api('/api/llm/status', null, true);
+    b.textContent = 'LLM: ' + (s.provider || '?') + (s.model_id ? ' / ' + s.model_id : '') + (s.available ? '' : ' (unavailable)');
+    b.title = s.note || '';
+    b.className = 'badge ' + (s.available ? 'ok' : 'bad');
+  } catch (e) { b.textContent = 'LLM: status unknown'; b.className = 'badge bad'; }
+}
+
+/* ---------- diff / proposals ---------- */
+function diffEl(text) {
+  const box = el('div', { class: 'diff' });
+  String(text || '').split('\n').forEach((ln) => {
+    let c = '';
+    if (ln.startsWith('+++') || ln.startsWith('---') || ln.startsWith('@@')) c = 'hunk';
+    else if (ln.startsWith('+')) c = 'add';
+    else if (ln.startsWith('-')) c = 'del';
+    box.appendChild(el('div', { class: c }, ln || ' '));
+  });
+  return box;
+}
+function proposalEl(p, after) {
+  const status = el('span', { class: 'muted small' });
+  const acc = el('button', { class: 'btn primary' }, 'Accept');
+  const rej = el('button', { class: 'btn' }, 'Reject');
+  const issuesBox = el('div');
+  const wrap = el('div', { class: 'proposal', 'data-pid': p.id },
+    el('div', null, el('b', null, p.summary || 'Proposal'), ' ', el('span', { class: 'muted small' }, p.id ? '#' + p.id : '')),
+    diffEl(p.diff), issuesBox, el('div', { class: 'row' }, acc, rej, status));
+  const done = (txt) => { acc.disabled = rej.disabled = true; status.textContent = txt; };
+  acc.addEventListener('click', async () => {
+    acc.disabled = rej.disabled = true;
+    try {
+      const r = await post('/api/proposals/' + encodeURIComponent(p.id) + '/accept');
+      done('Accepted (version ' + r.version_id + ')');
+      clear(issuesBox).appendChild(issuesEl(r.issues));
+      toast('Proposal accepted', true);
+      loadConfig(); loadVersions(); loadPending();
+      if (after) after();
+    } catch (e) { acc.disabled = rej.disabled = false; }
+  });
+  rej.addEventListener('click', async () => {
+    acc.disabled = rej.disabled = true;
+    try { await post('/api/proposals/' + encodeURIComponent(p.id) + '/reject'); done('Rejected'); loadPending(); if (after) after(); }
+    catch (e) { acc.disabled = rej.disabled = false; }
+  });
+  return wrap;
+}
+let pendingSig = '';
+async function loadPending() {
+  try {
+    const list = await api('/api/proposals?status=pending', null, true);
+    const sig = JSON.stringify(list.map((p) => p.id));
+    if (sig === pendingSig) return;
+    pendingSig = sig;
+    const box = clear($('pending'));
+    if (!list.length) box.appendChild(el('span', { class: 'muted small' }, 'None'));
+    list.forEach((p) => box.appendChild(proposalEl(p)));
+  } catch (e) {}
+}
+
+/* ---------- chat ---------- */
+let sessionId = lsGet('ingest_session_id');
+if (!sessionId) {
+  sessionId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 's' + Date.now() + Math.random().toString(16).slice(2);
+  lsSet('ingest_session_id', sessionId);
+}
+function chatScroll() { const l = $('chatlog'); l.scrollTop = l.scrollHeight; }
+function addMsg(role, content, extra) {
+  const m = el('div', { class: 'msg ' + role }, content == null ? '' : String(content));
+  if (extra) extra.forEach((x) => m.appendChild(x));
+  $('chatlog').appendChild(m);
+  chatScroll();
+  return m;
+}
+function toolChip(tc) {
+  const body = el('pre', { class: 'mono' }, (tc.args !== undefined ? 'args: ' + JSON.stringify(tc.args, null, 1) + '\n' : '') + (tc.result_summary || ''));
+  return el('details', { class: 'chip' }, el('summary', null, '\u{1F527} ' + (tc.name || 'tool')), body);
+}
+async function loadChat() {
+  try {
+    const h = await api('/api/chat/' + encodeURIComponent(sessionId), null, true);
+    clear($('chatlog'));
+    h.forEach((m) => addMsg(m.role === 'tool' ? 'tool' : m.role, m.content));
+    if (!h.length) addMsg('assistant', 'Hi! Ask me to inspect or edit the ingestion config. Edits come back as proposals you can accept or reject.');
+  } catch (e) { addMsg('assistant', 'Hi! Ask me to inspect or edit the ingestion config.'); }
+}
+let chatBusy = false;
+async function sendChat() {
+  const inp = $('chatInput'); const msg = inp.value.trim();
+  if (!msg || chatBusy) return;
+  chatBusy = true; inp.value = '';
+  $('chatSend').disabled = true; $('chatWait').style.display = '';
+  addMsg('user', msg);
+  try {
+    const r = await post('/api/chat', { session_id: sessionId, message: msg });
+    const extras = (r.tool_calls || []).map(toolChip);
+    (r.proposals || []).forEach((p) => extras.push(proposalEl(p)));
+    addMsg('assistant', r.reply, extras);
+    loadPending();
+  } catch (e) { addMsg('tool', 'Error: ' + e.message); }
+  finally { chatBusy = false; $('chatSend').disabled = false; $('chatWait').style.display = 'none'; inp.focus(); }
+}
+$('chatSend').addEventListener('click', sendChat);
+$('chatInput').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); } });
+
+$('genBtn').addEventListener('click', async () => {
+  const btn = $('genBtn'); btn.disabled = true;
+  const out = clear($('genOut'));
+  out.appendChild(el('span', { class: 'spinner' }));
+  try {
+    const r = await post('/api/scenarios/generate', { count: parseInt($('genCount').value, 10) || 10, theme: $('genTheme').value.trim() });
+    clear(out);
+    if (r.note) out.appendChild(el('div', { class: 'muted small' }, r.note));
+    if (r.proposal) out.appendChild(proposalEl(r.proposal));
+    else if (!r.note) out.appendChild(el('div', { class: 'muted small' }, 'No proposal returned.'));
+    loadPending();
+  } catch (e) { clear(out); } finally { btn.disabled = false; }
+});
+
+/* ---------- config ---------- */
+let cfgDirty = false;
+async function loadConfig(force) {
+  try {
+    const c = await api('/api/config');
+    $('cfgVer').textContent = '(version ' + c.version_id + ')';
+    if (force !== false || !cfgDirty) { $('cfgText').value = c.content || ''; cfgDirty = false; }
+    if (c.fmt) $('cfgFmt').value = c.fmt;
+    clear($('cfgIssues')).appendChild(issuesEl(c.issues));
+    const t = el('table', null,
+      el('thead', null, el('tr', null, ['ID', 'Name', 'Tables', 'Records', 'Fingerprint'].map((h) => el('th', null, h)))),
+      el('tbody', null, (c.summary || []).map((s) => el('tr', null,
+        el('td', null, s.id), el('td', null, s.name), el('td', null, (s.tables || []).join(', ')),
+        el('td', null, fmtNum(s.records)), el('td', { class: 'mono' }, String(s.fingerprint || '').slice(0, 10))))));
+    clear($('summary')).appendChild((c.summary || []).length ? t : el('span', { class: 'muted small' }, 'No scenarios.'));
+  } catch (e) {}
+}
+$('cfgText').addEventListener('input', () => { cfgDirty = true; });
+$('cfgReload').addEventListener('click', () => loadConfig(true));
+$('cfgSave').addEventListener('click', async () => {
+  const btn = $('cfgSave'); btn.disabled = true;
+  try {
+    const r = await api('/api/config', { method: 'PUT', body: { content: $('cfgText').value, fmt: $('cfgFmt').value, note: $('cfgNote').value }, silentStatus: [422] });
+    toast('Saved as version ' + r.version_id, true);
+    cfgDirty = false; $('cfgNote').value = '';
+    await loadConfig(true);
+    clear($('cfgIssues')).appendChild(issuesEl(r.issues));
+    loadVersions();
+  } catch (e) {
+    const iss = e.body && e.body.detail && e.body.detail.issues;
+    if (e.status === 422) clear($('cfgIssues')).appendChild(iss ? issuesEl(iss) : el('div', { class: 'issues' }, e.message));
+  } finally { btn.disabled = false; }
+});
+
+let selVersion = null;
+async function loadVersions() {
+  try {
+    const v = await api('/api/config/versions', null, true);
+    const t = el('table', null,
+      el('thead', null, el('tr', null, ['ID', 'Created', 'Fmt', 'Note', 'Author', 'Size'].map((h) => el('th', null, h)))),
+      el('tbody', null, v.map((x) => {
+        const tr = el('tr', { class: 'click' + (x.id === selVersion ? ' sel' : ''), onclick: () => viewVersion(x.id) },
+          el('td', null, x.id), el('td', null, fmtDate(x.created_at)), el('td', null, x.fmt), el('td', null, x.note || ''),
+          el('td', null, x.author || ''), el('td', null, fmtNum(x.size)));
+        return tr;
+      })));
+    clear($('versions')).appendChild(v.length ? t : el('span', { class: 'muted small' }, 'No saved versions.'));
+  } catch (e) {}
+}
+async function viewVersion(id) {
+  try {
+    const v = await api('/api/config/versions/' + encodeURIComponent(id));
+    selVersion = id;
+    $('verView').style.display = '';
+    $('verTitle').textContent = 'Version ' + v.id + ' (' + v.fmt + ')';
+    $('verContent').textContent = v.content || '';
+    loadVersions();
+  } catch (e) {}
+}
+$('verUse').addEventListener('click', async () => {
+  if (selVersion == null) return;
+  try {
+    const r = await post('/api/config/versions/' + encodeURIComponent(selVersion) + '/activate');
+    toast('Activated version ' + r.version_id, true);
+    loadConfig(true); loadVersions();
+  } catch (e) {}
+});
+
+/* ---------- modal ---------- */
+function openModal(title, bodyNodes, buttons) {
+  const close = () => ov.remove();
+  const foot = el('div', { class: 'row', style: 'justify-content:flex-end;margin-top:12px' },
+    (buttons || [{ label: 'Close' }]).map((b) => el('button', { class: 'btn' + (b.primary ? ' primary' : ''), onclick: () => { if (!b.onclick || b.onclick() !== false) close(); } }, b.label)));
+  const ov = el('div', { class: 'overlay', onclick: (e) => { if (e.target === ov) close(); } },
+    el('div', { class: 'modal', role: 'dialog' }, el('h3', null, title), bodyNodes, foot));
+  document.body.appendChild(ov);
+  return close;
+}
+
+/* ---------- runs ---------- */
+const TERMINAL = ['completed', 'failed', 'cancelled'];
+let curRun = null, curStatus = null, es = null, lastState = null;
+const expanded = new Set();
+
+function updateButtons() {
+  const s = curStatus;
+  const on = (id, list) => { $(id).disabled = !curRun || !list.includes(s); };
+  on('btnPause', ['running']);
+  on('btnResume', ['paused', 'interrupted', 'failed']);
+  on('btnCancel', ['running', 'paused', 'interrupted', 'planned']);
+  on('btnPurge', ['completed', 'failed', 'cancelled', 'interrupted', 'planned', 'paused']);
+  $('btnReport').disabled = !curRun;
+}
+function selectRun(id, status) {
+  if (es) { es.close(); es = null; }
+  curRun = id; curStatus = status || null; lastState = null;
+  $('curRun').textContent = id ? '(' + id + ')' : '';
+  updateButtons();
+  if (!id) return;
+  attach(id);
+  loadRuns();
+}
+function attach(id) {
+  if (es) es.close();
+  es = new EventSource('/api/runs/' + encodeURIComponent(id) + '/events');
+  es.onmessage = (ev) => {
+    let d; try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (id !== curRun) return;
+    lastState = d; curStatus = d.status; renderProgress(d); updateButtons();
+    if (TERMINAL.includes(d.status)) { es.close(); es = null; loadRuns(); loadLedger(); }
+  };
+  es.onerror = () => {
+    // EventSource auto-reconnects; if the run is terminal, stop.
+    if (curStatus && TERMINAL.includes(curStatus) && es) { es.close(); es = null; }
+  };
+}
+function renderProgress(d) {
+  const box = clear($('progress'));
+  const status = d.status || '?';
+  box.appendChild(el('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:6px' },
+    el('span', { class: 'pill ' + status }, status), el('span', { class: 'muted small' }, d.workers != null ? d.workers + ' workers' : '')));
+  box.appendChild(bar(d.total_done, d.total_planned, true));
+  const stat = (k, v) => el('div', null, el('span', { class: 'muted small' }, k), el('b', null, v));
+  box.appendChild(el('div', { class: 'stats' },
+    stat('Rows', fmtNum(d.total_done) + ' / ' + fmtNum(d.total_planned)),
+    stat('Rows/s', d.rate != null ? fmtNum(Math.round(d.rate)) : '-'),
+    stat('ETA', fmtTime(d.eta_s)), stat('Elapsed', fmtTime(d.elapsed))));
+  if (d.error) box.appendChild(el('div', { class: 'issues' }, 'Error: ' + d.error));
+  const sc = d.scenarios || {};
+  Object.keys(sc).forEach((sid) => {
+    const s = sc[sid], open = expanded.has(sid);
+    const wrap = el('div', { class: 'scen' },
+      el('div', { class: 'hd', onclick: () => { open ? expanded.delete(sid) : expanded.add(sid); if (lastState) renderProgress(lastState); } },
+        el('span', null, (open ? '▾ ' : '▸ ') + sid),
+        el('span', { class: 'muted small' }, fmtNum(s.done) + ' / ' + fmtNum(s.planned))),
+      bar(s.done, s.planned));
+    if (open) {
+      const tb = el('div', { class: 'tbls' });
+      const tables = s.tables || {};
+      Object.keys(tables).forEach((t) => {
+        const x = tables[t];
+        tb.appendChild(el('div', { class: 'small', style: 'margin:4px 0' },
+          el('div', { style: 'display:flex;justify-content:space-between;gap:8px' },
+            el('span', null, t), el('span', { class: 'muted' }, fmtNum(x.done) + '/' + fmtNum(x.planned) + ' · ' + (x.status || '') + (x.batches != null ? ' · ' + x.batches + ' batches' : ''))),
+          bar(x.done, x.planned)));
+      });
+      wrap.appendChild(tb);
+    }
+    box.appendChild(wrap);
+  });
+  const evs = (d.events || []).slice(-30).reverse();
+  const errs = (d.errors || []).slice(-20).reverse();
+  if (errs.length) {
+    box.appendChild(el('div', { class: 'small muted', style: 'margin-top:8px' }, 'Errors'));
+    box.appendChild(el('div', { class: 'evlist' }, errs.map((e) => el('div', { class: 'error' }, e))));
+  }
+  if (evs.length) {
+    box.appendChild(el('div', { class: 'small muted', style: 'margin-top:8px' }, 'Recent events'));
+    box.appendChild(el('div', { class: 'evlist' }, evs.map((e) =>
+      el('div', { class: String(e.level || '').toLowerCase() }, (e.ts != null ? new Date(typeof e.ts === 'number' ? e.ts * 1000 : e.ts).toLocaleTimeString() : '') + ' ' + (e.message || '')))));
+  }
+}
+async function loadRuns() {
+  try {
+    const runs = await api('/api/runs', null, true);
+    const t = el('table', null,
+      el('thead', null, el('tr', null, ['Run', 'Status', 'Created', 'Rows', 'Elapsed'].map((h) => el('th', null, h)))),
+      el('tbody', null, runs.map((r) => el('tr', { class: 'click' + (r.id === curRun ? ' sel' : ''), onclick: () => selectRun(r.id, r.status), title: r.error || '' },
+        el('td', { class: 'mono' }, String(r.id).slice(0, 12)), el('td', null, el('span', { class: 'pill ' + r.status }, r.status)),
+        el('td', null, fmtDate(r.created_at)), el('td', null, fmtNum(r.total_done) + '/' + fmtNum(r.total_planned)), el('td', null, fmtTime(r.elapsed))))));
+    clear($('history')).appendChild(runs.length ? t : el('span', { class: 'muted small' }, 'No runs yet.'));
+    const me = runs.find((r) => r.id === curRun);
+    if (me && me.status !== curStatus) { curStatus = me.status; updateButtons(); }
+    if (me && !es && !TERMINAL.includes(me.status)) attach(me.id);
+  } catch (e) {}
+}
+async function loadLedger() {
+  try {
+    const l = await api('/api/ledger', null, true);
+    const t = el('table', null,
+      el('thead', null, el('tr', null, ['Scenario', 'Name', 'Run', 'Status', 'Rows', 'Ingested'].map((h) => el('th', null, h)))),
+      el('tbody', null, l.map((x) => el('tr', null,
+        el('td', null, x.scenario_id), el('td', null, x.name || ''), el('td', { class: 'mono' }, String(x.run_id).slice(0, 8)),
+        el('td', null, x.status), el('td', null, fmtNum(x.rows)), el('td', null, fmtDate(x.ingested_at))))));
+    clear($('ledger')).appendChild(l.length ? t : el('span', { class: 'muted small' }, 'Ledger is empty.'));
+  } catch (e) {}
+}
+
+function runOptions() {
+  const o = {};
+  const w = parseInt($('optWorkers').value, 10), b = parseInt($('optBatch').value, 10);
+  if (w > 0) o.workers = w;
+  if (b > 0) o.batch_size = b;
+  return o;
+}
+function findingsModal(findings) {
+  const choices = {};
+  const body = el('div', null, el('p', { class: 'muted' }, 'Some scenarios appear to be ingested already. Choose what to do for each.'));
+  findings.forEach((f) => {
+    const sid = f.scenario_id; choices[sid] = choices[sid] || 'skip';
+    const name = 'dec_' + sid;
+    const radios = ['skip', 'append', 'replace'].map((v) => {
+      const r = el('input', { type: 'radio', name, value: v, checked: choices[sid] === v });
+      r.addEventListener('change', () => { choices[sid] = v; });
+      return el('label', null, r, ' ' + v.charAt(0).toUpperCase() + v.slice(1));
+    });
+    const bits = [f.kind, f.similarity != null ? 'similarity ' + Number(f.similarity).toFixed(2) : null,
+      f.matched_scenario_id ? 'matches ' + f.matched_scenario_id : null, f.matched_run_id ? 'run ' + f.matched_run_id : null,
+      f.rows != null ? fmtNum(f.rows) + ' rows' : null, f.source, f.ingested_at ? fmtDate(f.ingested_at) : null].filter(Boolean);
+    body.appendChild(el('div', { class: 'finding' },
+      el('div', null, el('b', null, f.scenario_name || sid), ' ', el('span', { class: 'muted small' }, '(' + sid + ')')),
+      el('div', { class: 'small muted' }, bits.join(' · ')), el('div', { class: 'row', style: 'margin-top:6px' }, radios)));
+  });
+  openModal('Confirm ingest decisions', body, [{ label: 'Cancel' }, {
+    label: 'Confirm', primary: true, onclick: () => { startRun(Object.assign({}, choices)); return true; } }]);
+}
+async function startRun(decisions) {
+  const body = {};
+  if (decisions) body.decisions = decisions;
+  const o = runOptions();
+  if (Object.keys(o).length) body.options = o;
+  try {
+    const r = await api('/api/runs', { method: 'POST', body, silentStatus: [409] });
+    toast('Run started', true);
+    selectRun(r.run_id, 'planned');
+  } catch (e) {
+    if (e.status === 409 && e.body && e.body.detail && e.body.detail.findings) findingsModal(e.body.detail.findings);
+    else if (e.status === 409) toast(e.message);
+  }
+}
+$('btnStart').addEventListener('click', async () => {
+  const btn = $('btnStart'); btn.disabled = true;
+  clear($('precheckIssues'));
+  try {
+    const p = await post('/api/runs/precheck', {});
+    if (p.issues && p.issues.length) {
+      $('precheckIssues').appendChild(el('div', null, el('b', { class: 'issues', style: 'list-style:none' }, 'Cannot start:'), issuesEl(p.issues)));
+      return;
+    }
+    if (p.estimate) $('precheckIssues').appendChild(el('div', { class: 'muted small' },
+      'Estimate: ' + fmtNum(p.estimate.total_rows) + ' rows, ~' + fmtTime(p.estimate.est_total_seconds)));
+    if (p.findings && p.findings.length) findingsModal(p.findings);
+    else await startRun(null);
+  } catch (e) {} finally { btn.disabled = false; }
+});
+async function runAction(act) {
+  if (!curRun) return;
+  if (act === 'purge' && !confirm('Purge this run and its ingested data? This cannot be undone.')) return;
+  try {
+    await post('/api/runs/' + encodeURIComponent(curRun) + '/' + act);
+    toast(act + ' requested', true);
+    if (act !== 'purge' && (!es)) attach(curRun);
+    if (act === 'purge') { selectRun(null); clear($('progress')).appendChild(el('span', { class: 'muted small' }, 'Run purged.')); }
+    loadRuns(); loadLedger();
+  } catch (e) {}
+}
+['pause', 'resume', 'cancel', 'purge'].forEach((a) => $('btn' + a.charAt(0).toUpperCase() + a.slice(1)).addEventListener('click', () => runAction(a)));
+$('btnReport').addEventListener('click', async () => {
+  if (!curRun) return;
+  try {
+    const r = await api('/api/runs/' + encodeURIComponent(curRun) + '/report');
+    openModal('Run report ' + curRun, el('pre', { class: 'diff', style: 'padding:8px;white-space:pre-wrap;max-height:60vh' }, JSON.stringify(r, null, 2)));
+  } catch (e) {}
+});
+
+/* ---------- init ---------- */
+updateButtons();
+loadLlm(); loadChat(); loadConfig(true); loadVersions(); loadPending(); loadRuns(); loadLedger();
+setInterval(() => { loadRuns(); loadPending(); }, 5000);
+</script>
+</body>
+</html>

@@ -1,17 +1,48 @@
 [project]
 name = "ingestion-engine"
 version = "0.1.0"
-description = "Add your description here"
+description = "Agentic, scenario-driven bulk data ingestion engine for Talentra"
 readme = "README.md"
-authors = [
-    { name = "thearpankumar", email = "arpankumar1119@outlook.com" }
-]
+authors = [{ name = "thearpankumar", email = "arpankumar1119@outlook.com" }]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "psycopg[binary,pool]>=3.2",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+    "jsonschema>=4.22",
+    "pydantic>=2.8",
+    "python-dotenv>=1.0",
+    "langgraph>=0.2",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "langchain-core>=0.3",
+    "langchain-aws>=0.2",
+    "boto3>=1.35",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "openpyxl>=3.1.5",
+]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.64.0",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
 
 [project.scripts]
-ingestion-engine = "ingestion_engine:main"
+engine = "ingestion_engine.cli:main"
+ingestion-engine = "ingestion_engine.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
