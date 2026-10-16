@@ -5,3 +5,6 @@
 *.key
 !infra/monitoring/grafana/dashboards/Logs/
 !infra/monitoring/grafana/dashboards/Logs/**
+
+# Grafana "Logs" dashboard folder is a source dir, not runtime logs
+!monitoring/grafana/dashboards/Logs/

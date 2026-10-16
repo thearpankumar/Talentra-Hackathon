@@ -628,3 +628,25 @@ http-client.private.env.json
 # schema parts are hand-authored source (override generic "parts/" ignore)
 !infra/schema/parts/
 !infra/schema/parts/**
+
+# ---- Talentra: runtime state, local data and secrets (never commit) ----
+.engine_state/
+**/.engine_state/
+**/state.env
+prod-credentials*
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.prom
+.venv/
+**/.venv/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.cache/
+
+# Re-include: Grafana "Logs" dashboard folder was hit by the generic `logs` rule above
+!infra/monitoring/grafana/dashboards/Logs/

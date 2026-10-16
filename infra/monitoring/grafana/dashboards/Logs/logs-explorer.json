@@ -1,0 +1,851 @@
+{
+ "uid": "logs-explorer",
+ "title": "Logs Explorer",
+ "tags": [
+  "talentra",
+  "loki",
+  "logs"
+ ],
+ "description": "Container and host (systemd journal) logs from Loki via Grafana Alloy.",
+ "editable": false,
+ "graphTooltip": 1,
+ "schemaVersion": 39,
+ "version": 1,
+ "timezone": "browser",
+ "refresh": "30s",
+ "time": {
+  "from": "now-1h",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "container",
+    "label": "Container",
+    "type": "query",
+    "datasource": {
+     "type": "loki",
+     "uid": "loki"
+    },
+    "query": {
+     "query": "label_values(container)",
+     "refId": "var-container"
+    },
+    "refresh": 2,
+    "sort": 1,
+    "multi": true,
+    "includeAll": true,
+    "regex": "",
+    "hide": 0,
+    "current": {
+     "selected": true,
+     "text": [
+      "All"
+     ],
+     "value": [
+      "$__all"
+     ]
+    },
+    "options": []
+   },
+   {
+    "name": "level",
+    "label": "Level",
+    "type": "query",
+    "datasource": {
+     "type": "loki",
+     "uid": "loki"
+    },
+    "query": {
+     "query": "label_values(level)",
+     "refId": "var-level"
+    },
+    "refresh": 2,
+    "sort": 1,
+    "multi": true,
+    "includeAll": true,
+    "regex": "",
+    "hide": 0,
+    "current": {
+     "selected": true,
+     "text": [
+      "All"
+     ],
+     "value": [
+      "$__all"
+     ]
+    },
+    "options": []
+   },
+   {
+    "name": "search",
+    "label": "Contains",
+    "type": "textbox",
+    "query": "",
+    "current": {
+     "selected": false,
+     "text": "",
+     "value": ""
+    },
+    "options": [
+     {
+      "selected": true,
+      "text": "",
+      "value": ""
+     }
+    ]
+   },
+   {
+    "name": "exclude",
+    "label": "Exclude (regex; default matches only empty lines)",
+    "type": "textbox",
+    "query": "^$",
+    "current": {
+     "selected": false,
+     "text": "^$",
+     "value": "^$"
+    },
+    "options": [
+     {
+      "selected": true,
+      "text": "^$",
+      "value": "^$"
+     }
+    ]
+   }
+  ]
+ },
+ "panels": [
+  {
+   "type": "row",
+   "id": 1,
+   "title": "Volume",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "Log volume by container",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "sum by (container) (count_over_time({container=~\"$container\"} |~ \"(?i)$search\" !~ \"(?i)$exclude\" [$__auto]))",
+     "legendFormat": "{{container}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short",
+     "custom": {
+      "drawStyle": "bars",
+      "lineWidth": 1,
+      "fillOpacity": 60,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      },
+      "lineInterpolation": "linear",
+      "thresholdsStyle": {
+       "mode": "off"
+      },
+      "axisPlacement": "auto"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "Log volume by level",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 1,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "sum by (level) (count_over_time({container=~\"$container\", level=~\"$level\"} [$__auto]))",
+     "legendFormat": "{{level}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short",
+     "custom": {
+      "drawStyle": "bars",
+      "lineWidth": 1,
+      "fillOpacity": 60,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      },
+      "lineInterpolation": "linear",
+      "thresholdsStyle": {
+       "mode": "off"
+      },
+      "axisPlacement": "auto"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "error"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "red"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "warn"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "yellow"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Errors in range",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 9,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "sum(count_over_time({container=~\"$container\", level=~\"error|fatal\"} [$__range]))",
+     "legendFormat": ""
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "#EAB839",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 100
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "none",
+    "textMode": "auto",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Warnings in range",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 4,
+    "y": 9,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "sum(count_over_time({container=~\"$container\", level=\"warn\"} [$__range]))",
+     "legendFormat": ""
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "#EAB839",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "none",
+    "textMode": "auto",
+    "justifyMode": "auto",
+    "orientation": "auto"
+   }
+  },
+  {
+   "id": 6,
+   "type": "bargauge",
+   "title": "Top containers by error lines",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 9,
+    "w": 8,
+    "h": 4
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "topk(10, sum by (container) (count_over_time({level=~\"error|fatal\"} [$__range])))",
+     "legendFormat": "{{container}}",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "#EAB839",
+        "value": 10
+       },
+       {
+        "color": "red",
+        "value": 100
+       }
+      ]
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "displayMode": "gradient",
+    "orientation": "horizontal",
+    "showUnfilled": true,
+    "valueMode": "color"
+   }
+  },
+  {
+   "type": "row",
+   "id": 7,
+   "title": "Container logs",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 13,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 8,
+   "type": "logs",
+   "title": "Logs",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 14,
+    "w": 24,
+    "h": 14
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "{container=~\"$container\"} |~ \"(?i)$search\" !~ \"(?i)$exclude\"",
+     "legendFormat": "",
+     "queryType": "range",
+     "maxLines": 500
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "showTime": true,
+    "wrapLogMessage": true,
+    "prettifyLogMessage": false,
+    "enableLogDetails": true,
+    "dedupStrategy": "none",
+    "sortOrder": "Descending",
+    "showLabels": false,
+    "showCommonLabels": false
+   }
+  },
+  {
+   "type": "row",
+   "id": 9,
+   "title": "Host (systemd journal; prod only)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 28,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 10,
+   "type": "logs",
+   "title": "Journal: warnings and above",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 29,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "{job=\"systemd-journal\", level=~\"emerg|alert|crit|err|warning\"}",
+     "legendFormat": "",
+     "queryType": "range",
+     "maxLines": 500
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "showTime": true,
+    "wrapLogMessage": true,
+    "prettifyLogMessage": false,
+    "enableLogDetails": true,
+    "dedupStrategy": "none",
+    "sortOrder": "Descending",
+    "showLabels": false,
+    "showCommonLabels": false
+   }
+  },
+  {
+   "id": 11,
+   "type": "logs",
+   "title": "Journal: docker / sshd / kernel / chrony",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 37,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "{job=\"systemd-journal\", unit=~\"docker.service|ssh.service|sshd.service|chrony.service|chronyd.service|systemd-timesyncd.service|containerd.service\"}",
+     "legendFormat": "",
+     "queryType": "range",
+     "maxLines": 500
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "showTime": true,
+    "wrapLogMessage": true,
+    "prettifyLogMessage": false,
+    "enableLogDetails": true,
+    "dedupStrategy": "none",
+    "sortOrder": "Descending",
+    "showLabels": false,
+    "showCommonLabels": false
+   }
+  },
+  {
+   "type": "row",
+   "id": 12,
+   "title": "CockroachDB, backups, edge",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 45,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 13,
+   "type": "logs",
+   "title": "CockroachDB errors and warnings",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 46,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "{container=~\".*crdb.*|.*cockroach.*\"} |~ \"^[EWF]\\\\d{6}|(?i)\\\"severity\\\":\\\"(ERROR|WARNING|FATAL)\\\"\"",
+     "legendFormat": "",
+     "queryType": "range",
+     "maxLines": 500
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "showTime": true,
+    "wrapLogMessage": true,
+    "prettifyLogMessage": false,
+    "enableLogDetails": true,
+    "dedupStrategy": "none",
+    "sortOrder": "Descending",
+    "showLabels": false,
+    "showCommonLabels": false
+   }
+  },
+  {
+   "id": 14,
+   "type": "logs",
+   "title": "backup-handler",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 54,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "{container=~\".*backup-handler.*\"}",
+     "legendFormat": "",
+     "queryType": "range",
+     "maxLines": 500
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "showTime": true,
+    "wrapLogMessage": true,
+    "prettifyLogMessage": false,
+    "enableLogDetails": true,
+    "dedupStrategy": "none",
+    "sortOrder": "Descending",
+    "showLabels": false,
+    "showCommonLabels": false
+   }
+  },
+  {
+   "id": 15,
+   "type": "logs",
+   "title": "Caddy access/errors",
+   "description": "",
+   "datasource": {
+    "type": "loki",
+    "uid": "loki"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 62,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "loki",
+      "uid": "loki"
+     },
+     "expr": "{container=~\".*caddy.*\"}",
+     "legendFormat": "",
+     "queryType": "range",
+     "maxLines": 500
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "showTime": true,
+    "wrapLogMessage": true,
+    "prettifyLogMessage": false,
+    "enableLogDetails": true,
+    "dedupStrategy": "none",
+    "sortOrder": "Descending",
+    "showLabels": false,
+    "showCommonLabels": false
+   }
+  }
+ ],
+ "annotations": {
+  "list": [
+   {
+    "name": "Alerts firing",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
+    },
+    "enable": true,
+    "iconColor": "red",
+    "expr": "ALERTS{alertstate=\"firing\",severity=~\"warning|critical\",alertname!=\"Watchdog\"}",
+    "step": "60s",
+    "titleFormat": "{{alertname}}",
+    "textFormat": "{{summary}}",
+    "tagKeys": "severity",
+    "useValueForTime": false
+   }
+  ]
+ },
+ "links": [
+  {
+   "type": "dashboards",
+   "title": "Talentra dashboards",
+   "tags": [
+    "talentra"
+   ],
+   "asDropdown": true,
+   "includeVars": false,
+   "keepTime": true,
+   "icon": "external link",
+   "targetBlank": false
+  },
+  {
+   "type": "link",
+   "title": "Prometheus alerts",
+   "url": "/alerting/list",
+   "icon": "bolt",
+   "targetBlank": false
+  }
+ ],
+ "fiscalYearStartMonth": 0,
+ "liveNow": false
+}
