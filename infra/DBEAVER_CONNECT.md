@@ -35,3 +35,17 @@ psql "host=db.talentra.thearpanhq.in port=26259 dbname=talentra user=talentra_ap
 psql "host=backup.talentra.thearpanhq.in port=26258 dbname=talentra user=backup_admin sslmode=verify-full sslrootcert=infra/certs/backup-ca.crt"
 ```
 Set `PGPASSWORD` from the credentials file rather than typing it on the command line.
+
+## 5. Backup cluster and sync verification (verified 2026-10-16)
+The backup cluster (`backup.talentra.thearpanhq.in:26258`, database `talentra`, user `backup_admin`, CA `infra/certs/backup-ca.crt`) holds a restored copy of main, rebuilt by the scheduled handler (full + incremental backups of main, then a RESTORE into the backup cluster under the same database name, then roles/owners/grants mirrored, then row counts compared). DBeaver settings are identical to the main connection; only host, port, user and root certificate differ (table in section 2).
+Live comparison after the first full sync (empty schema, no data yet):
+
+| Object | main (`db.` 26257) | backup (`backup.` 26258) |
+|---|---|---|
+| tables | 1306 | 1306 |
+| views | 765 | 765 |
+| indexes | 4614 | 4614 |
+| rows (all tables) | 3121 (seed lookups) | 3121 |
+| per-table count mismatches | - | 0 |
+
+The backup copy is briefly absent while a sync restores (the database is dropped and restored under the stable name), so a DBeaver session open at that moment must be refreshed. Schedule and manual triggers: `infra/README.md` (section "Backup schedule and manual runs").
