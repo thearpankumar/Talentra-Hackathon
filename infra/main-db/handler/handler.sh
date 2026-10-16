@@ -85,8 +85,8 @@ cmd_verify() { # one connection per cluster, all counts in one stream (a connect
   for t in $tables; do echo "SELECT '$t' AS t, count(*) AS c FROM $DB.public.\"$t\";"; done > "$sq"
   msql --format=csv < "$sq" 2>/dev/null | grep -E '^[a-z0-9_]+,[0-9]+$' | sort > "$mo"
   bsql --format=csv < "$sq" 2>/dev/null | grep -E '^[a-z0-9_]+,[0-9]+$' | sort > "$bo"
-  if [ -s "$mo" ] && cmp -s "$mo" "$bo"; then bad=0; else bad=1; fi
-  detail="tables=$(wc -l < "$mo") rows_main=$(awk -F, '{s+=$2} END{print s+0}' "$mo") rows_backup=$(awk -F, '{s+=$2} END{print s+0}' "$bo") mismatched=$(diff "$mo" "$bo" | grep -c '^<')"
+  if [ -s "$mo" ] && [ "$(comm -3 "$mo" "$bo" | wc -l)" = 0 ]; then bad=0; else bad=1; fi
+  detail="tables=$(wc -l < "$mo") rows_main=$(awk -F, '{s+=$2} END{print s+0}' "$mo") rows_backup=$(awk -F, '{s+=$2} END{print s+0}' "$bo") mismatched=$(comm -23 "$mo" "$bo" | wc -l)"
   rm -f "$sq" "$mo" "$bo"
   [ $bad -eq 0 ] && rec verify counts ok "$s" "$detail" || rec verify counts drift "$s" "$detail"
   echo "$detail"; return $bad
