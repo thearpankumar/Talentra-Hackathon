@@ -8,3 +8,5 @@
 
 # Grafana "Logs" dashboard folder is a source dir, not runtime logs
 !monitoring/grafana/dashboards/Logs/
+
+prod-snapshot/

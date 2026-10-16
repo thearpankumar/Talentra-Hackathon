@@ -42,3 +42,17 @@ license-check:
 config-check:
 	@for f in backup-db main-db caddy monitoring; do for y in docker-compose.yml docker-compose.prod.yml; do \
 	  [ -f $$f/$$y ] && (cd $$f && docker compose -f $$y config -q 2>&1 | grep -v -E "variable is not set|WARN" ; true) && echo "ok $$f/$$y"; done; done
+
+# ---- prod operations (EC2 over ssh; nothing here prints secrets) ----
+.PHONY: backup-now sync-now prod-env-check prod-snapshot schema-prod-remote
+# manual backup / restore-sync trigger inside the running handler (sync runs in the background on the host: it takes many minutes with 1306 tables)
+backup-now:     ; bash aws-scripts/ssh.sh 'docker exec talentra-main-backup-handler-1 handler.sh backup $(or $(KIND),incr)'
+sync-now:       ; bash aws-scripts/ssh.sh 'nohup docker exec talentra-main-backup-handler-1 handler.sh sync > /opt/talentra/logs/sync-manual.log 2>&1 & echo started; tail -3 /opt/talentra/repo/infra/main-db/logs/backup_timing.csv'
+# every variable the compose files reference (non-defaulted) or .env.example lists must be set (non-empty) in the server .env; prints names only
+prod-env-check:
+	@bash scripts/prod-env-check.sh
+# pull the live non-secret config state back to ./prod-snapshot/ so it can be diffed against git (git diff --no-index prod-snapshot ...)
+prod-snapshot:
+	@bash scripts/prod-snapshot.sh
+# run the schema apply on the host in tmux (needs /opt/talentra/schema.env, see PROD_RUNBOOK.md)
+schema-prod-remote: ; bash aws-scripts/ssh.sh 'tmux new-session -d -s apply ". /opt/talentra/schema.env; cd /opt/talentra/repo/infra/schema; /opt/talentra/venv/bin/python -u apply.py --soft --workers 6 > /opt/talentra/logs/apply-$$(date +%s).log 2>&1"; echo started in tmux session apply'

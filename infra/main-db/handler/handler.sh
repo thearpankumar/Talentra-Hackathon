@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Talentra backup handler: scheduled BACKUP (full + incremental) of main, and sync (RESTORE) into the backup cluster.
-# Usage: handler.sh loop | backup [full|incr] | sync | verify
+# Usage: handler.sh loop | backup [full|incr] | sync | acl | verify
 set -u
 SECURE="${CRDB_SECURE:-0}"
 LOGDIR="${LOG_DIR:-/logs}"; STATE="${STATE_DIR:-/state}"
@@ -79,15 +79,15 @@ cmd_backup() {
   do_backup "$kind"
 }
 
-cmd_verify() {
-  local tables t m b bad=0 s; s=$(date +%s)
+cmd_verify() { # one connection per cluster, all counts in one stream (a connection per table takes ~20 min at 1306 tables)
+  local tables t bad=0 s sq mo bo detail; s=$(date +%s); sq=$(mktemp); mo=$(mktemp); bo=$(mktemp)
   tables=$(msql --format=csv -e "SELECT table_name FROM $DB.information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'" 2>/dev/null | tail -n +2)
-  local detail=""
-  for t in $tables; do
-    m=$(msql --format=csv -e "SELECT count(*) FROM $DB.public.\"$t\"" 2>/dev/null | tail -1)
-    b=$(bsql --format=csv -e "SELECT count(*) FROM $DB.public.\"$t\"" 2>/dev/null | tail -1)
-    detail="$detail $t main=$m backup=$b;"; [ "$m" = "$b" ] || bad=1
-  done
+  for t in $tables; do echo "SELECT '$t' AS t, count(*) AS c FROM $DB.public.\"$t\";"; done > "$sq"
+  msql --format=csv < "$sq" 2>/dev/null | grep -E '^[a-z0-9_]+,[0-9]+$' | sort > "$mo"
+  bsql --format=csv < "$sq" 2>/dev/null | grep -E '^[a-z0-9_]+,[0-9]+$' | sort > "$bo"
+  if [ -s "$mo" ] && cmp -s "$mo" "$bo"; then bad=0; else bad=1; fi
+  detail="tables=$(wc -l < "$mo") rows_main=$(awk -F, '{s+=$2} END{print s+0}' "$mo") rows_backup=$(awk -F, '{s+=$2} END{print s+0}' "$bo") mismatched=$(diff "$mo" "$bo" | grep -c '^<')"
+  rm -f "$sq" "$mo" "$bo"
   [ $bad -eq 0 ] && rec verify counts ok "$s" "$detail" || rec verify counts drift "$s" "$detail"
   echo "$detail"; return $bad
 }
@@ -110,13 +110,15 @@ SELECT 'GRANT ' || string_agg(privilege_type, ',') || ' ON TABLE ' || quote_iden
 apply_acl() {
   local s f n; s=$(date +%s); f=$(mktemp)
   acl_sql | sed 's/$/;/' > "$f"; n=$(wc -l < "$f")
+  # schema changes are slow one by one (about 0.3 s each, 17k statements at 1306 tables): run them in transactions of 200
+  awk 'NR%200==1{print "BEGIN;"} {print} NR%200==0{print "COMMIT;"} END{if(NR%200!=0)print "COMMIT;"}' "$f" > "$f.b"
   if [ "$n" -eq 0 ]; then rm -f "$f"; rec sync acl fail "$s" "no ACL statements generated from main"; return 1; fi
-  if bsql -d "$DB" < "$f" >/dev/null 2>&1; then rec sync acl ok "$s" "applied $n statements"
+  if bsql -d "$DB" < "$f.b" >/dev/null 2>&1; then rec sync acl ok "$s" "applied $n statements"
   else # slow path: one statement at a time so one bad statement does not skip the rest
     local bad=0 l; while IFS= read -r l; do bsql -d "$DB" -e "$l" >/dev/null 2>&1 || bad=$((bad+1)); done < "$f"
     [ $bad -eq 0 ] && rec sync acl ok "$s" "applied $n statements (slow path)" || rec sync acl fail "$s" "$bad of $n statements failed"
   fi
-  rm -f "$f"
+  rm -f "$f" "$f.b"
 }
 
 # Restore into the STABLE name. A restore under another name (new_db_name) and ALTER DATABASE RENAME does not work:
@@ -152,6 +154,7 @@ case "${1:-loop}" in
   backup) shift; cmd_backup "${1:-auto}" ;;
   sync)   cmd_sync ;;
   verify) cmd_verify ;;
+  acl)    apply_acl ;;
   loop)
     echo "handler loop: full=${FULL_MIN}m incr=${INCR_MIN}m sync=${SYNC_MIN}m"
     wait_main
