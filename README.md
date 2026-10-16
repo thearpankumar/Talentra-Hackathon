@@ -212,8 +212,33 @@ bash infra/aws-scripts/provision.sh     # EC2 + Elastic IP
 make -C infra deploy-prod               # git clone on host + compose up
 ```
 
-- Connecting from DBeaver or psql: see [`infra/DBEAVER_CONNECT.md`](infra/DBEAVER_CONNECT.md)
+- Connecting from DBeaver: see [`infra/DBEAVER_CONNECT.md`](infra/DBEAVER_CONNECT.md)
 - Rebuilding prod from scratch: see [`infra/PROD_RUNBOOK.md`](infra/PROD_RUNBOOK.md)
+
+## Connect with psql
+
+```bash
+# Where to get these:
+#   <DB_USER> / <DB_PASSWORD>  ->  .aws-creds/prod-credentials.txt (local, gitignored; generated at deploy time)
+#       main, admin       user: talentra_admin      password var: TALENTRA_ADMIN_PASSWORD
+#       main, read-only   user: talentra_app_ro     password var: TALENTRA_APP_RO_PASSWORD
+#       backup            user: backup_admin        password var: BACKUP_ADMIN_PASSWORD
+#   CA certificates       ->  infra/certs/main-ca.crt and infra/certs/backup-ca.crt (public, in this repo)
+#   Full role list and DBeaver settings  ->  infra/DBEAVER_CONNECT.md
+
+# Main DB, write port (leaseholder node)
+PGPASSWORD='<DB_PASSWORD>' psql "host=db.talentra.thearpanhq.in port=26257 dbname=talentra user=<DB_USER> sslmode=verify-full sslrootcert=infra/certs/main-ca.crt"
+
+# Main DB, read port (follower reads, read-only roles)
+PGPASSWORD='<DB_PASSWORD>' psql "host=db.talentra.thearpanhq.in port=26259 dbname=talentra user=<DB_USER> sslmode=verify-full sslrootcert=infra/certs/main-ca.crt"
+
+# Backup DB
+PGPASSWORD='<DB_PASSWORD>' psql "host=backup.talentra.thearpanhq.in port=26258 dbname=talentra user=<DB_USER> sslmode=verify-full sslrootcert=infra/certs/backup-ca.crt"
+```
+
+- Run from the repo root, or point `sslrootcert` at the CA file
+- Passwords are alphanumeric, so no shell escaping is needed
+- Smoke check: `-c "select count(*) from information_schema.tables where table_schema='public'"` should return 2077 (1,306 tables + 771 views)
 
 ## Documentation index
 
