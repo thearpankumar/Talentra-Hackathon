@@ -52,3 +52,6 @@ Because IMDSv2 hop limit is 2, containers can still reach instance metadata if n
 4. Home IP changes lock out SSH/SQL: update SG rules (`aws ec2 authorize-security-group-ingress`) or edit in console.
 5. Stop/start keeps EIP and disk, but containers need `restart: unless-stopped` to come back.
 6. Let's Encrypt needs DNS A records for talentra./db./backup./ui. pointed at the EIP before Caddy starts, plus ports 80/443 open.
+
+## Applied budget (deployed Oct 2026, host has 30 GiB usable)
+The defaults above exceeded 30 GiB once monitoring (about 3.3 GiB) and the handler were added, so `infra/main-db/.env` and `infra/backup-db/.env` set (in compose via `N*_CACHE`, `N*_SQL_MEM`, `N*_MEM_LIMIT`, `BK_*`): main node1 cache 2 GiB / sql 1.5 GiB / limit 5 g; node2 and node3 1.5 GiB / 1 GiB / 4 g; backup 2 GiB / 1.5 GiB / 5 g. Container limits total about 18 g (databases) + 3.3 g (monitoring) + 1.5 g (handler) + 0.75 g (haproxy, caddy) = about 23.6 g, leaving page cache headroom. Raise caches again if the host is resized.

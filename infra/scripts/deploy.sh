@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Copy infra/ to /opt/talentra/infra on the EC2 host (tar over ssh; no rsync needed), then optionally bring stacks up.
-# Excludes logs/, certs-public/ (generated on the host) and local.env. Keeps remote .env files (we only overwrite what we send;
-# .env files ARE sent if present locally: create them from .env.example first).
-# Usage: scripts/deploy.sh [--up]
+# Deploy = git on the EC2 host (public repo, https, no credentials): clone or fast-forward /opt/talentra/repo, then optionally bring stacks up.
+# Generated-on-server files stay out of git and survive pulls: infra/*/.env (gitignored), infra/*/certs-public, infra/*/logs.
+# Usage: scripts/deploy.sh [--up] [--env]
+#   --env  also copy the local gitignored infra/*/.env files to the host over ssh (tar, mode 600; never printed or committed)
 set -euo pipefail
 INFRA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$INFRA/aws-scripts/common.sh"; load_state
+REPO_URL="${REPO_URL:-https://github.com/thearpankumar/Talentra-Hackathon.git}"
+BRANCH="${BRANCH:-master}"
 SSH=(ssh -i "$KEY_FILE" -o StrictHostKeyChecking=accept-new "ubuntu@$PUBLIC_IP")
+"${SSH[@]}" "sudo mkdir -p /opt/talentra && sudo chown ubuntu:ubuntu /opt/talentra && cd /opt/talentra && \
+  if [ -d repo/.git ]; then git -C repo fetch --depth 1 origin $BRANCH && git -C repo reset --hard FETCH_HEAD; \
+  else git clone --depth 1 --branch $BRANCH $REPO_URL repo; fi && \
+  chmod +x repo/infra/*/scripts/*.sh repo/infra/*/handler/*.sh repo/infra/scripts/*.sh 2>/dev/null; git -C repo log --oneline -1"
+if [[ " $* " == *" --env "* ]]; then
+  for s in backup-db main-db caddy monitoring; do [ -f "$INFRA/$s/.env" ] || echo "WARN: $s/.env missing locally"; done
+  tar -C "$INFRA" -cf - $(cd "$INFRA" && ls */.env 2>/dev/null) | "${SSH[@]}" "tar -C /opt/talentra/repo/infra -xf - && chmod 600 /opt/talentra/repo/infra/*/.env && echo env copied"
+fi
 for s in backup-db main-db caddy; do
-  [ -f "$INFRA/$s/.env" ] || echo "WARN: $s/.env missing locally (copy $s/.env.example and fill it in) - prod up will fail without it"
+  "${SSH[@]}" "[ -f /opt/talentra/repo/infra/$s/.env ]" || echo "WARN: $s/.env missing on host - prod up will fail without it (use --env)"
 done
-"${SSH[@]}" "sudo mkdir -p /opt/talentra/infra && sudo chown -R ubuntu:ubuntu /opt/talentra"
-tar -C "$INFRA" --exclude=logs --exclude=certs-public --exclude=local.env --exclude='aws-scripts' --exclude=.git -czf - . \
-  | "${SSH[@]}" "tar -C /opt/talentra/infra -xzf - && chmod 600 /opt/talentra/infra/*/.env 2>/dev/null; chmod +x /opt/talentra/infra/*/scripts/*.sh /opt/talentra/infra/*/handler/*.sh 2>/dev/null; echo deployed"
-[ "${1:-}" = "--up" ] && bash "$INFRA/scripts/stack.sh" prod up
+[[ " $* " == *" --up "* ]] && bash "$INFRA/scripts/stack.sh" prod up
 exit 0

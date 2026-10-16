@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # stack.sh <local|prod> <up|down|logs|ps|restart|pull> [stack ...]
 # Order on up: network+volume -> backup-db -> main-db -> monitoring -> caddy.  Reverse on down.
-# prod runs the same command over SSH on the EC2 host in /opt/talentra/infra (use deploy.sh first).
+# prod runs the same command over SSH on the EC2 host in /opt/talentra/repo/infra (use deploy.sh first).
 set -euo pipefail
 INFRA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENVN="${1:?local|prod}"; ACT="${2:?action}"; shift 2
@@ -12,7 +12,7 @@ if [ "$ENVN" = prod ]; then FILE=docker-compose.prod.yml; else FILE=docker-compo
 run() { # run <shell cmd> in context (local or remote)
   if [ "$ENVN" = prod ]; then bash "$INFRA/aws-scripts/ssh.sh" "$1"; else bash -c "$1"; fi
 }
-dir() { if [ "$ENVN" = prod ]; then echo "/opt/talentra/infra/$1"; else echo "$INFRA/$1"; fi; }
+dir() { if [ "$ENVN" = prod ]; then echo "/opt/talentra/repo/infra/$1"; else echo "$INFRA/$1"; fi; }
 # certs-public/ca.crt must be a FILE (Docker turns a missing single-file bind mount into a directory): repair local leftovers.
 fix_certs() { local d; for d in main-db backup-db; do [ -d "$INFRA/$d/certs-public/ca.crt" ] && { echo "repairing $d/certs-public/ca.crt (was a directory)"; rm -rf "$INFRA/$d/certs-public/ca.crt"; }; mkdir -p "$INFRA/$d/certs-public"; done; true; }
 prep() {

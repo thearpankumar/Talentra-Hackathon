@@ -1,5 +1,5 @@
 # One Makefile for all three stacks.  STACK=backup-db|main-db|monitoring|caddy (monitoring is owned by another agent) (omit for all, in dependency order).
-# Local = docker-compose.yml (laptop, insecure, no domains).  Prod = docker-compose.prod.yml on EC2 (/opt/talentra/infra) via SSH.
+# Local = docker-compose.yml (laptop, insecure, no domains).  Prod = docker-compose.prod.yml on EC2 (/opt/talentra/repo/infra) via SSH.
 SHELL := bash
 STACK ?=
 S := $(STACK)
@@ -16,8 +16,8 @@ down-local-all: ; bash scripts/stack.sh local down
 test-local:     ; bash scripts/test-local.sh
 
 # ---- prod (EC2) - never run casually; deploy first ----
-deploy-prod:    ; bash scripts/deploy.sh
-deploy-prod-up: ; bash scripts/deploy.sh --up
+deploy-prod:    ; bash scripts/deploy.sh --env     # ssh -> git clone/pull on host (+ copy gitignored .env)
+deploy-prod-up: ; bash scripts/deploy.sh --env --up
 up-prod:        ; bash scripts/stack.sh prod up $(S)
 down-prod:      ; bash scripts/stack.sh prod down $(S)
 logs-prod:      ; bash scripts/stack.sh prod logs $(S)

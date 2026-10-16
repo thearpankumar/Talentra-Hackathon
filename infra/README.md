@@ -16,7 +16,7 @@ Start order (enforced by `scripts/stack.sh`): `talentra-edge` network + volume -
 make up-local-all            # or: make up-local STACK=main-db
 make ps-local / logs-local / down-local-all
 make test-local              # acceptance tests (routing, read-only, backup->sync counts, caddy, node1 failover)
-make deploy-prod             # tar|ssh infra/ to /opt/talentra/infra (EC2 key from .aws-creds)
+make deploy-prod             # ssh -> git clone/pull on the host into /opt/talentra/repo, copies gitignored .env files; deploy-prod-up also starts all stacks
 make up-prod [STACK=..] / down-prod / ps-prod / logs-prod     # runs compose over SSH on EC2
 ```
 Prod needs `.env` in backup-db, main-db and caddy (copy `.env.example`, fill passwords; `BACKUP_ADMIN_PASSWORD` must match in both DB stacks).
