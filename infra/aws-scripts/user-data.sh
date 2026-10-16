@@ -27,6 +27,8 @@ mkdir -p /etc/docker
 cat > /etc/docker/daemon.json <<'JSON'
 {
   "log-driver": "local",
+  "live-restore": true,
+  "metrics-addr": "172.17.0.1:9323",
   "log-opts": { "max-size": "50m", "max-file": "5" },
   "default-ulimits": { "nofile": { "Name": "nofile", "Hard": 1048576, "Soft": 1048576 } }
 }
@@ -66,6 +68,7 @@ bantime = 1h
 ' > /etc/fail2ban/jail.d/sshd.local
 systemctl enable --now fail2ban
 ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 26257:26259/tcp
+ufw allow from 172.16.0.0/12 to any port 9100,9323 proto tcp   # Prometheus (container) -> node_exporter / dockerd metrics on docker0
 ufw --force enable
 
 # --- workspace ---
