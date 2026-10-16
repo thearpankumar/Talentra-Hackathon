@@ -1,0 +1,32 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: talentra-logs
+    folder: Talentra
+    interval: 1m
+    rules:
+      - uid: talentra-log-error-burst
+        title: LogErrorBurst
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: OK
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 50 error-level log lines in 5m from {{ $labels.container }}"
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: loki
+            model:
+              refId: A
+              expr: 'sum by (container) (count_over_time({level=~"error|fatal"}[5m]))'
+              queryType: instant
+          - refId: B
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last, datasource: {type: __expr__, uid: __expr__}}
+          - refId: C
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [50]}}], datasource: {type: __expr__, uid: __expr__}}

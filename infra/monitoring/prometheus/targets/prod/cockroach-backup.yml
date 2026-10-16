@@ -1,0 +1,2 @@
+- targets: ["backup-crdb:8080"]
+  labels: {cluster: backup}

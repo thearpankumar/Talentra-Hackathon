@@ -1,0 +1,76 @@
+# Cluster-level SQL metrics, valid on any CockroachDB cluster (main and backup).
+# Required privileges for the monitoring role (see INTEGRATION_REQUESTS.md):
+#   GRANT SYSTEM VIEWACTIVITY, VIEWCLUSTERMETADATA, VIEWJOB, VIEWCLUSTERSETTING TO talentra_monitor;
+# IMPORTANT: sql_exporter answers HTTP 500 (target DOWN, no samples) if ANY query errors, so every query here is
+# guaranteed to return zero rows - never an error - when its source is empty or the talentra database does not exist yet.
+# Verified against a secure v26.2 cluster with the least-privilege role (SHOW SCHEDULES needs SELECT on system tables -> not used).
+collector_name: crdb_common
+min_interval: 60s
+
+metrics:
+  - metric_name: crdb_sql_up
+    type: gauge
+    help: "1 if the monitoring role can run SQL against the cluster."
+    values: [up]
+    query: |
+      SELECT 1 AS up
+
+  # ---- sessions / queries ----
+  - metric_name: crdb_sessions
+    type: gauge
+    help: "Open SQL sessions cluster-wide per SQL user."
+    key_labels: [sql_user]
+    values: [n]
+    query: |
+      SELECT user_name AS sql_user, count(*)::FLOAT AS n
+      FROM crdb_internal.cluster_sessions
+      GROUP BY user_name
+
+  - metric_name: crdb_queries_running
+    type: gauge
+    help: "Statements currently executing cluster-wide, by SQL user."
+    key_labels: [sql_user]
+    values: [n]
+    query: |
+      SELECT user_name AS sql_user, count(*)::FLOAT AS n
+      FROM crdb_internal.cluster_queries
+      GROUP BY user_name
+
+  - metric_name: crdb_queries_running_over_10s
+    type: gauge
+    help: "Statements running for more than 10 seconds."
+    values: [n]
+    query: |
+      SELECT count(*)::FLOAT AS n FROM crdb_internal.cluster_queries WHERE start < now() - INTERVAL '10s' AND query NOT LIKE '%crdb_internal.cluster_queries%'
+
+  - metric_name: crdb_oldest_query_age_seconds
+    type: gauge
+    help: "Age of the longest-running statement (slow statement indicator)."
+    values: [age]
+    query: |
+      SELECT greatest(COALESCE(max(extract(epoch FROM (now() - start))), 0), 0)::FLOAT AS age
+      FROM crdb_internal.cluster_queries
+      WHERE query NOT LIKE '%crdb_internal.cluster_queries%'
+
+  - metric_name: crdb_max_connections_per_gateway
+    type: gauge
+    help: "server.max_connections_per_gateway (-1 = unlimited)."
+    values: [v]
+    query: |
+      SELECT value::FLOAT AS v FROM crdb_internal.cluster_settings WHERE variable = 'server.max_connections_per_gateway'
+
+  # ---- contention ----
+  - metric_name: crdb_contention_events_5m
+    type: gauge
+    help: "Transaction contention events recorded in the last 5 minutes."
+    values: [n]
+    query: |
+      SELECT count(*)::FLOAT AS n FROM crdb_internal.transaction_contention_events WHERE collection_ts > now() - INTERVAL '5m'
+
+  - metric_name: crdb_contention_seconds_5m
+    type: gauge
+    help: "Total time spent in contention (last 5 minutes)."
+    values: [secs]
+    query: |
+      SELECT COALESCE(sum(extract(epoch FROM contention_duration)), 0)::FLOAT AS secs
+      FROM crdb_internal.transaction_contention_events WHERE collection_ts > now() - INTERVAL '5m'

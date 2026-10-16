@@ -1,0 +1,7 @@
+# PROD TCP probes (container-internal). Public SQL ports 26257/26258/26259 are SG-restricted to the operator IP, so they cannot be probed from the host itself (hairpin is blocked) - see README.
+- targets: ["main-haproxy:26257"]
+  labels: {scope: internal, service: sql-main-write}
+- targets: ["main-haproxy:26259"]
+  labels: {scope: internal, service: sql-main-read}
+- targets: ["backup-crdb:26257"]
+  labels: {scope: internal, service: sql-backup}

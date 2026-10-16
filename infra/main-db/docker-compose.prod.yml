@@ -1,0 +1,145 @@
+# PROD main cluster (EC2): 3 secure CockroachDB nodes (internal CA, password auth) + HAProxy + init/bootstrap + backup-handler.
+# Memory/CPU per infra/aws-scripts/EC2_SIZING.md.  Needs: .env (see .env.example), external network talentra-edge,
+# external volume talentra_backup_share (make net volumes).  Host ports: 26257 write, 26259 read (open 26259 in the SG).
+name: talentra-main
+
+x-crdb: &crdb
+  image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+  restart: unless-stopped
+  stop_grace_period: 60s
+  healthcheck:
+    test: ["CMD-SHELL", "curl -skf https://localhost:8080/health || exit 1"]
+    interval: 10s
+    timeout: 3s
+    retries: 30
+    start_period: 20s
+  logging: {driver: json-file, options: {max-size: "20m", max-file: "5"}}
+
+services:
+  certs:
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    restart: "no"
+    entrypoint: ["/scripts/gen-certs.sh"]
+    environment:
+      CERT_HOSTS: ${CERT_HOSTS:-localhost 127.0.0.1 crdb1 crdb2 crdb3 haproxy main-haproxy main-crdb1 main-crdb2 main-crdb3 db.talentra.thearpanhq.in 34.235.96.187}
+    volumes: ["./scripts:/scripts:ro", "certs:/certs", "./certs-public:/certs-public"]
+
+  crdb1:
+    <<: *crdb
+    hostname: crdb1
+    command: start --certs-dir=/certs --advertise-addr=crdb1 --join=crdb1,crdb2,crdb3 --locality=region=aws,zone=a --cache=${N1_CACHE:-3GiB} --max-sql-memory=${N1_SQL_MEM:-2GiB}
+    mem_limit: ${N1_MEM_LIMIT:-7g}
+    cpus: ${N1_CPUS:-2.0}
+    volumes: [crdb1_data:/cockroach/cockroach-data, backup_share:/cockroach/cockroach-data/extern, "certs:/certs:ro"]
+    depends_on: {certs: {condition: service_completed_successfully}}
+    networks:
+      default:
+      edge: {aliases: [main-crdb1]}
+
+  crdb2:
+    <<: *crdb
+    hostname: crdb2
+    command: start --certs-dir=/certs --advertise-addr=crdb2 --join=crdb1,crdb2,crdb3 --locality=region=aws,zone=b --cache=${N2_CACHE:-2GiB} --max-sql-memory=${N2_SQL_MEM:-1536MiB}
+    mem_limit: ${N2_MEM_LIMIT:-5500m}
+    cpus: ${N2_CPUS:-1.5}
+    volumes: [crdb2_data:/cockroach/cockroach-data, backup_share:/cockroach/cockroach-data/extern, "certs:/certs:ro"]
+    depends_on: {init: {condition: service_completed_successfully}}
+    networks:
+      default:
+      edge: {aliases: [main-crdb2]}
+
+  crdb3:
+    <<: *crdb
+    hostname: crdb3
+    command: start --certs-dir=/certs --advertise-addr=crdb3 --join=crdb1,crdb2,crdb3 --locality=region=aws,zone=c --cache=${N3_CACHE:-2GiB} --max-sql-memory=${N3_SQL_MEM:-1536MiB}
+    mem_limit: ${N3_MEM_LIMIT:-5500m}
+    cpus: ${N3_CPUS:-1.5}
+    volumes: [crdb3_data:/cockroach/cockroach-data, backup_share:/cockroach/cockroach-data/extern, "certs:/certs:ro"]
+    depends_on: {init: {condition: service_completed_successfully}, crdb2: {condition: service_healthy}}
+    networks:
+      default:
+      edge: {aliases: [main-crdb3]}
+
+  init:
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    restart: "no"
+    entrypoint: ["/scripts/init.sh"]
+    environment: {CRDB_SECURE: "1"}
+    volumes: ["./scripts:/scripts:ro", "certs:/certs:ro"]
+    depends_on: {crdb1: {condition: service_healthy}}
+
+  bootstrap:
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    restart: "no"
+    entrypoint: ["/scripts/bootstrap.sh"]
+    env_file: [.env]
+    environment: {CRDB_SECURE: "1"}
+    volumes: ["./scripts:/scripts:ro", "certs:/certs:ro"]
+    depends_on:
+      crdb2: {condition: service_healthy}
+      crdb3: {condition: service_healthy}
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    volumes: ["./haproxy/haproxy.prod.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    ports: ["${HAPROXY_WRITE_PORT:-26257}:26257", "${HAPROXY_READ_PORT:-26259}:26259"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8404/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    depends_on: [crdb1]
+    networks:
+      default:
+      edge: {aliases: [main-haproxy]}
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}
+
+  backup-handler:
+    build: {context: ./handler, args: {CRDB_VERSION: "${CRDB_VERSION:-v26.2.8}"}}
+    restart: unless-stopped
+    mem_limit: 1536m
+    cpus: 1.0
+    env_file: [.env]
+    environment:
+      CRDB_SECURE: "1"
+      MAIN_CA: /certs/main/ca.crt
+      BACKUP_CA: /certs/backup/ca.crt
+      MAIN_SQL_HOST: haproxy
+      MAIN_SQL_USER: talentra_backup
+      MAIN_SQL_PASSWORD: ${TALENTRA_BACKUP_PASSWORD}
+      BACKUP_SQL_HOST: backup-crdb
+      BACKUP_SQL_USER: backup_admin
+      BACKUP_SQL_PASSWORD: ${BACKUP_ADMIN_PASSWORD}
+      FULL_EVERY_MIN: ${FULL_EVERY_MIN:-1440}
+      INCR_EVERY_MIN: ${INCR_EVERY_MIN:-5}
+      SYNC_EVERY_MIN: ${SYNC_EVERY_MIN:-360}
+      BACKUP_S3_URI: ${BACKUP_S3_URI:-}
+    volumes:
+      - ./logs:/logs
+      - handler_state:/state
+      - ./certs-public:/certs/main:ro
+      - ../backup-db/certs-public:/certs/backup:ro
+    depends_on: {bootstrap: {condition: service_completed_successfully}, haproxy: {condition: service_started}}
+    networks:
+      default:
+      edge:
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /logs/backup_timing.csv"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}
+
+networks:
+  edge: {name: talentra-edge, external: true}
+
+volumes:
+  certs:
+  crdb1_data:
+  crdb2_data:
+  crdb3_data:
+  handler_state:
+  backup_share: {name: talentra_backup_share, external: true}

@@ -1,0 +1,38 @@
+# yet-another-cloudwatch-exporter (opt-in compose profile "cloudwatch"). Read-only: GetMetricData / ListMetrics / tag discovery.
+# CloudWatch basic monitoring = 5 minute resolution, hence period/length 300 and a 5m scrape.
+apiVersion: v1alpha1
+sts-region: us-east-1
+discovery:
+  jobs:
+    - type: AWS/EC2
+      regions: [us-east-1]
+      period: 300
+      length: 300
+      metrics:
+        - {name: CPUUtilization, statistics: [Average, Maximum]}
+        - {name: NetworkIn, statistics: [Sum]}
+        - {name: NetworkOut, statistics: [Sum]}
+        - {name: NetworkPacketsIn, statistics: [Sum]}
+        - {name: NetworkPacketsOut, statistics: [Sum]}
+        - {name: EBSReadOps, statistics: [Sum]}
+        - {name: EBSWriteOps, statistics: [Sum]}
+        - {name: EBSReadBytes, statistics: [Sum]}
+        - {name: EBSWriteBytes, statistics: [Sum]}
+        - {name: StatusCheckFailed, statistics: [Maximum]}
+        - {name: StatusCheckFailed_System, statistics: [Maximum]}
+        - {name: StatusCheckFailed_Instance, statistics: [Maximum]}
+    - type: AWS/EBS
+      regions: [us-east-1]
+      period: 300
+      length: 300
+      metrics:
+        - {name: VolumeReadOps, statistics: [Sum]}
+        - {name: VolumeWriteOps, statistics: [Sum]}
+        - {name: VolumeReadBytes, statistics: [Sum]}
+        - {name: VolumeWriteBytes, statistics: [Sum]}
+        - {name: VolumeQueueLength, statistics: [Average]}
+        - {name: VolumeThroughputPercentage, statistics: [Average]}
+        - {name: VolumeConsumedReadWriteOps, statistics: [Sum]}
+        - {name: VolumeIdleTime, statistics: [Sum]}
+        - {name: VolumeTotalReadTime, statistics: [Sum]}
+        - {name: VolumeTotalWriteTime, statistics: [Sum]}

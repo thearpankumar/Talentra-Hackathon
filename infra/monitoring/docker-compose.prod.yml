@@ -1,0 +1,300 @@
+# PROD (EC2 m6i.2xlarge, Ubuntu 24.04) observability stack. Own compose project: `talentra-monitoring`.
+# Needs: .env (cp .env.example .env; GRAFANA_ADMIN_PASSWORD + SQL_EXPORTER_*_DSN are required),
+#        external network talentra-edge (make net), external volume talentra_backup_share (make volumes),
+#        start AFTER main-db and backup-db (their certs-public/ca.crt are mounted here).
+# Grafana is the ONLY UI: https://monitoring.talentra.thearpanhq.in via Caddy (container alias `grafana` on talentra-edge).
+# Prometheus/Alertmanager/Loki bind 127.0.0.1 only (ssh -L 9090:127.0.0.1:9090 ...), nothing is published publicly.
+# Footprint: memory limits sum to ~3.3 GiB (typical resident ~1.8 GiB). EC2_SIZING.md leaves ~3 GiB for OS+Docker:
+# see README "Memory budget" before running the full ingest load.
+name: talentra-monitoring
+
+x-common: &common
+  restart: unless-stopped
+  logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}
+
+services:
+  prometheus:
+    <<: *common
+    image: prom/prometheus:v3.5.0
+    mem_limit: ${PROM_MEM_LIMIT:-1280m}
+    cpus: 1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROM_RETENTION:-15d}
+      - --storage.tsdb.retention.size=${PROM_RETENTION_SIZE:-8GB}
+      - --storage.tsdb.wal-compression
+      - --web.enable-lifecycle
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - ./prometheus/scrape.d/common:/etc/prometheus/scrape.d/common:ro
+      - ./prometheus/scrape.d/prod:/etc/prometheus/scrape.d/env:ro
+      - ./prometheus/targets/prod:/etc/prometheus/targets:ro
+      - ../main-db/certs-public:/certs/main:ro
+      - ../backup-db/certs-public:/certs/backup:ro
+      - prometheus_data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/ready >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    networks: [default, edge]
+
+  alertmanager:
+    <<: *common
+    image: prom/alertmanager:v0.28.1
+    mem_limit: 96m
+    cpus: 0.25
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
+    environment:
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SLACK_CHANNEL: ${SLACK_CHANNEL:-#alerts}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      SMTP_SMARTHOST: ${SMTP_SMARTHOST:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      WATCHDOG_WEBHOOK_URL: ${WATCHDOG_WEBHOOK_URL:-}
+    volumes:
+      - ./alertmanager/alertmanager.base.yml:/etc/alertmanager/alertmanager.base.yml:ro
+      - ./alertmanager/entrypoint.sh:/etc/alertmanager/entrypoint.sh:ro
+      - alertmanager_data:/alertmanager
+    ports: ["127.0.0.1:9093:9093"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/ready >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    <<: *common
+    image: grafana/grafana:11.6.1
+    mem_limit: ${GRAFANA_MEM_LIMIT:-384m}
+    cpus: 0.5
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_SECURITY_SECRET_KEY: ${GRAFANA_SECRET_KEY:-SW2YcwTIb9zpOOhoPsMm}
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_COOKIE_SAMESITE: lax
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SECURITY_STRICT_TRANSPORT_SECURITY: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_ORG_CREATE: "false"
+      GF_SERVER_DOMAIN: ${MONITORING_HOST:-monitoring.talentra.thearpanhq.in}
+      GF_SERVER_ROOT_URL: https://${MONITORING_HOST:-monitoring.talentra.thearpanhq.in}/
+      GF_SERVER_ENABLE_GZIP: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 10s
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana-dashboards/Talentra/talentra-overview.json
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana-dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on: {prometheus: {condition: service_healthy}}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    networks:
+      default:
+      edge: {aliases: [grafana]}      # Caddy: reverse_proxy grafana:3000
+
+  loki:
+    <<: *common
+    image: grafana/loki:3.5.0
+    mem_limit: ${LOKI_MEM_LIMIT:-512m}
+    cpus: 0.5
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    ports: ["127.0.0.1:3100:3100"]
+
+  alloy:
+    <<: *common
+    image: grafana/alloy:v1.9.1
+    mem_limit: 256m
+    cpus: 0.5
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "--storage.path=/var/lib/alloy/data", "--disable-reporting", "/etc/alloy-config"]
+    environment: {MONITORING_ENV: prod}
+    user: "0:0"
+    volumes:
+      - ./alloy/docker.alloy:/etc/alloy-config/docker.alloy:ro
+      - ./alloy/journal.alloy:/etc/alloy-config/journal.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - alloy_data:/var/lib/alloy/data
+    depends_on: [loki]
+
+  # Host metrics. network_mode: host so NIC / TCP / ethtool (ENA) stats are the real host's; listens on docker0 only.
+  node-exporter:
+    <<: *common
+    image: quay.io/prometheus/node-exporter:v1.9.1
+    mem_limit: 128m
+    cpus: 0.25
+    network_mode: host
+    pid: host
+    command:
+      - --web.listen-address=${NODE_EXPORTER_LISTEN:-172.17.0.1:9100}
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run/docker/.+|run/user/.+|var/lib/docker/(overlay2|containers|rootfs).*|run/credentials/.+)($$|/)
+      - --collector.systemd
+      - --collector.systemd.unit-include=^(docker|containerd|ssh|sshd|chrony|chronyd|systemd-timesyncd|cron|unattended-upgrades|amazon-ssm-agent|snap\.amazon-ssm-agent.*|cloud-init.*)\.service$$
+      - --collector.processes
+      - --collector.tcpstat
+      - --collector.buddyinfo
+      - --collector.ethtool
+      - --collector.ethtool.device-include=^(ens|eth|enp).*
+      - --collector.textfile.directory=/textfile
+      - --no-collector.arp
+      - --no-collector.bcache
+      - --no-collector.bonding
+      - --no-collector.btrfs
+      - --no-collector.fibrechannel
+      - --no-collector.infiniband
+      - --no-collector.ipvs
+      - --no-collector.mdadm
+      - --no-collector.nfs
+      - --no-collector.nfsd
+      - --no-collector.powersupplyclass
+      - --no-collector.tapestats
+      - --no-collector.xfs
+      - --no-collector.zfs
+    volumes:
+      - /:/host:ro,rslave
+      - /run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
+      - textfile:/textfile:ro
+
+  cadvisor:
+    <<: *common
+    image: gcr.io/cadvisor/cadvisor:v0.55.1      # >= v0.53 is REQUIRED when Docker uses the containerd image store (Docker 29 default)
+    mem_limit: 256m
+    cpus: 0.3
+    privileged: true
+    devices: [/dev/kmsg]
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=30s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.project,com.docker.compose.service
+      - --enable_metrics=cpu,memory,disk,diskIO,network,process,oom_event
+      - --disable_metrics=percpu,sched,tcp,udp,advtcp,hugetlb,referenced_memory,cpu_topology,resctrl,memory_numa,cpuset,cpuLoad
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+
+  blackbox:
+    <<: *common
+    image: prom/blackbox-exporter:v0.26.0
+    mem_limit: 64m
+    cpus: 0.25
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+      - ../main-db/certs-public:/certs/main:ro
+      - ../backup-db/certs-public:/certs/backup:ro
+    networks: [default, edge]
+
+  sql-exporter-main:
+    <<: *common
+    image: burningalchemist/sql_exporter:0.17.3
+    mem_limit: 64m
+    cpus: 0.25
+    command: ["-config.file=/config/${SQL_EXPORTER_CONFIG:-sql_exporter.yml}"]
+    environment:
+      SQLEXPORTER_TARGET_DSN: ${SQL_EXPORTER_MAIN_DSN:?set SQL_EXPORTER_MAIN_DSN in .env}
+    volumes:
+      - ./sql_exporter:/config:ro
+      - ../main-db/certs-public:/certs/main:ro
+    networks: [default, edge]
+
+  sql-exporter-backup:
+    <<: *common
+    image: burningalchemist/sql_exporter:0.17.3
+    mem_limit: 64m
+    cpus: 0.25
+    command: ["-config.file=/config/${SQL_EXPORTER_CONFIG:-sql_exporter.yml}"]
+    environment:
+      SQLEXPORTER_TARGET_DSN: ${SQL_EXPORTER_BACKUP_DSN:?set SQL_EXPORTER_BACKUP_DSN in .env}
+    volumes:
+      - ./sql_exporter:/config:ro
+      - ../backup-db/certs-public:/certs/backup:ro
+    networks: [default, edge]
+
+  haproxy-exporter:
+    <<: *common
+    image: prom/haproxy-exporter:v0.15.0
+    mem_limit: 48m
+    cpus: 0.1
+    command:
+      - --haproxy.scrape-uri=http://main-haproxy:8404/stats;csv
+      - --haproxy.timeout=5s
+    networks: [default, edge]
+
+  backup-metrics:
+    <<: *common
+    image: python:3.13-alpine
+    mem_limit: 48m
+    cpus: 0.1
+    command: ["python", "-u", "/app/export.py"]
+    environment:
+      BACKUP_CSV: /logs/backup_timing.csv
+      TEXTFILE_DIR: /textfile
+      BACKUP_DIR: /backups
+    volumes:
+      - ./backup-metrics/export.py:/app/export.py:ro
+      - ../main-db/logs:/logs:ro
+      - backup_share:/backups:ro
+      - textfile:/textfile
+
+  # ---- opt-in: docker compose -f docker-compose.prod.yml --profile cloudwatch up -d yace ----
+  # Read-only CloudWatch (EC2 + EBS). Credentials: prefer the EC2 instance profile (needs cloudwatch:GetMetricData,
+  # cloudwatch:ListMetrics, tag:GetResources, ec2:DescribeInstances/Volumes). Otherwise set AWS_* in .env. Never committed.
+  yace:
+    <<: *common
+    profiles: [cloudwatch]
+    image: quay.io/prometheuscommunity/yet-another-cloudwatch-exporter:v0.62.1
+    mem_limit: 128m
+    cpus: 0.25
+    command: ["--config.file=/config/yace.yml", "--listen-address=:5000", "--scraping-interval=300", "--disable-account-alias-lookup"]
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    volumes: ["./cloudwatch/yace.yml:/config/yace.yml:ro"]
+
+networks:
+  edge: {name: talentra-edge, external: true}
+
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:
+  loki_data:
+  alloy_data:
+  textfile:
+  backup_share: {name: talentra_backup_share, external: true}

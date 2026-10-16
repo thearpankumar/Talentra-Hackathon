@@ -1,0 +1,2 @@
+# LOCAL Caddy admin API serves /metrics on :2019 (Caddyfile.local: admin :2019). Per-request metrics need `servers { metrics }`.
+- targets: ["caddy:2019"]

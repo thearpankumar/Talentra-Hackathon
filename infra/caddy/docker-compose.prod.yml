@@ -1,0 +1,32 @@
+# PROD Caddy (EC2): Let's Encrypt for talentra./db./backup./monitoring.thearpanhq.in. Start AFTER backup-db and main-db
+# (their certs-public/ DIRECTORIES are mounted, never the ca.crt file itself: a missing single-file bind mount makes Docker create a directory). Port 9180 (metrics) is intentionally NOT published. Needs external network talentra-edge.
+name: talentra-caddy
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.25
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../main-db/certs-public:/certs/main:ro
+      - ../backup-db/certs-public:/certs/backup:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    env_file: [.env]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    networks: [edge]
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}
+
+networks:
+  edge: {name: talentra-edge, external: true}
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,26 @@
+# PROD: secure CockroachDB. /_status/vars is served on the HTTPS port (8080) WITHOUT a login (verified on v26.2),
+# so Prometheus only needs TLS verification against each cluster's own CA (main and backup have different CAs).
+# server_name is pinned because the node certs list service/alias names, not container IPs.
+scrape_configs:
+  - job_name: cockroachdb-main
+    metrics_path: /_status/vars
+    scheme: https
+    tls_config:
+      ca_file: /certs/main/ca.crt
+      server_name: main-crdb1          # SAN present on every main node cert (CERT_HOSTS); see README
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/cockroach-main.yml]
+        refresh_interval: 1m
+    relabel_configs:
+      - {target_label: job, replacement: cockroachdb}
+  - job_name: cockroachdb-backup
+    metrics_path: /_status/vars
+    scheme: https
+    tls_config:
+      ca_file: /certs/backup/ca.crt
+      server_name: backup-crdb
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/cockroach-backup.yml]
+        refresh_interval: 1m
+    relabel_configs:
+      - {target_label: job, replacement: cockroachdb}

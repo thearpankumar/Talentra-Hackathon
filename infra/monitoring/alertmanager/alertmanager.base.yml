@@ -1,0 +1,35 @@
+# Static part of the Alertmanager config. entrypoint.sh appends the `receivers:` block (built from env) -> /tmp/alertmanager.yml
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: notify
+  group_by: [alertname, cluster, instance]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # heartbeat: delivered to its own receiver (point a dead-man's-switch service at it), never to humans
+    - matchers: [alertname="Watchdog"]
+      receiver: watchdog
+      repeat_interval: 5m
+    # informational alerts are visible in Grafana/Alertmanager only
+    - matchers: [severity=~"info|none"]
+      receiver: blackhole
+    # criticals page faster and repeat more often
+    - matchers: [severity="critical"]
+      receiver: notify
+      group_wait: 10s
+      repeat_interval: 1h
+
+inhibit_rules:
+  # a down host/target explains everything else about it
+  - source_matchers: [alertname="InstanceDown"]
+    target_matchers: [severity=~"warning|info"]
+    equal: [instance]
+  - source_matchers: [severity="critical"]
+    target_matchers: [severity="warning"]
+    equal: [alertname, cluster, instance]
+  - source_matchers: [alertname="HAProxyBackendDown"]
+    target_matchers: [alertname="HAProxyServerDown"]
+    equal: [backend]

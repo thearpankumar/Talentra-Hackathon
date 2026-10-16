@@ -1,0 +1,3 @@
+# PROD: expects a dedicated metrics site  `:9180 { metrics /metrics }`  + global `servers { metrics }` (see INTEGRATION_REQUESTS.md).
+# The admin API is bound to localhost:2019 and is NOT reachable from other containers (and should not be).
+- targets: ["caddy:9180"]

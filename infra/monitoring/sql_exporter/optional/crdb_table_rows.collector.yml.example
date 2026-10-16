@@ -1,0 +1,19 @@
+# OPT-IN per-table row counts. NOT loaded by default because sql_exporter turns ANY failing query into HTTP 500 for the
+# whole target, and a query naming a table fails while the table does not exist (e.g. before the first ingest, or on the
+# backup cluster before the first restore-sync).
+# Enable once the schema exists: copy to sql_exporter/collectors/crdb_table_rows.collector.yml (drop the .example suffix),
+# list your tables, set SQL_EXPORTER_CONFIG=sql_exporter.rows.yml in .env and `docker compose up -d`.
+# Cheap estimate (optimizer statistics, no scan):
+#   SELECT row_count::FLOAT AS rows FROM [SHOW STATISTICS FOR TABLE talentra.public.profiles] ORDER BY created DESC LIMIT 1
+# Exact (full scan - only for small tables):  SELECT count(*)::FLOAT AS rows FROM talentra.public.profiles
+collector_name: crdb_table_rows
+min_interval: 300s
+metrics:
+  - metric_name: crdb_table_estimated_rows
+    type: gauge
+    help: "Estimated rows of a key table (statistics based)."
+    key_labels: [tbl]
+    values: [rows]
+    query: |
+      SELECT 'profiles' AS tbl, row_count::FLOAT AS rows
+      FROM [SHOW STATISTICS FOR TABLE talentra.public.profiles] ORDER BY created DESC LIMIT 1

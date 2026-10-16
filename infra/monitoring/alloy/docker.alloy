@@ -1,0 +1,52 @@
+// Container logs -> Loki. Works on any Docker host (Docker Desktop included).
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "10s"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "compose_project"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.containers.output
+  relabel_rules    = discovery.relabel.containers.rules
+  forward_to       = [loki.process.containers.receiver]
+  refresh_interval = "10s"
+}
+
+loki.process "containers" {
+  // level label from JSON ("level"/"severity"), logfmt (level=...) or a leading level word.
+  stage.regex {
+    expression = "(?i)(?:\"(?:level|severity)\"\\s*:\\s*\"|\\blevel=)(?P<level>debug|info|notice|warn|warning|error|fatal|critical)"
+  }
+  stage.template {
+    source   = "level"
+    template = "{{ if eq (ToLower .Value) \"warning\" }}warn{{ else if eq (ToLower .Value) \"critical\" }}fatal{{ else }}{{ ToLower .Value }}{{ end }}"
+  }
+  stage.labels {
+    values = {level = ""}
+  }
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+  external_labels = {env = coalesce(sys.env("MONITORING_ENV"), "local")}
+}

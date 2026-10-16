@@ -1,0 +1,14 @@
+# PROD: node_exporter uses network_mode: host (real NIC/TCP/ethtool stats) and listens on the docker0 address only.
+# host.docker.internal -> host-gateway (172.17.0.1) via extra_hosts in docker-compose.prod.yml.
+scrape_configs:
+  - job_name: node
+    static_configs: [{targets: ["host.docker.internal:9100"], labels: {host: talentra-host}}]
+    relabel_configs:
+      - {target_label: instance, replacement: talentra-host}
+
+  # Opt-in (compose profile "cloudwatch"): EC2 / EBS CloudWatch metrics via yet-another-cloudwatch-exporter.
+  - job_name: cloudwatch
+    scrape_interval: 5m
+    scrape_timeout: 60s
+    honor_labels: true
+    static_configs: [{targets: ["yace:5000"], labels: {optional: "true"}}]

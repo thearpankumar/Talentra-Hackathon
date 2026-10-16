@@ -1,0 +1,47 @@
+modules:
+  # public HTTPS endpoint: must be 2xx; certificate chain verified by default
+  http_2xx:
+    prober: http
+    timeout: 10s
+    http:
+      method: GET
+      follow_redirects: true
+      fail_if_not_ssl: false   # local targets are plain http; prod public targets are https (cert-expiry series only exist for TLS)
+      preferred_ip_protocol: ip4
+  # basic-auth protected consoles: 401/403 means "up and TLS ok"
+  http_tls_any:
+    prober: http
+    timeout: 10s
+    http:
+      method: GET
+      valid_status_codes: [200, 301, 302, 303, 401, 403]
+      fail_if_not_ssl: true
+      preferred_ip_protocol: ip4
+  # in-cluster CockroachDB HTTPS health (internal CA mounted at /certs)
+  http_crdb_main:
+    prober: http
+    timeout: 5s
+    http:
+      fail_if_not_ssl: true
+      tls_config: {ca_file: /certs/main/ca.crt, server_name: main-crdb1}
+      preferred_ip_protocol: ip4
+  http_crdb_backup:
+    prober: http
+    timeout: 5s
+    http:
+      fail_if_not_ssl: true
+      tls_config: {ca_file: /certs/backup/ca.crt, server_name: backup-crdb}
+      preferred_ip_protocol: ip4
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp: {preferred_ip_protocol: ip4}
+  # pgwire SSLRequest (int32 len=8, int32 code=80877103): CockroachDB answers 'S' when TLS is available.
+  pgwire_tls:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+      query_response:
+        - send: "\x00\x00\x00\x08\x04\xd2\x16\x2f"
+        - expect: "S"

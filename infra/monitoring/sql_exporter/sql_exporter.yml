@@ -1,0 +1,15 @@
+# burningalchemist/sql_exporter against CockroachDB (pgwire). One container per cluster; the DSN comes from the
+# SQLEXPORTER_TARGET_DSN env var (overrides data_source_name), so no credentials live in this file.
+global:
+  scrape_timeout_offset: 500ms
+  min_interval: 45s          # cache results; Prometheus scrapes every 60s, SHOW JOBS etc. are not free
+  max_connections: 3
+  max_idle_connections: 1
+  max_connection_lifetime: 10m
+
+target:
+  data_source_name: "postgres://monitor@localhost:26257/defaultdb?sslmode=disable"   # always overridden by env
+  collectors: [crdb_common, crdb_jobs, crdb_tables]
+
+collector_files:
+  - "/config/collectors/*.collector.yml"

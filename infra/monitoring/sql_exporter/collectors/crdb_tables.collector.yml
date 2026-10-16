@@ -1,0 +1,14 @@
+# Cheap database inventory. The previous query (crdb_internal.tables) loaded EVERY table descriptor of EVERY database
+# (1306+ tables -> 30-50 s per scrape on the laptop cluster, scrape timeouts). crdb_internal.databases reads only the
+# database descriptors. Per-table counts are available natively in /_status/vars (sql_*, ranges, livebytes per store).
+# The old full scan is kept as optional/crdb_tables_full.collector.yml.example (opt-in, hourly).
+collector_name: crdb_tables
+min_interval: 600s
+
+metrics:
+  - metric_name: crdb_user_databases
+    type: gauge
+    help: "User databases (excludes system/defaultdb/postgres)."
+    values: [n]
+    query: |
+      SELECT count(*)::FLOAT AS n FROM crdb_internal.databases WHERE name NOT IN ('system', 'defaultdb', 'postgres')

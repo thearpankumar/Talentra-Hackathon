@@ -1,0 +1,54 @@
+# Job metrics. SHOW JOBS reads the jobs table (thousands of rows on a busy cluster), so it is cached for 5 minutes
+# and kept in its own collector. Never errors on an empty source.
+collector_name: crdb_jobs
+min_interval: 300s
+
+metrics:
+  - metric_name: crdb_jobs_recent
+    type: gauge
+    help: "Jobs created in the last 24h by type and status."
+    key_labels: [job_type, status]
+    values: [n]
+    query: |
+      SELECT job_type, status, count(*)::FLOAT AS n
+      FROM [SHOW JOBS]
+      WHERE created > now() - INTERVAL '24h'
+      GROUP BY job_type, status
+
+  - metric_name: crdb_jobs_running
+    type: gauge
+    help: "Currently running/pending jobs by type."
+    key_labels: [job_type]
+    values: [n]
+    query: |
+      SELECT job_type, count(*)::FLOAT AS n
+      FROM [SHOW JOBS]
+      WHERE status IN ('running', 'pending', 'retrying', 'reverting')
+      GROUP BY job_type
+
+  - metric_name: crdb_job_last_success_timestamp_seconds
+    type: gauge
+    help: "Unix time the newest succeeded job of this type finished."
+    key_labels: [job_type]
+    values: [ts]
+    query: |
+      SELECT job_type, extract(epoch FROM max(finished))::FLOAT AS ts
+      FROM [SHOW JOBS]
+      WHERE status = 'succeeded' AND job_type IN ('BACKUP', 'RESTORE', 'IMPORT', 'SCHEMA CHANGE', 'AUTO CREATE STATS')
+      GROUP BY job_type
+
+  - metric_name: crdb_job_last_success_duration_seconds
+    type: gauge
+    help: "Duration of the newest succeeded job of this type (RTO input for BACKUP/RESTORE)."
+    key_labels: [job_type]
+    values: [secs]
+    query: |
+      SELECT job_type, secs FROM (
+        SELECT job_type,
+               extract(epoch FROM (finished - started))::FLOAT AS secs,
+               row_number() OVER (PARTITION BY job_type ORDER BY finished DESC) AS rn
+        FROM [SHOW JOBS]
+        WHERE status = 'succeeded' AND finished IS NOT NULL AND started IS NOT NULL
+          AND job_type IN ('BACKUP', 'RESTORE', 'IMPORT')
+      ) WHERE rn = 1
+

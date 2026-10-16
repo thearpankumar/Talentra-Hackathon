@@ -1,0 +1,117 @@
+# LOCAL (laptop) main cluster: 3 insecure CockroachDB nodes + HAProxy + init + backup-handler. No TLS, no domains.
+# Up:  docker compose up -d --build        (or from infra/: make up-local STACK=main-db)
+# Host ports (chosen not to clash with ingestion-engine's 26357/8089):
+#   26267 SQL write (HAProxy -> node1)   26269 SQL read (HAProxy -> node2/3)   8180 DB Console (node1)   8404 HAProxy stats
+# Requires external volume/network: talentra_backup_share, talentra-edge  (make net / make volumes)
+name: talentra-main-local
+
+x-crdb: &crdb
+  image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+  restart: unless-stopped
+  stop_grace_period: 60s
+  healthcheck: &crdb-hc
+    test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+  networks: [default]
+
+services:
+  crdb1:
+    <<: *crdb
+    hostname: crdb1
+    command: start --insecure --advertise-addr=crdb1 --join=crdb1,crdb2,crdb3 --locality=region=local,zone=a --cache=256MiB --max-sql-memory=256MiB
+    volumes: [crdb1_data:/cockroach/cockroach-data, backup_share:/cockroach/cockroach-data/extern]
+    ports: ["8180:8080"]
+    networks:
+      default:
+      edge: {aliases: [main-crdb1]}
+
+  crdb2:
+    <<: *crdb
+    hostname: crdb2
+    command: start --insecure --advertise-addr=crdb2 --join=crdb1,crdb2,crdb3 --locality=region=local,zone=b --cache=256MiB --max-sql-memory=256MiB
+    volumes: [crdb2_data:/cockroach/cockroach-data, backup_share:/cockroach/cockroach-data/extern]
+    depends_on: {init: {condition: service_completed_successfully}}
+    networks:
+      default:
+      edge: {aliases: [main-crdb2]}
+
+  crdb3:
+    <<: *crdb
+    hostname: crdb3
+    command: start --insecure --advertise-addr=crdb3 --join=crdb1,crdb2,crdb3 --locality=region=local,zone=c --cache=256MiB --max-sql-memory=256MiB
+    volumes: [crdb3_data:/cockroach/cockroach-data, backup_share:/cockroach/cockroach-data/extern]
+    depends_on: {init: {condition: service_completed_successfully}, crdb2: {condition: service_healthy}}
+    networks:
+      default:
+      edge: {aliases: [main-crdb3]}
+
+  init:
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    restart: "no"
+    entrypoint: ["/scripts/init.sh"]
+    environment: {CRDB_SECURE: "0"}
+    volumes: ["./scripts:/scripts:ro"]
+    depends_on: {crdb1: {condition: service_healthy}}
+
+  bootstrap:
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    restart: "no"
+    entrypoint: ["/scripts/bootstrap.sh"]
+    # local.env = dummy passwords; optional gitignored .env supplies CRDB_LICENSE_KEY / CRDB_ORG (never commit the key)
+    env_file:
+      - local.env
+      - {path: .env, required: false}
+    environment: {CRDB_SECURE: "0"}
+    volumes: ["./scripts:/scripts:ro"]
+    depends_on:
+      crdb2: {condition: service_healthy}
+      crdb3: {condition: service_healthy}
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    restart: unless-stopped
+    volumes: ["./haproxy/haproxy.local.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    ports: ["26267:26257", "26269:26259", "8404:8404"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8404/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on: [crdb1]
+    networks:
+      default:
+      edge: {aliases: [main-haproxy]}
+
+  backup-handler:
+    build: {context: ./handler, args: {CRDB_VERSION: "${CRDB_VERSION:-v26.2.8}"}}
+    restart: unless-stopped
+    env_file: [local.env]
+    environment:
+      CRDB_SECURE: "0"
+      MAIN_SQL_HOST: haproxy
+      BACKUP_SQL_HOST: backup-crdb
+      FULL_EVERY_MIN: "${FULL_EVERY_MIN:-1440}"
+      INCR_EVERY_MIN: "${INCR_EVERY_MIN:-15}"
+      SYNC_EVERY_MIN: "${SYNC_EVERY_MIN:-360}"
+    volumes: ["./logs:/logs", "handler_state:/state"]
+    depends_on: {bootstrap: {condition: service_completed_successfully}, haproxy: {condition: service_started}}
+    networks:
+      default:
+      edge:
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /logs/backup_timing.csv"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+networks:
+  edge: {name: talentra-edge, external: true}
+
+volumes:
+  crdb1_data:
+  crdb2_data:
+  crdb3_data:
+  handler_state:
+  backup_share: {name: talentra_backup_share, external: true}

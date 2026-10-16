@@ -1,0 +1,148 @@
+groups:
+  - name: talentra-cockroachdb
+    rules:
+      - alert: CockroachNodeDown
+        expr: up{job="cockroachdb"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "CockroachDB node {{ $labels.instance }} ({{ $labels.cluster }}) is not reachable"
+          description: "With RF=3 the main cluster tolerates one node down; a second loses quorum."
+      - alert: CockroachLiveNodesBelowExpected
+        expr: max by (cluster) (liveness_livenodes{job="cockroachdb"}) < count by (cluster) (up{job="cockroachdb"})
+        for: 3m
+        labels: {severity: critical}
+        annotations: {summary: "{{ $labels.cluster }}: only {{ $value }} nodes are live in the liveness range"}
+      - alert: CockroachUnavailableRanges
+        expr: sum by (cluster) (ranges_unavailable{job="cockroachdb"}) > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: "{{ $labels.cluster }}: {{ $value }} ranges have lost quorum (unavailable)"}
+      - alert: CockroachUnderReplicatedRanges
+        expr: sum by (cluster) (ranges_underreplicated{job="cockroachdb"}) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.cluster }}: {{ $value }} under-replicated ranges for 10m (rebalancing stuck or node loss)"}
+      - alert: CockroachClockOffsetHigh
+        expr: clock_offset_meannanos{job="cockroachdb"} / 1e9 > 0.25
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.instance }} mean clock offset {{ $value | humanizeDuration }}"
+          description: "Nodes self-terminate at 80% of max-offset (default 500ms => 400ms). Alert at 250ms."
+      - alert: CockroachSQLLatencyHigh
+        expr: cluster:crdb_sql_service_latency_seconds:p99 > 1
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.cluster }}: SQL p99 service latency {{ $value | humanizeDuration }}"}
+      - alert: CockroachSQLConnectionsNearLimit
+        expr: |
+          (sum by (cluster, instance) (sql_conns{job="cockroachdb"})
+            / on(cluster) group_left max by (cluster) (crdb_max_connections_per_gateway > 0)) > 0.80
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.instance }} SQL connections at {{ $value | humanizePercentage }} of server.max_connections_per_gateway"}
+      - alert: CockroachSQLConnectionsHigh
+        expr: sql_conns{job="cockroachdb"} > 400
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value }} open SQL connections"
+          description: "Fallback for clusters where server.max_connections_per_gateway is -1 (unlimited)."
+      - alert: CockroachNodeCertExpiring
+        expr: (security_certificate_ttl_node{job="cockroachdb"} > 0) and (security_certificate_ttl_node{job="cockroachdb"} < 14 * 86400)
+        for: 1h
+        labels: {severity: warning}
+        annotations: {summary: "Node certificate on {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"}
+      - alert: CockroachCACertExpiring
+        expr: (security_certificate_ttl_ca{job="cockroachdb"} > 0) and (security_certificate_ttl_ca{job="cockroachdb"} < 30 * 86400)
+        for: 1h
+        labels: {severity: warning}
+        annotations: {summary: "CA certificate on {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"}
+      - alert: CockroachLicenseExpiring
+        expr: (seconds_until_enterprise_license_expiry{job="cockroachdb"} > 0) and (seconds_until_enterprise_license_expiry{job="cockroachdb"} < 30 * 86400)
+        for: 1h
+        labels: {severity: warning}
+        annotations: {summary: "CockroachDB license expires in {{ $value | humanizeDuration }} ({{ $labels.instance }})"}
+      - alert: CockroachStoreDiskLow
+        expr: instance:crdb_store_used_ratio > 0.70
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.instance }} store {{ $value | humanizePercentage }} full (guidance: stay under ~60%)"}
+      - alert: CockroachStoreDiskCritical
+        expr: instance:crdb_store_used_ratio > 0.85
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "{{ $labels.instance }} store {{ $value | humanizePercentage }} full"}
+      - alert: CockroachL0SublevelsHigh
+        expr: storage_l0_sublevels{job="cockroachdb"} > 20
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.instance }} LSM L0 sublevels {{ $value }} (write overload / admission control kicks in)"}
+      - alert: CockroachNodeRestarted
+        expr: resets(sys_uptime{job="cockroachdb"}[15m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: "CockroachDB {{ $labels.instance }} restarted in the last 15m"}
+      - alert: CockroachSlowRequests
+        expr: sum by (cluster, instance) (requests_slow_raft{job="cockroachdb"} + requests_slow_latch{job="cockroachdb"} + requests_slow_lease{job="cockroachdb"}) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.instance }} has {{ $value }} slow (stuck) KV requests"}
+      - alert: CockroachWriteStalls
+        expr: increase(storage_write_stalls{job="cockroachdb"}[10m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.instance }} storage write stalls (EBS throttling?)"}
+      - alert: CockroachLongRunningQueries
+        expr: crdb_queries_running_over_10s > 0
+        for: 10m
+        labels: {severity: info}
+        annotations: {summary: "{{ $labels.cluster }}: {{ $value }} queries running longer than 10s for >10m"}
+      - alert: CockroachSQLExporterBlind
+        expr: absent_over_time(crdb_sql_up{cluster="main"}[10m]) or absent_over_time(crdb_sql_up{cluster="backup"}[10m])
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "sql_exporter cannot query the {{ $labels.cluster }} cluster (talentra_monitor role/DSN wrong, or SQL down)"}
+
+  - name: talentra-backups
+    rules:
+      - alert: BackupStale
+        expr: talentra:backup_age_seconds{op="backup"} > scalar(talentra:backup_rpo_target_seconds)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "No successful {{ $labels.kind }} backup for {{ $value | humanizeDuration }} (RPO target 2h)"
+          description: "Source: backup-handler CSV (talentra_backup_*) via textfile collector. Check the backup-handler container logs."
+      - alert: BackupVeryStale
+        expr: min(talentra:backup_age_seconds{op="backup"}) > 4 * scalar(talentra:backup_rpo_target_seconds)
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "Newest backup is {{ $value | humanizeDuration }} old (4x RPO)"}
+      - alert: BackupNeverSucceeded
+        expr: absent(talentra_backup_last_success_timestamp_seconds{op="backup"})
+        for: 1h
+        labels: {severity: warning}
+        annotations: {summary: "No successful backup has ever been recorded (exporter or handler not running?)"}
+      - alert: BackupLastRunFailed
+        expr: talentra_backup_last_run_success{op="backup"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "Most recent {{ $labels.kind }} backup run FAILED"}
+      - alert: BackupSyncFailed
+        expr: talentra_backup_last_run_success{op="sync"} == 0
+        for: 30m
+        labels: {severity: warning}
+        annotations: {summary: "Restore-sync into the backup cluster failed on its last run"}
+      - alert: BackupSlowerThanRTO
+        expr: talentra_backup_last_duration_seconds{op="backup"} > scalar(talentra:backup_rto_target_seconds)
+        labels: {severity: warning}
+        annotations: {summary: "Last {{ $labels.kind }} backup took {{ $value | humanizeDuration }} (RTO budget 30m)"}
+      - alert: BackupExporterStale
+        expr: time() - talentra_backup_exporter_last_scan_timestamp_seconds > 600
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "backup-metrics sidecar has not refreshed for {{ $value | humanizeDuration }}"}
+      - alert: CockroachBackupJobFailures
+        expr: sum by (cluster) (crdb_jobs_recent{job_type="BACKUP",status="failed"}) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.cluster }}: {{ $value }} BACKUP job(s) failed in the last 24h (SHOW JOBS)"}

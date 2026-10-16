@@ -1,0 +1,23 @@
+// PROD only: host systemd journal (sshd, docker, kernel OOM, cloud-init, chrony...) -> Loki.
+loki.relabel "journal" {
+  forward_to = []
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+  rule {
+    source_labels = ["__journal__hostname"]
+    target_label  = "host"
+  }
+}
+
+loki.source.journal "host" {
+  max_age       = "12h"
+  relabel_rules = loki.relabel.journal.rules
+  labels        = {job = "systemd-journal", service = "host"}
+  forward_to    = [loki.write.default.receiver]
+}

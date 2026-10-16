@@ -1,0 +1,17 @@
+# OPT-IN, expensive: tables per database via crdb_internal.tables (loads every table descriptor; 30+ s on 1000+ tables).
+# Copy to ../collectors/crdb_tables_full.collector.yml, add `crdb_tables_full` to `collectors:` and give it its own exporter
+# target/scrape job with a long interval. Do not add it to the 60 s job.
+collector_name: crdb_tables_full
+min_interval: 3600s
+
+metrics:
+  - metric_name: crdb_database_tables
+    type: gauge
+    help: "Public tables per user database."
+    key_labels: [db]
+    values: [n]
+    query: |
+      SELECT database_name AS db, count(*)::FLOAT AS n
+      FROM crdb_internal.tables
+      WHERE database_name NOT IN ('system', 'defaultdb', 'postgres', '') AND state = 'PUBLIC' AND schema_name = 'public'
+      GROUP BY database_name

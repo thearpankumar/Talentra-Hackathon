@@ -1,0 +1,96 @@
+groups:
+  - name: talentra-haproxy
+    rules:
+      - alert: HAProxyBackendDown
+        expr: haproxy_backend_up == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "HAProxy backend {{ $labels.proxy }}: ALL servers down (SQL unavailable via this port)"}
+      - alert: HAProxyServerDown
+        expr: haproxy_server_up == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: "HAProxy server {{ $labels.server }} in backend {{ $labels.backend }} is DOWN (health check failing)"}
+      - alert: HAProxyExporterCannotScrape
+        expr: haproxy_up == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations: {summary: "haproxy_exporter cannot read the HAProxy stats page"}
+      - alert: HAProxyConnectionErrors
+        expr: rate(haproxy_backend_connection_errors_total[5m]) > 0.1
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "HAProxy backend {{ $labels.proxy }} connection errors {{ $value | humanize }}/s"}
+      - alert: HAProxySessionsNearLimit
+        expr: haproxy_frontend_current_sessions / haproxy_frontend_limit_sessions > 0.80
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "HAProxy frontend {{ $labels.proxy }} sessions at {{ $value | humanizePercentage }} of maxconn"}
+
+  - name: talentra-caddy
+    rules:
+      - alert: CaddyHighServerErrorRate
+        expr: sum(rate(caddy_http_request_duration_seconds_count{code=~"5.."}[5m])) / sum(rate(caddy_http_request_duration_seconds_count[5m])) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Caddy 5xx ratio {{ $value | humanizePercentage }}"}
+      - alert: CaddyHighLatency
+        expr: histogram_quantile(0.95, sum by (le) (rate(caddy_http_request_duration_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Caddy p95 request latency {{ $value | humanizeDuration }}"}
+
+  - name: talentra-blackbox
+    rules:
+      - alert: EndpointProbeFailed
+        expr: probe_success{job="blackbox-http"} == 0
+        for: 3m
+        labels: {severity: critical}
+        annotations: {summary: "HTTP probe failing: {{ $labels.instance }} ({{ $labels.service }}, {{ $labels.scope }})"}
+      - alert: SQLPortUnreachable
+        expr: probe_success{job="blackbox-tcp"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: "SQL port unreachable: {{ $labels.instance }} ({{ $labels.service }})"}
+      - alert: TLSCertExpiresSoon
+        expr: (probe_ssl_earliest_cert_expiry{job="blackbox-http"} - time()) < 14 * 86400
+        for: 30m
+        labels: {severity: warning}
+        annotations: {summary: "TLS cert for {{ $labels.instance }} expires in {{ $value | humanizeDuration }} (<14d; ACME renewal failing?)"}
+      - alert: TLSCertExpiresVerySoon
+        expr: (probe_ssl_earliest_cert_expiry{job="blackbox-http"} - time()) < 5 * 86400
+        for: 30m
+        labels: {severity: critical}
+        annotations: {summary: "TLS cert for {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"}
+      - alert: EndpointSlow
+        expr: probe_duration_seconds{job="blackbox-http"} > 3
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.instance }} responds in {{ $value | humanizeDuration }}"}
+
+  - name: talentra-monitoring-self
+    rules:
+      - alert: PrometheusRuleEvaluationFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: "Prometheus rule evaluation failing in {{ $labels.rule_group }}"}
+      - alert: PrometheusTSDBNearSizeCap
+        expr: prometheus_tsdb_storage_blocks_bytes / prometheus_tsdb_retention_limit_bytes > 0.85
+        for: 30m
+        labels: {severity: warning}
+        annotations: {summary: "Prometheus TSDB at {{ $value | humanizePercentage }} of its size cap (older data is being dropped early)"}
+      - alert: AlertmanagerNotificationsFailing
+        expr: rate(alertmanager_notifications_failed_total[10m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Alertmanager failing to send via {{ $labels.integration }}"}
+      - alert: LokiRequestErrors
+        expr: sum(rate(loki_request_duration_seconds_count{status_code=~"5.."}[5m])) > 0.1
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Loki returning 5xx"}
+      - alert: IngestionEngineStalled
+        expr: (time() - ingest_last_success_timestamp_seconds) > 900 and on() (ingest_rows_inflight > 0)
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Ingestion engine has work in flight but no successful batch for 15m (needs /metrics, see README)"}

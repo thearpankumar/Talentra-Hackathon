@@ -1,0 +1,3 @@
+# Needs /etc/docker/daemon.json {"metrics-addr": "172.17.0.1:9323"} (see INTEGRATION_REQUESTS.md). host.docker.internal = host-gateway.
+- targets: ["host.docker.internal:9323"]
+  labels: {optional: "true"}

@@ -1,0 +1,9 @@
+# LOCAL HTTP probes (container-internal). Caddy local is plain HTTP on :80 inside the edge network.
+- targets: ["http://main-crdb1:8080/health?ready=1", "http://main-crdb2:8080/health?ready=1", "http://main-crdb3:8080/health?ready=1"]
+  labels: {scope: internal, service: cockroach-main}
+- targets: ["http://backup-crdb:8080/health?ready=1"]
+  labels: {scope: internal, service: cockroach-backup}
+- targets: ["http://grafana:3000/api/health", "http://prometheus:9090/-/ready"]
+  labels: {scope: internal, service: monitoring}
+- targets: ["http://caddy/"]
+  labels: {scope: edge, service: caddy}

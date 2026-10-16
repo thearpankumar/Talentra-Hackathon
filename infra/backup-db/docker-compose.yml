@@ -1,0 +1,39 @@
+# LOCAL standalone backup CockroachDB (insecure). Host: SQL 26268, DB Console 8181.
+name: talentra-backup-local
+
+services:
+  backup-crdb:
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    restart: unless-stopped
+    stop_grace_period: 60s
+    hostname: backup-crdb
+    command: start-single-node --insecure --advertise-addr=backup-crdb --cache=256MiB --max-sql-memory=256MiB
+    volumes: [backup_data:/cockroach/cockroach-data, backup_share:/cockroach/cockroach-data/extern]
+    ports: ["26268:26257", "8181:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health?ready=1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      default:
+      edge: {aliases: [backup-crdb]}
+
+  bootstrap:
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    restart: "no"
+    entrypoint: ["/scripts/bootstrap.sh"]
+    # local.env = dummy passwords; optional gitignored .env supplies CRDB_LICENSE_KEY / CRDB_ORG (never commit the key)
+    env_file:
+      - local.env
+      - {path: .env, required: false}
+    environment: {CRDB_SECURE: "0"}
+    volumes: ["./scripts:/scripts:ro"]
+    depends_on: {backup-crdb: {condition: service_healthy}}
+
+networks:
+  edge: {name: talentra-edge, external: true}
+
+volumes:
+  backup_data:
+  backup_share: {name: talentra_backup_share, external: true}

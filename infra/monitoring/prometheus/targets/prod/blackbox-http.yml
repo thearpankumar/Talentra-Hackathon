@@ -1,0 +1,12 @@
+# PROD public endpoints (HTTPS + cert expiry). db./backup. are basic-auth protected -> http_tls_any accepts 401.
+- targets: ["https://talentra.thearpanhq.in/"]
+  labels: {scope: public, service: app}
+  # module default http_2xx
+- targets: ["https://db.talentra.thearpanhq.in/", "https://backup.talentra.thearpanhq.in/"]
+  labels: {scope: public, service: db-console, __param_module: http_tls_any}
+- targets: ["https://monitoring.talentra.thearpanhq.in/api/health"]
+  labels: {scope: public, service: grafana}
+- targets: ["https://main-crdb1:8080/health?ready=1", "https://main-crdb2:8080/health?ready=1", "https://main-crdb3:8080/health?ready=1"]
+  labels: {scope: internal, service: cockroach-main, __param_module: http_crdb_main}
+- targets: ["https://backup-crdb:8080/health?ready=1"]
+  labels: {scope: internal, service: cockroach-backup, __param_module: http_crdb_backup}

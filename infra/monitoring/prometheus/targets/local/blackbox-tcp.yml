@@ -1,0 +1,7 @@
+# LOCAL TCP probes: SQL ports inside the edge network.
+- targets: ["main-haproxy:26257"]
+  labels: {scope: internal, service: sql-main-write}
+- targets: ["main-haproxy:26259"]
+  labels: {scope: internal, service: sql-main-read}
+- targets: ["backup-crdb:26257"]
+  labels: {scope: internal, service: sql-backup}

@@ -1,0 +1,162 @@
+groups:
+  - name: talentra-availability
+    rules:
+      - alert: Watchdog
+        expr: vector(1)
+        labels: {severity: none}
+        annotations:
+          summary: "Alerting pipeline heartbeat (always firing)"
+          description: "Always-firing alert. If it stops arriving at the receiver, Prometheus -> Alertmanager -> notifier is broken."
+      - alert: InstanceDown
+        expr: up{optional!="true"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.job }} target {{ $labels.instance }} is down"
+          description: "Prometheus cannot scrape {{ $labels.job }}/{{ $labels.instance }} for 2 minutes."
+      - alert: OptionalTargetDown
+        expr: up{optional="true"} == 0
+        for: 15m
+        labels: {severity: info}
+        annotations:
+          summary: "Optional target {{ $labels.job }} ({{ $labels.instance }}) is not being scraped"
+          description: "Not paged. Expected until the integration is enabled (see monitoring/README.md)."
+
+  - name: talentra-host
+    rules:
+      - alert: HostHighCPU
+        expr: instance:node_cpu_utilisation:ratio > 0.85
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Host CPU {{ $value | humanizePercentage }} on {{ $labels.instance }}"
+          description: "CPU above 85% for 10m. Load phases of the 10M-row ingest are expected to do this; sustained otherwise is not."
+      - alert: HostCPUSaturated
+        expr: instance:node_cpu_utilisation:ratio > 0.95
+        for: 15m
+        labels: {severity: critical}
+        annotations: {summary: "Host CPU above 95% for 15m on {{ $labels.instance }}"}
+      - alert: HostHighMemory
+        expr: instance:node_memory_utilisation:ratio > 0.92
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Host memory {{ $value | humanizePercentage }} used on {{ $labels.instance }}"
+          description: "MemAvailable below 8%. The box is sized tight (EC2_SIZING.md); expect OOM kills next."
+      - alert: HostMemoryPressure
+        expr: rate(node_pressure_memory_waiting_seconds_total[5m]) > 0.10
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Memory PSI: tasks stalled {{ $value | humanizePercentage }} of the time on {{ $labels.instance }}"}
+      - alert: HostCPUPressure
+        expr: rate(node_pressure_cpu_waiting_seconds_total[5m]) > 0.50
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: "CPU PSI above 50% on {{ $labels.instance }}"}
+      - alert: HostIOPressure
+        expr: rate(node_pressure_io_waiting_seconds_total[5m]) > 0.30
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "IO PSI above 30% on {{ $labels.instance }} (disk-bound)"}
+      - alert: HostOOMKill
+        expr: increase(node_vmstat_oom_kill[10m]) > 0
+        labels: {severity: critical}
+        annotations: {summary: "Kernel OOM-killed {{ $value }} process(es) on {{ $labels.instance }}"}
+      - alert: HostLoadHigh
+        expr: node_load5 / on(instance) count by (instance) (node_cpu_seconds_total{mode="idle"}) > 1.5
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: "5m load is {{ $value | humanize }}x the CPU count on {{ $labels.instance }}"}
+      - alert: HostDiskSpaceLow
+        expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nsfs|fuse.*",mountpoint!~"/(boot|run|sys|dev|proc).*"} / node_filesystem_size_bytes) < 0.20
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.mountpoint }} {{ $value | humanizePercentage }} free on {{ $labels.instance }}"
+          description: "CockroachDB wants >30% free; below 20% free is already past guidance."
+      - alert: HostDiskSpaceCritical
+        expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nsfs|fuse.*",mountpoint!~"/(boot|run|sys|dev|proc).*"} / node_filesystem_size_bytes) < 0.08
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: "{{ $labels.mountpoint }} only {{ $value | humanizePercentage }} free on {{ $labels.instance }}"}
+      - alert: HostDiskWillFillIn24h
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nsfs|fuse.*",mountpoint!~"/(boot|run|sys|dev|proc).*"} / node_filesystem_size_bytes < 0.40)
+          and (predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs|nsfs|fuse.*",mountpoint!~"/(boot|run|sys|dev|proc).*"}[6h], 24 * 3600) < 0)
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} predicted to fill within 24h"
+          description: "predict_linear over the last 6h projects avail < 0 in 24h (only evaluated when <40% free)."
+      - alert: HostInodesLow
+        expr: (node_filesystem_files_free{fstype!~"tmpfs|overlay|squashfs|ramfs|nsfs|fuse.*"} / node_filesystem_files) < 0.10 and node_filesystem_files > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.mountpoint }} has <10% free inodes on {{ $labels.instance }}"}
+      - alert: HostEBSIOPSNearLimit
+        expr: instance:node_disk_iops:rate5m > 0.9 * scalar(talentra:ebs_iops_limit)
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Disk IOPS {{ $value | humanize }} (>90% of the 6000 gp3 limit) on {{ $labels.instance }}"
+          description: "Volume will be throttled by EBS. Raise IOPS live with aws ec2 modify-volume or slow the load."
+      - alert: HostEBSThroughputNearLimit
+        expr: instance:node_disk_throughput_bytes:rate5m > 0.9 * scalar(talentra:ebs_throughput_limit_bytes)
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Disk throughput {{ $value | humanize1024 }}B/s (>90% of 300 MB/s gp3 limit) on {{ $labels.instance }}"}
+      - alert: HostDiskBusy
+        expr: rate(node_disk_io_time_seconds_total{device!~"loop.*|ram.*|dm-.*"}[5m]) > 0.90
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: "Disk {{ $labels.device }} busy >90% for 15m on {{ $labels.instance }}"}
+      - alert: HostClockSkew
+        expr: abs(node_timex_offset_seconds) > 0.05 or node_timex_sync_status == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Host clock unsynchronised or skewed on {{ $labels.instance }}"
+          description: "CockroachDB nodes crash at 500ms offset; keep chrony/ntp healthy."
+      - alert: HostFileDescriptorsHigh
+        expr: node_filefd_allocated / node_filefd_maximum > 0.80
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "File descriptors {{ $value | humanizePercentage }} used on {{ $labels.instance }}"}
+      - alert: HostTemperatureHigh
+        expr: node_hwmon_temp_celsius > 85
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Hardware sensor {{ $labels.chip }}/{{ $labels.sensor }} at {{ $value }}C"}
+      - alert: HostSystemdUnitFailed
+        expr: node_systemd_unit_state{state="failed"} == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "systemd unit {{ $labels.name }} failed on {{ $labels.instance }}"}
+      - alert: HostNetworkErrors
+        expr: rate(node_network_receive_errs_total{device!~"lo|veth.*"}[5m]) + rate(node_network_transmit_errs_total{device!~"lo|veth.*"}[5m]) > 1
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Network errors on {{ $labels.device }} ({{ $labels.instance }})"}
+
+  - name: talentra-containers
+    rules:
+      - alert: ContainerRestarting
+        expr: changes(container_start_time_seconds{name!=""}[30m]) > 2
+        labels: {severity: warning}
+        annotations: {summary: "Container {{ $labels.name }} restarted {{ $value }} times in 30m"}
+      - alert: ContainerOOMKilled
+        expr: increase(container_oom_events_total{name!=""}[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Container {{ $labels.name }} was OOM-killed"
+          description: "It hit its mem_limit. Raise the limit or reduce --cache/--max-sql-memory."
+      - alert: ContainerMemoryNearLimit
+        expr: (container_memory_working_set_bytes{name!=""} / (container_spec_memory_limit_bytes{name!=""} > 0)) > 0.92
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Container {{ $labels.name }} at {{ $value | humanizePercentage }} of its memory limit"}
+      - alert: ContainerCPUThrottled
+        expr: rate(container_cpu_cfs_throttled_periods_total{name!=""}[5m]) / rate(container_cpu_cfs_periods_total{name!=""}[5m]) > 0.50
+        for: 15m
+        labels: {severity: info}
+        annotations: {summary: "Container {{ $labels.name }} CPU-throttled in {{ $value | humanizePercentage }} of periods"}

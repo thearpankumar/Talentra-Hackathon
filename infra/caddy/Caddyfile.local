@@ -1,0 +1,37 @@
+# LOCAL: plain HTTP on host :8081, no certs, no real domains. Test: curl -H 'Host: db.localhost' http://localhost:8081/
+{
+	auto_https off
+	admin :2019
+	metrics
+}
+
+# Internal-only metrics endpoint for Prometheus (caddy:9180 on talentra-edge); not published on the host.
+:9180 {
+	metrics /metrics
+}
+
+http://localhost {
+	respond "Talentra edge (local)" 200
+}
+
+http://db.localhost {
+	basic_auth {
+		local $2a$14$CsNEHzMa0C.Eqm6TfDRrme6EsXGz8Y8pdn3l28IJ9tZi1uTYILpfS
+	}
+	reverse_proxy main-crdb1:8080 main-crdb2:8080 main-crdb3:8080 {
+		lb_policy first
+		health_uri /health?ready=1
+		health_interval 10s
+	}
+}
+
+http://backup.localhost {
+	basic_auth {
+		local $2a$14$CsNEHzMa0C.Eqm6TfDRrme6EsXGz8Y8pdn3l28IJ9tZi1uTYILpfS
+	}
+	reverse_proxy backup-crdb:8080
+}
+
+http://monitoring.localhost {
+	reverse_proxy grafana:3000
+}

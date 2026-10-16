@@ -1,0 +1,11 @@
+scrape_configs:
+  # CockroachDB SQL-level metrics (jobs/backups, row counts, sessions, slow statements). One exporter per cluster.
+  - job_name: sql_exporter
+    scrape_interval: 60s
+    scrape_timeout: 30s
+    static_configs:
+      - {targets: ["sql-exporter-main:9399"], labels: {cluster: main}}
+      - {targets: ["sql-exporter-backup:9399"], labels: {cluster: backup}}
+  - job_name: haproxy
+    scrape_interval: 15s
+    static_configs: [{targets: ["haproxy-exporter:9101"], labels: {cluster: main}}]

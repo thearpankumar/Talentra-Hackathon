@@ -1,0 +1,55 @@
+# PROD: automatic Let's Encrypt (HTTP-01 on :80 / TLS-ALPN on :443). DNS A records must already point at the EC2 EIP.
+# Upstream DB Consoles speak HTTPS with the Cockroach internal CA, which Caddy trusts via the mounted public ca.crt.
+{
+	email {$ACME_EMAIL}
+	admin localhost:2019
+	metrics          # per-request caddy_http_* series (Caddy >= 2.10 global option)
+}
+
+# HSTS on every public hostname (docs/15 section 3)
+(hsts) {
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}
+
+# Internal-only metrics endpoint for Prometheus (caddy:9180 on talentra-edge). NOT published on the host in docker-compose.prod.yml.
+:9180 {
+	metrics /metrics
+}
+
+{$APEX_HOST} {
+	import hsts
+	respond "Talentra" 200
+}
+
+{$DB_HOST} {
+	import hsts
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+	reverse_proxy https://main-crdb1:8080 https://main-crdb2:8080 https://main-crdb3:8080 {
+		lb_policy first
+		health_uri /health?ready=1
+		health_interval 10s
+		transport http {
+			tls_trust_pool file /certs/main/ca.crt
+		}
+	}
+}
+
+{$BACKUP_HOST} {
+	import hsts
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+	reverse_proxy https://backup-crdb:8080 {
+		transport http {
+			tls_trust_pool file /certs/backup/ca.crt
+		}
+	}
+}
+
+# Grafana (container `grafana` on the talentra-edge network, owned by infra/monitoring)
+{$MONITORING_HOST} {
+	import hsts
+	reverse_proxy grafana:3000
+}

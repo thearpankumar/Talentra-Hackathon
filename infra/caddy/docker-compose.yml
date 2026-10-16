@@ -1,0 +1,25 @@
+# LOCAL Caddy: plain HTTP on host :8081 (no TLS/certs). Routes Host header db.localhost / backup.localhost / monitoring.localhost.
+name: talentra-caddy-local
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["8081:80"]
+    volumes:
+      - ./Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [edge]
+
+networks:
+  edge: {name: talentra-edge, external: true}
+
+volumes:
+  caddy_data:
+  caddy_config:

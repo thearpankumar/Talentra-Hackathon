@@ -1,0 +1,5 @@
+# secrets / generated
+**/.env
+**/certs-public/
+**/logs/
+*.key

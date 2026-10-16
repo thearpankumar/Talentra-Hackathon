@@ -1,0 +1,7 @@
+scrape_configs:
+  # (job "node" is env-specific: scrape.d/{local,prod}/05-node.yml - prod runs node_exporter in the host network namespace)
+  - job_name: cadvisor
+    scrape_interval: 15s
+    static_configs: [{targets: ["cadvisor:8080"], labels: {host: talentra-host}}]
+    relabel_configs:
+      - {target_label: instance, replacement: talentra-host}

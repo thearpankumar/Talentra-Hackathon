@@ -1,0 +1,280 @@
+# LOCAL (laptop / Docker Desktop) observability stack. Own compose project; no real domain, no TLS.
+#   cp .env.example .env            (optional - everything has a local default)
+#   docker network create talentra-edge      (once; same shared network the other stacks use)
+#   docker compose up -d
+#   docker compose --profile demo-target up -d     # + throwaway single-node CockroachDB with a running workload (own data)
+# Grafana  http://localhost:3300  (admin / $GRAFANA_ADMIN_PASSWORD, default "admin")   Prometheus :9090   Alertmanager :9093
+# Also reachable through the local Caddy as http://monitoring.localhost:8081 (Caddyfile.local -> grafana:3000).
+# Scrape targets for the local (insecure) main-db / backup-db stacks are in prometheus/targets/local/.
+name: talentra-monitoring-local
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  prometheus:
+    <<: *restart
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROM_RETENTION:-15d}
+      - --storage.tsdb.retention.size=${PROM_RETENTION_SIZE:-5GB}
+      - --storage.tsdb.wal-compression
+      - --web.enable-lifecycle
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - ./prometheus/scrape.d/common:/etc/prometheus/scrape.d/common:ro
+      - ${SCRAPE_DIR:-./prometheus/scrape.d/local}:/etc/prometheus/scrape.d/env:ro
+      - ${TARGETS_DIR:-./prometheus/targets/local}:/etc/prometheus/targets:ro
+      - demo_targets:/etc/prometheus/targets-dyn:ro
+      - ${MAIN_CERTS_DIR:-../main-db/certs-public}:/certs/main:ro
+      - ${BACKUP_CERTS_DIR:-../backup-db/certs-public}:/certs/backup:ro
+      - prometheus_data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/ready >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [default, edge]
+
+  alertmanager:
+    <<: *restart
+    image: prom/alertmanager:v0.28.1
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
+    environment: &am-env
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SLACK_CHANNEL: ${SLACK_CHANNEL:-#alerts}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      SMTP_SMARTHOST: ${SMTP_SMARTHOST:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      WATCHDOG_WEBHOOK_URL: ${WATCHDOG_WEBHOOK_URL:-}
+    volumes:
+      - ./alertmanager/alertmanager.base.yml:/etc/alertmanager/alertmanager.base.yml:ro
+      - ./alertmanager/entrypoint.sh:/etc/alertmanager/entrypoint.sh:ro
+      - alertmanager_data:/alertmanager
+    ports: ["127.0.0.1:9093:9093"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/ready >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    <<: *restart
+    image: grafana/grafana:11.6.1
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3300/
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 10s
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana-dashboards/Talentra/talentra-overview.json
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana-dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports: ["127.0.0.1:3300:3000"]
+    depends_on: {prometheus: {condition: service_healthy}}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      default:
+      edge: {aliases: [grafana]}
+
+  loki:
+    <<: *restart
+    image: grafana/loki:3.5.0
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    ports: ["127.0.0.1:3100:3100"]
+
+  alloy:
+    <<: *restart
+    image: grafana/alloy:v1.9.1
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "--storage.path=/var/lib/alloy/data", "--disable-reporting", "/etc/alloy-config"]
+    environment: {MONITORING_ENV: local}
+    user: "0:0"
+    volumes:
+      - ./alloy/docker.alloy:/etc/alloy-config/docker.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - alloy_data:/var/lib/alloy/data
+    depends_on: [loki]
+
+  node-exporter:
+    <<: *restart
+    image: quay.io/prometheus/node-exporter:v1.9.1
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run/docker/.+|var/lib/docker/(overlay2|containers|rootfs).*)($$|/)
+      - --collector.processes
+      - --collector.tcpstat
+      - --collector.buddyinfo
+      - --collector.textfile.directory=/textfile
+      - --no-collector.arp
+      - --no-collector.bcache
+      - --no-collector.bonding
+      - --no-collector.btrfs
+      - --no-collector.fibrechannel
+      - --no-collector.infiniband
+      - --no-collector.ipvs
+      - --no-collector.mdadm
+      - --no-collector.nfs
+      - --no-collector.nfsd
+      - --no-collector.powersupplyclass
+      - --no-collector.tapestats
+      - --no-collector.xfs
+      - --no-collector.zfs
+    pid: host
+    volumes:
+      - /:/host:ro
+      - textfile:/textfile:ro
+
+  cadvisor:
+    <<: *restart
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.project,com.docker.compose.service
+      - --enable_metrics=cpu,memory,disk,diskIO,network,process,oom_event
+      - --disable_metrics=percpu,sched,tcp,udp,advtcp,hugetlb,referenced_memory,cpu_topology,resctrl,memory_numa,cpuset,cpuLoad
+    privileged: true
+    devices: [/dev/kmsg]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+
+  blackbox:
+    <<: *restart
+    image: prom/blackbox-exporter:v0.26.0
+    command: ["--config.file=/etc/blackbox/blackbox.yml"]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+      - ${MAIN_CERTS_DIR:-../main-db/certs-public}:/certs/main:ro
+      - ${BACKUP_CERTS_DIR:-../backup-db/certs-public}:/certs/backup:ro
+    networks: [default, edge]
+
+  # CockroachDB SQL-level metrics (jobs/backups, table rows, sessions, slow queries, contention). One per cluster.
+  sql-exporter-main:
+    <<: *restart
+    image: burningalchemist/sql_exporter:0.17.3
+    command: ["-config.file=/config/${SQL_EXPORTER_CONFIG:-sql_exporter.yml}"]
+    environment:
+      SQLEXPORTER_TARGET_DSN: ${SQL_EXPORTER_MAIN_DSN:-postgres://talentra_monitor@main-crdb1:26257/defaultdb?sslmode=disable&options=-c%20allow_unsafe_internals%3Dtrue}
+    volumes:
+      - ./sql_exporter:/config:ro
+      - ${MAIN_CERTS_DIR:-../main-db/certs-public}:/certs/main:ro
+    networks: [default, edge]
+
+  sql-exporter-backup:
+    <<: *restart
+    image: burningalchemist/sql_exporter:0.17.3
+    command: ["-config.file=/config/${SQL_EXPORTER_CONFIG:-sql_exporter.yml}"]
+    environment:
+      SQLEXPORTER_TARGET_DSN: ${SQL_EXPORTER_BACKUP_DSN:-postgres://talentra_monitor@backup-crdb:26257/defaultdb?sslmode=disable&options=-c%20allow_unsafe_internals%3Dtrue}
+    volumes:
+      - ./sql_exporter:/config:ro
+      - ${BACKUP_CERTS_DIR:-../backup-db/certs-public}:/certs/backup:ro
+    networks: [default, edge]
+
+  haproxy-exporter:
+    <<: *restart
+    image: prom/haproxy-exporter:v0.15.0
+    command:
+      - --haproxy.scrape-uri=http://main-haproxy:8404/stats;csv
+      - --haproxy.timeout=5s
+    networks: [default, edge]
+
+  # backup-health textfile metrics from the backup-handler CSV (infra/main-db/logs/backup_timing.csv) -> node_exporter textfile dir
+  backup-metrics:
+    <<: *restart
+    image: python:3.13-alpine
+    command: ["python", "-u", "/app/export.py"]
+    environment:
+      BACKUP_CSV: /logs/backup_timing.csv
+      TEXTFILE_DIR: /textfile
+      BACKUP_DIR: /backups
+    volumes:
+      - ./backup-metrics/export.py:/app/export.py:ro
+      - ../main-db/logs:/logs:ro
+      - backup_share:/backups:ro
+      - textfile:/textfile
+
+  # ---------------- profile: demo-target (throwaway CockroachDB so dashboards have data) ----------------
+  demo-crdb:
+    profiles: [demo-target]
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    command: start-single-node --insecure --cache=256MiB --max-sql-memory=256MiB --advertise-addr=demo-crdb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health?ready=1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    volumes: [demo_crdb_data:/cockroach/cockroach-data]
+    networks: [default]
+    ports: ["127.0.0.1:26299:26257"]
+
+  demo-load:
+    profiles: [demo-target]
+    image: cockroachdb/cockroach:${CRDB_VERSION:-v26.2.8}
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        U='postgresql://root@demo-crdb:26257/movr?sslmode=disable'
+        ./cockroach sql --insecure --host=demo-crdb -e "CREATE DATABASE IF NOT EXISTS talentra"
+        ./cockroach workload init movr "$$U" 2>&1 | tail -2
+        while true; do ./cockroach workload run movr --duration=10m --max-rate=150 --concurrency=8 "$$U" 2>&1 | tail -1; sleep 2; done
+    depends_on: {demo-crdb: {condition: service_healthy}}
+    networks: [default]
+
+  demo-register:
+    profiles: [demo-target]
+    image: alpine:3.20
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        printf -- '- targets: ["demo-crdb:8080"]\n  labels: {cluster: demo}\n' > /t/cockroach-demo.yml
+        trap 'rm -f /t/cockroach-demo.yml; exit 0' TERM INT
+        while true; do sleep 3600 & wait $$!; done
+    volumes: [demo_targets:/t]
+
+networks:
+  edge: {name: talentra-edge, external: true}
+
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:
+  loki_data:
+  alloy_data:
+  textfile:
+  demo_targets:
+  demo_crdb_data:
+  backup_share: {name: talentra_backup_share, external: true}

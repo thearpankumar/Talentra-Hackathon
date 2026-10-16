@@ -1,0 +1,3 @@
+# Ingestion engine running on the laptop host (placeholder; engine exposes no /metrics yet).
+- targets: ["host.docker.internal:8000"]
+  labels: {optional: "true"}

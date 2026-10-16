@@ -1,0 +1,3 @@
+# Placeholder until the ingestion engine runs as a container on talentra-edge and exposes /metrics.
+- targets: ["ingestion-engine:8000"]
+  labels: {optional: "true"}

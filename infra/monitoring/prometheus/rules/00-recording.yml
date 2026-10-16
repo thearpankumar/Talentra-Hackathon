@@ -1,0 +1,58 @@
+groups:
+  - name: talentra-constants
+    rules:
+      # Targets used by dashboards and alerts. Edit here to retune RPO / RTO.
+      - record: talentra:backup_rpo_target_seconds
+        expr: vector(1800)      # 30m (docs/20: RPO 15 min laptop / 5 min prod; incremental every 15m local, 5m prod + one missed run)
+      - record: talentra:backup_rto_target_seconds
+        expr: vector(1800)      # 30m restore/backup duration budget
+      - record: talentra:ebs_iops_limit
+        expr: vector(6000)      # gp3 provisioned IOPS (EC2_SIZING.md)
+      - record: talentra:ebs_throughput_limit_bytes
+        expr: vector(314572800) # gp3 provisioned 300 MB/s
+
+  - name: talentra-host
+    interval: 30s
+    rules:
+      - record: instance:node_cpu_utilisation:ratio
+        expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+      - record: instance:node_memory_utilisation:ratio
+        expr: 1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+      - record: instance:node_disk_iops:rate5m
+        expr: sum by (instance) (rate(node_disk_reads_completed_total{device!~"loop.*|ram.*|dm-.*"}[5m]) + rate(node_disk_writes_completed_total{device!~"loop.*|ram.*|dm-.*"}[5m]))
+      - record: instance:node_disk_throughput_bytes:rate5m
+        expr: sum by (instance) (rate(node_disk_read_bytes_total{device!~"loop.*|ram.*|dm-.*"}[5m]) + rate(node_disk_written_bytes_total{device!~"loop.*|ram.*|dm-.*"}[5m]))
+      - record: instance:node_network_receive_bytes:rate5m
+        expr: sum by (instance) (rate(node_network_receive_bytes_total{device!~"lo|veth.*|docker.*|br-.*"}[5m]))
+      - record: instance:node_network_transmit_bytes:rate5m
+        expr: sum by (instance) (rate(node_network_transmit_bytes_total{device!~"lo|veth.*|docker.*|br-.*"}[5m]))
+
+  - name: talentra-containers
+    interval: 30s
+    rules:
+      - record: container:cpu_usage_cores:rate5m
+        expr: sum by (name) (rate(container_cpu_usage_seconds_total{name!=""}[5m]))
+      - record: container:memory_working_set_bytes
+        expr: sum by (name) (container_memory_working_set_bytes{name!=""})
+
+  - name: talentra-cockroachdb
+    interval: 30s
+    rules:
+      - record: cluster:crdb_sql_qps:rate5m
+        expr: sum by (cluster) (rate(sql_select_count{job="cockroachdb"}[5m]) + rate(sql_insert_count{job="cockroachdb"}[5m]) + rate(sql_update_count{job="cockroachdb"}[5m]) + rate(sql_delete_count{job="cockroachdb"}[5m]))
+      - record: cluster:crdb_sql_service_latency_seconds:p50
+        expr: histogram_quantile(0.50, sum by (le, cluster) (rate(sql_service_latency_bucket{job="cockroachdb"}[5m]))) / 1e9
+      - record: cluster:crdb_sql_service_latency_seconds:p95
+        expr: histogram_quantile(0.95, sum by (le, cluster) (rate(sql_service_latency_bucket{job="cockroachdb"}[5m]))) / 1e9
+      - record: cluster:crdb_sql_service_latency_seconds:p99
+        expr: histogram_quantile(0.99, sum by (le, cluster) (rate(sql_service_latency_bucket{job="cockroachdb"}[5m]))) / 1e9
+      - record: instance:crdb_store_used_ratio
+        expr: 1 - capacity_available{job="cockroachdb"} / capacity{job="cockroachdb"}
+
+  - name: talentra-backup
+    interval: 30s
+    rules:
+      - record: talentra:backup_age_seconds
+        expr: time() - max by (op, kind) (talentra_backup_last_success_timestamp_seconds)
+      - record: talentra:backup_rpo_headroom_seconds
+        expr: scalar(talentra:backup_rpo_target_seconds) - (time() - max(talentra_backup_last_success_timestamp_seconds{op="backup"}))

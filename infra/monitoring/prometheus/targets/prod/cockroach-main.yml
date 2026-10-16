@@ -1,0 +1,2 @@
+- targets: ["main-crdb1:8080", "main-crdb2:8080", "main-crdb3:8080"]
+  labels: {cluster: main}
